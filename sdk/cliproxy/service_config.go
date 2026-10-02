@@ -65,6 +65,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 }
 
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
+	coreauth.SetNextResetEnabled(state.strategy == "next-reset")
 	var selector coreauth.Selector
 	switch state.strategy {
 	case "weighted-round-robin":

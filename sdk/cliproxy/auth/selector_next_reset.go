@@ -33,6 +33,7 @@ type nextResetAssessment struct {
 	score          float64
 	weeklyResetsAt time.Time
 	weeklyUsedPct  float64
+	blockedUntil   time.Time
 }
 
 // NextResetSelector spends the quota that is closest to being lost first. For
@@ -80,11 +81,14 @@ func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, op
 	if ranked[0].tier == nextResetReady {
 		return ranked[0].auth, nil
 	}
-	// No credential has usable weekly data: rotate through the best remaining
-	// tier so idle credentials get traffic and report their quota. When every
-	// candidate looks exhausted, rotate through all of them and let the
-	// upstream answer, rather than failing a pick CPA considers eligible.
 	tier := ranked[0].tier
+	if tier == nextResetUnavailable {
+		// Every candidate is exhausted for this request. Answer with a
+		// cooldown instead of sending requests the upstream will reject.
+		return nil, newModelCooldownError(model, provider, nextResetSoonestReset(ranked, now).Sub(now))
+	}
+	// No credential has usable weekly data: rotate through the best remaining
+	// tier so idle credentials get traffic and report their quota.
 	pool := make([]*Auth, 0, len(ranked))
 	for _, a := range ranked {
 		if a.tier == tier {
@@ -110,12 +114,14 @@ func (s *NextResetSelector) assess(auth *Auth, model string, now time.Time) next
 		a.tier = nextResetTrial
 		return a
 	}
-	if nextResetExhausted(snap.Short, now) || nextResetExhausted(snap.Weekly, now) {
-		a.tier = nextResetUnavailable
-		return a
+	for _, w := range []nextResetWindow{snap.Short, snap.Weekly} {
+		if nextResetExhausted(w, now) {
+			a.tier, a.blockedUntil = nextResetUnavailable, w.ResetsAt
+			return a
+		}
 	}
 	if provider == "claude" && strings.Contains(strings.ToLower(model), "fable") && nextResetExhausted(snap.Fable, now) {
-		a.tier = nextResetUnavailable
+		a.tier, a.blockedUntil = nextResetUnavailable, snap.Fable.ResetsAt
 		return a
 	}
 	w := snap.Weekly
@@ -136,6 +142,24 @@ func (s *NextResetSelector) assess(auth *Auth, model string, now time.Time) next
 	a.weeklyResetsAt = w.ResetsAt
 	a.weeklyUsedPct = w.UsedPct
 	return a
+}
+
+// nextResetSoonestReset is the earliest reset among exhausted windows, or a
+// short retry when none is known.
+func nextResetSoonestReset(ranked []nextResetAssessment, now time.Time) time.Time {
+	soonest := time.Time{}
+	for _, a := range ranked {
+		if !a.blockedUntil.After(now) {
+			continue
+		}
+		if soonest.IsZero() || a.blockedUntil.Before(soonest) {
+			soonest = a.blockedUntil
+		}
+	}
+	if soonest.IsZero() {
+		return now.Add(nextResetLatchRetry)
+	}
+	return soonest
 }
 
 // nextResetExhausted reports a window that blocks use right now. It is derived

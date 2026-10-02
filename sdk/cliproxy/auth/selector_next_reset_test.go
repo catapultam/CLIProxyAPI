@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -145,10 +146,15 @@ func TestNextResetAPIKeyAfterOAuth(t *testing.T) {
 	}
 }
 
-func TestNextResetAllExhaustedStillPicks(t *testing.T) {
+func TestNextResetAllExhaustedReturnsCooldown(t *testing.T) {
 	a := claudeAuth("a", 100, 10*time.Hour)
-	if got := nrPick(t, nrSelector(), "", a); got.ID != "a" {
-		t.Fatalf("got %v", got)
+	got, err := nrSelector().Pick(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, []*Auth{a})
+	if err == nil || got != nil {
+		t.Fatalf("want cooldown error, got auth=%v err=%v", got, err)
+	}
+	var cooldown *modelCooldownError
+	if !errors.As(err, &cooldown) || cooldown.resetIn < 9*time.Hour {
+		t.Fatalf("err = %v", err)
 	}
 }
 

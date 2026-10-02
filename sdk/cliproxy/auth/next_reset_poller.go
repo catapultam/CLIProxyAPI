@@ -18,11 +18,16 @@ import (
 const (
 	claudeUsageURL       = "https://api.anthropic.com/api/oauth/usage"
 	claudeUsageUserAgent = "claude-cli/2.1.280 (external, cli)"
+	codexUsageURL        = "https://chatgpt.com/backend-api/wham/usage"
+	codexUsageUserAgent  = "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"
 
 	nextResetPollEvery      = time.Minute
 	nextResetPollStaleAfter = 15 * time.Minute
-	// nextResetPollIdleAfter stops polling when the strategy has made no pick
-	// for this long, so an unused proxy does not keep calling Anthropic.
+	// nextResetPollLatchedEarly re-checks a latched credential before its
+	// expected reset, so an early reset is noticed.
+	nextResetPollLatchedEarly = 30 * time.Minute
+	// nextResetPollIdleAfter stops routine polling when the strategy has made
+	// no pick for this long. Latched credentials are still confirmed.
 	nextResetPollIdleAfter = 2 * time.Hour
 	nextResetPollTimeout   = 30 * time.Second
 
@@ -47,8 +52,11 @@ func withPrevalidatedAuthCandidates(ctx context.Context) context.Context {
 // credential's proxy settings.
 type NextResetHTTPDoer func(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
 
-// nextResetPoller reads the Claude usage endpoint for OAuth credentials whose
-// poll is older than nextResetPollStaleAfter, one credential per tick. It is
+// nextResetPoller reads the Claude and Codex usage endpoints, one credential
+// per tick. Latched credentials come first: once their expected reset passes
+// they are polled until the endpoint confirms room, and before that they are
+// re-checked occasionally for early resets. Other credentials are refreshed
+// when their poll is stale, only while the strategy is in use. The poller is
 // read-only: it never refreshes or writes credentials.
 type nextResetPoller struct {
 	list   func() []*Auth
@@ -61,30 +69,47 @@ type nextResetPoller struct {
 	lastPoll map[string]time.Time
 }
 
+func (p *nextResetPoller) due(auth *Auth, now time.Time, idle bool) (int, bool) {
+	p.mu.Lock()
+	until, polled := p.backoff[auth.ID], p.lastPoll[auth.ID]
+	p.mu.Unlock()
+	if now.Before(until) {
+		return 0, false
+	}
+	since := now.Sub(polled)
+	if nextResetIsLatched(auth.ID) {
+		_, expected := nextResetBlocked(auth, now)
+		if !expected.After(now.Add(nextResetLatchRetry)) {
+			return 0, since >= nextResetLatchRetry
+		}
+		return 1, since >= nextResetPollLatchedEarly
+	}
+	if idle {
+		return 0, false
+	}
+	return 2, since >= nextResetPollStaleAfter
+}
+
 func (p *nextResetPoller) runOnce(ctx context.Context, now time.Time) {
 	if p.active != nil && !p.active() {
 		return
 	}
-	if now.Sub(time.Unix(0, nextResetLastPick.Load())) > nextResetPollIdleAfter {
-		return
-	}
+	idle := now.Sub(time.Unix(0, nextResetLastPick.Load())) > nextResetPollIdleAfter
 	auths := p.list()
 	sort.Slice(auths, func(i, j int) bool { return auths[i].ID < auths[j].ID })
+	var pick *Auth
+	pickRank := 3
 	for _, auth := range auths {
-		if auth == nil || auth.Disabled || !strings.EqualFold(auth.Provider, "claude") {
+		if auth == nil || auth.Disabled || !nextResetTracked(auth) || authAccessToken(auth) == "" {
 			continue
 		}
-		if strings.EqualFold(auth.Attributes["auth_kind"], "apikey") || authAccessToken(auth) == "" {
-			continue
+		rank, ok := p.due(auth, now, idle)
+		if ok && rank < pickRank {
+			pick, pickRank = auth, rank
 		}
-		p.mu.Lock()
-		until, polled := p.backoff[auth.ID], p.lastPoll[auth.ID]
-		p.mu.Unlock()
-		if now.Before(until) || now.Sub(polled) < nextResetPollStaleAfter {
-			continue
-		}
-		p.fetch(ctx, auth, now)
-		return
+	}
+	if pick != nil {
+		p.fetch(ctx, pick, now)
 	}
 }
 
@@ -101,15 +126,26 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 
 	reqCtx, cancel := context.WithTimeout(ctx, nextResetPollTimeout)
 	defer cancel()
-	req, errReq := http.NewRequestWithContext(reqCtx, http.MethodGet, claudeUsageURL, nil)
+	codex := strings.EqualFold(auth.Provider, "codex")
+	url, agent := claudeUsageURL, claudeUsageUserAgent
+	if codex {
+		url, agent = codexUsageURL, codexUsageUserAgent
+	}
+	req, errReq := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if errReq != nil {
 		setBackoff(nextResetBackoffOther, errReq.Error())
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+authAccessToken(auth))
-	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
-	req.Header.Set("User-Agent", claudeUsageUserAgent)
+	req.Header.Set("User-Agent", agent)
 	req.Header.Set("Content-Type", "application/json")
+	if codex {
+		if accountID := authMetadataString(auth, "account_id"); accountID != "" {
+			req.Header.Set("Chatgpt-Account-Id", accountID)
+		}
+	} else {
+		req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	}
 	resp, errDo := p.do(reqCtx, auth, req)
 	if errDo != nil {
 		setBackoff(nextResetBackoffOther, errDo.Error())
@@ -127,12 +163,18 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 	}
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		snap, errParse := parseClaudeUsageEndpoint(body, now)
+		parse := parseClaudeUsageEndpoint
+		if codex {
+			parse = parseCodexUsageEndpoint
+		}
+		snap, errParse := parse(body, now)
 		if errParse != nil {
 			setBackoff(nextResetBackoffOther, "parse: "+errParse.Error())
 			return
 		}
 		p.store.set(auth.ID, snap)
+		// Re-evaluate now so a confirmed reset releases the latch at once.
+		nextResetBlocked(auth, now)
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		setBackoff(nextResetBackoffAuth, fmt.Sprintf("http %d", resp.StatusCode))
 	case resp.StatusCode == http.StatusTooManyRequests:
@@ -146,9 +188,9 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 	}
 }
 
-// StartNextResetPoller polls the Claude usage endpoint while the next-reset
-// strategy is the active selector (directly or as the session-affinity
-// fallback). It stops when ctx is cancelled.
+// StartNextResetPoller polls the usage endpoints while the next-reset strategy
+// is the active selector (directly or as the session-affinity fallback). It
+// stops when ctx is cancelled.
 func (m *Manager) StartNextResetPoller(ctx context.Context, do NextResetHTTPDoer) {
 	if m == nil || do == nil {
 		return

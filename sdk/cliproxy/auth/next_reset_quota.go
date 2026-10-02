@@ -265,3 +265,81 @@ func nextResetView(auth *Auth, polled *nextResetPolledStore) (nextResetSnapshot,
 		return nextResetSnapshot{}, false
 	}
 }
+
+// flexNumber accepts a JSON number or a numeric string.
+type flexNumber struct {
+	value float64
+	set   bool
+}
+
+func (n *flexNumber) UnmarshalJSON(data []byte) error {
+	raw := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	if raw == "" || raw == "null" {
+		return nil
+	}
+	f, errParse := strconv.ParseFloat(raw, 64)
+	if errParse != nil {
+		return nil
+	}
+	n.value, n.set = f, true
+	return nil
+}
+
+type codexUsageWindow struct {
+	UsedPercent        flexNumber `json:"used_percent"`
+	LimitWindowSeconds flexNumber `json:"limit_window_seconds"`
+	ResetAfterSeconds  flexNumber `json:"reset_after_seconds"`
+	ResetAt            flexNumber `json:"reset_at"`
+}
+
+type codexUsageBody struct {
+	RateLimit *struct {
+		Allowed         *bool             `json:"allowed"`
+		LimitReached    *bool             `json:"limit_reached"`
+		PrimaryWindow   *codexUsageWindow `json:"primary_window"`
+		SecondaryWindow *codexUsageWindow `json:"secondary_window"`
+	} `json:"rate_limit"`
+}
+
+// parseCodexUsageEndpoint reads GET https://chatgpt.com/backend-api/wham/usage.
+// The long window is whichever reports the longer limit_window_seconds.
+func parseCodexUsageEndpoint(body []byte, now time.Time) (nextResetSnapshot, error) {
+	var b codexUsageBody
+	if errUnmarshal := json.Unmarshal(body, &b); errUnmarshal != nil {
+		return nextResetSnapshot{}, errUnmarshal
+	}
+	snap := nextResetSnapshot{ObservedAt: now}
+	if b.RateLimit == nil {
+		return snap, nil
+	}
+	toWindow := func(w *codexUsageWindow) (nextResetWindow, float64) {
+		if w == nil || !w.UsedPercent.set {
+			return nextResetWindow{}, 0
+		}
+		out := nextResetWindow{Known: true, UsedPct: w.UsedPercent.value}
+		switch {
+		case w.ResetAt.set && w.ResetAt.value > 0:
+			out.ResetsAt = time.Unix(int64(w.ResetAt.value), 0)
+		case w.ResetAfterSeconds.set && w.ResetAfterSeconds.value >= 0:
+			out.ResetsAt = now.Add(time.Duration(w.ResetAfterSeconds.value * float64(time.Second)))
+		}
+		return out, w.LimitWindowSeconds.value
+	}
+	primary, primarySecs := toWindow(b.RateLimit.PrimaryWindow)
+	secondary, secondarySecs := toWindow(b.RateLimit.SecondaryWindow)
+	snap.Short, snap.Weekly = primary, secondary
+	if primarySecs > secondarySecs {
+		snap.Short, snap.Weekly = secondary, primary
+	}
+	if !snap.Weekly.Known && snap.Short.Known && primarySecs >= 7*24*3600 {
+		snap.Short, snap.Weekly = snap.Weekly, snap.Short
+	}
+	if b.RateLimit.LimitReached != nil && *b.RateLimit.LimitReached {
+		if snap.Weekly.UsedPct >= 100 {
+			snap.Weekly.Rejected = true
+		} else {
+			snap.Short.Rejected, snap.Short.Known = true, true
+		}
+	}
+	return snap, nil
+}
