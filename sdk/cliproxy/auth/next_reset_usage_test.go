@@ -90,6 +90,12 @@ func TestPooledUsageForModelOnlyCountsCredentialsServingTheModel(t *testing.T) {
 	if got = m.PooledUsageForModel("gpt-5.5", nrNow); got.Accounts != 1 || math.Abs(got.SevenDay.UsedPercentage-90) > 1e-9 {
 		t.Fatalf("codex pool = %+v %+v", got, got.SevenDay)
 	}
+	if got = m.PooledUsageForProvider("claude", nrNow); got.Accounts != 2 || got.Provider != "claude" || math.Abs(got.SevenDay.UsedPercentage-30) > 1e-9 {
+		t.Fatalf("claude provider pool = %+v %+v", got, got.SevenDay)
+	}
+	if got = m.PooledUsageForProvider("codex", nrNow); got.Accounts != 1 || math.Abs(got.SevenDay.UsedPercentage-90) > 1e-9 {
+		t.Fatalf("codex provider pool = %+v %+v", got, got.SevenDay)
+	}
 }
 
 func TestPooledUsageForModelKeepsPollerActive(t *testing.T) {
@@ -98,5 +104,35 @@ func TestPooledUsageForModelKeepsPollerActive(t *testing.T) {
 	NewManager(nil, nil, nil).PooledUsageForModel("claude-opus-5-5", nrNow)
 	if got := time.Unix(0, nextResetLastPick.Load()); !got.Equal(nrNow) {
 		t.Fatalf("last activity = %v", got)
+	}
+}
+
+func TestPooledUsageReportListsEveryProviderWeekly(t *testing.T) {
+	withNextReset(t)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("rp-c1", "claude", []*registry.ModelInfo{{ID: "claude-opus-5-5"}})
+	reg.RegisterClient("rp-c2", "claude", []*registry.ModelInfo{{ID: "claude-sonnet-5-5"}})
+	reg.RegisterClient("rp-x1", "codex", []*registry.ModelInfo{{ID: "gpt-5.5"}})
+	t.Cleanup(func() {
+		for _, id := range []string{"rp-c1", "rp-c2", "rp-x1"} {
+			reg.UnregisterClient(id)
+		}
+	})
+	m := NewManager(nil, nil, nil)
+	for _, a := range []*Auth{claudeAuth("rp-c1", 20, 48*time.Hour), claudeAuth("rp-c2", 60, 48*time.Hour), codexAuth("rp-x1", 50, 10*time.Hour)} {
+		if _, err := m.Register(context.Background(), a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := m.PooledUsageReport("claude-opus-5-5", nrNow)
+	if got.Provider != "claude" || got.Accounts != 1 || len(got.SevenDayByProvider) != 2 {
+		t.Fatalf("report = %+v", got)
+	}
+	// claude's weekly entry uses the model pool (only rp-c1 serves opus).
+	if c := got.SevenDayByProvider[0]; c.Provider != "claude" || c.Accounts != 1 || math.Abs(c.SevenDay.UsedPercentage-20) > 1e-9 {
+		t.Fatalf("claude entry = %+v %+v", c, c.SevenDay)
+	}
+	if o := got.SevenDayByProvider[1]; o.Provider != "openai" || o.Accounts != 1 || math.Abs(o.SevenDay.UsedPercentage-50) > 1e-9 {
+		t.Fatalf("openai entry = %+v %+v", o, o.SevenDay)
 	}
 }

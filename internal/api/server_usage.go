@@ -8,14 +8,25 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// pooledUsageHandler serves GET /v1/usage?model=<id>: pooled 5h and weekly
-// usage across the credentials that serve the model, in the rate_limits shape
+// pooledUsageHandler serves pooled 5h and weekly usage in the rate_limits shape
 // Claude Code status lines read. Claude Code does not surface usage itself when
 // it authenticates to a gateway, so status lines fetch it from here.
+//
+//	GET /v1/usage?model=<id>         credentials that serve the model, plus the
+//	                                 weekly pool of every provider (seven_day_by_provider)
+//	GET /v1/usage?provider=<name>    every credential of claude or codex (openai)
 func (s *Server) pooledUsageHandler(c *gin.Context) {
 	model := strings.TrimSpace(c.Query("model"))
-	if model == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+	provider := strings.ToLower(strings.TrimSpace(c.Query("provider")))
+	if provider == "openai" {
+		provider = "codex"
+	}
+	if (model == "") == (provider == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly one of model or provider is required"})
+		return
+	}
+	if provider != "" && provider != "claude" && provider != "codex" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider must be claude, codex or openai"})
 		return
 	}
 	if s.handlers == nil || s.handlers.AuthManager == nil {
@@ -23,5 +34,9 @@ func (s *Server) pooledUsageHandler(c *gin.Context) {
 		return
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, s.handlers.AuthManager.PooledUsageForModel(model, time.Now()))
+	if provider != "" {
+		c.JSON(http.StatusOK, s.handlers.AuthManager.PooledUsageForProvider(provider, time.Now()))
+		return
+	}
+	c.JSON(http.StatusOK, s.handlers.AuthManager.PooledUsageReport(model, time.Now()))
 }
