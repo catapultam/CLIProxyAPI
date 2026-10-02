@@ -65,7 +65,10 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	// Claude server tools such as the advisor run inside Anthropic's API and
 	// cannot be executed by Codex, so they are dropped below. When the advisor
 	// is dropped, its usage instructions are removed from the system text too.
-	dropAdvisorText := claudeToolsDeclareAdvisor(rootResult.Get("tools"))
+	// With advisor emulation (the Claude handler sets cpa_advisor_emulation),
+	// the advisor is exposed as a plain function and its instructions stay.
+	emulateAdvisor := rootResult.Get(AdvisorEmulationMarker).Bool()
+	dropAdvisorText := !emulateAdvisor && claudeToolsDeclareAdvisor(rootResult.Get("tools"))
 
 	// Process system messages and convert them to input content format.
 	systemsResult := rootResult.Get("system")
@@ -359,6 +362,10 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 			// Special handling: map Claude web search tool to Codex web_search
 			if isClaudeWebSearchToolType(toolResult.Get("type").String()) {
 				toolItems = append(toolItems, convertClaudeWebSearchToolToCodex(toolResult))
+				continue
+			}
+			if emulateAdvisor && strings.HasPrefix(toolResult.Get("type").String(), "advisor_") {
+				toolItems = append(toolItems, []byte(advisorFunctionTool))
 				continue
 			}
 			if isUnsupportedClaudeServerToolType(toolResult.Get("type").String()) {
@@ -897,3 +904,10 @@ func stripClaudeAdvisorSection(text string) string {
 	}
 	return text[:start] + text[end:]
 }
+
+// AdvisorEmulationMarker is set on a Claude request body by the Claude
+// Messages handler when it will run the advisor loop itself.
+const AdvisorEmulationMarker = "cpa_advisor_emulation"
+
+// advisorFunctionTool is the Codex function a model calls to ask for advice.
+const advisorFunctionTool = `{"type":"function","name":"advisor","description":"Ask a stronger reviewer model for advice. It sees the whole conversation so far. Takes no arguments.","parameters":{"type":"object","properties":{}},"strict":false}`

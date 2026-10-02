@@ -47,3 +47,32 @@ func TestConvertClaudeRequestToCodexKeepsAdvisorTextWithoutAdvisorTool(t *testin
 		t.Fatal("system text changed although no advisor tool was declared")
 	}
 }
+
+func TestConvertClaudeRequestToCodexExposesAdvisorWhenEmulated(t *testing.T) {
+	in := []byte(`{
+		"model":"gpt-6.1-sol",
+		"cpa_advisor_emulation":true,
+		"system":[{"type":"text","text":"Intro.\n\n# Advisor Tool\n\nCall advisor() first.\n\n# Env\nx"}],
+		"tools":[{"type":"advisor_20260301","name":"advisor","model":"opus"},{"name":"Bash","input_schema":{"type":"object","properties":{}}}],
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	out := ConvertClaudeRequestToCodex("gpt-6.1-sol", in, true)
+	var advisor gjson.Result
+	for _, tool := range gjson.GetBytes(out, "tools").Array() {
+		if tool.Get("name").String() == "advisor" {
+			advisor = tool
+		}
+	}
+	if !advisor.Exists() || advisor.Get("type").String() != "function" || advisor.Get("parameters.type").String() != "object" {
+		t.Fatalf("advisor not exposed as a function: %s", gjson.GetBytes(out, "tools").Raw)
+	}
+	if advisor.Get("model").Exists() {
+		t.Fatalf("advisor function carries the server tool model field: %s", advisor.Raw)
+	}
+	if !strings.Contains(gjson.GetBytes(out, "input.0.content.0.text").String(), "# Advisor Tool") {
+		t.Fatal("advisor instructions stripped although emulation is on")
+	}
+	if gjson.GetBytes(out, "cpa_advisor_emulation").Exists() {
+		t.Fatal("marker leaked into the codex body")
+	}
+}
