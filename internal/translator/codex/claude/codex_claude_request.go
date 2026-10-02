@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -61,12 +62,20 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 	template, _ = sjson.SetBytes(template, "model", modelName)
 	inputItems := translatorcommon.NewRawArrayItems(rootResult.Get("messages.#").Int())
 
+	// Claude server tools such as the advisor run inside Anthropic's API and
+	// cannot be executed by Codex, so they are dropped below. When the advisor
+	// is dropped, its usage instructions are removed from the system text too.
+	dropAdvisorText := claudeToolsDeclareAdvisor(rootResult.Get("tools"))
+
 	// Process system messages and convert them to input content format.
 	systemsResult := rootResult.Get("system")
 	if systemsResult.Exists() {
 		contentItems := make([][]byte, 0, 2)
 
 		appendSystemText := func(text string) {
+			if dropAdvisorText {
+				text = stripClaudeAdvisorSection(text)
+			}
 			if text == "" || util.IsClaudeCodeAttributionSystemText(text) {
 				return
 			}
@@ -350,6 +359,9 @@ func convertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool, 
 			// Special handling: map Claude web search tool to Codex web_search
 			if isClaudeWebSearchToolType(toolResult.Get("type").String()) {
 				toolItems = append(toolItems, convertClaudeWebSearchToolToCodex(toolResult))
+				continue
+			}
+			if isUnsupportedClaudeServerToolType(toolResult.Get("type").String()) {
 				continue
 			}
 			tool := []byte(toolResult.Raw)
@@ -838,4 +850,50 @@ func codexSchemaMissesRequired(schema gjson.Result) bool {
 		}
 	}
 	return false
+}
+
+// claudeServerToolType matches versioned Claude server tool types such as
+// advisor_20260301 or code_execution_20250825.
+var claudeServerToolType = regexp.MustCompile(`^[a-z][a-z0-9_]*_[0-9]{8}$`)
+
+// isUnsupportedClaudeServerToolType reports Claude server tools Codex cannot
+// run. Web search has its own mapping and is handled before this check.
+func isUnsupportedClaudeServerToolType(toolType string) bool {
+	return claudeServerToolType.MatchString(toolType) && !isClaudeWebSearchToolType(toolType)
+}
+
+func claudeToolsDeclareAdvisor(tools gjson.Result) bool {
+	found := false
+	if tools.IsArray() {
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			if strings.HasPrefix(tool.Get("type").String(), "advisor_") {
+				found = true
+				return false
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// stripClaudeAdvisorSection removes the "# Advisor Tool" section, up to the
+// next top-level heading, from Claude Code's system prompt.
+func stripClaudeAdvisorSection(text string) string {
+	const heading = "# Advisor Tool"
+	const lineBreak = "\n"
+	start := -1
+	if strings.HasPrefix(text, heading) {
+		start = 0
+	} else if i := strings.Index(text, lineBreak+heading); i >= 0 {
+		start = i + 1
+	}
+	if start < 0 {
+		return text
+	}
+	rest := text[start+len(heading):]
+	end := len(text)
+	if j := strings.Index(rest, lineBreak+"# "); j >= 0 {
+		end = start + len(heading) + j + 1
+	}
+	return text[:start] + text[end:]
 }
