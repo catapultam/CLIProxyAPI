@@ -65,6 +65,7 @@ func (s *Server) setupRoutes() {
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.GET("/usage", s.pooledUsageHandler)
+		s.agentbus.Register(v1.Group("/agentbus"))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
 		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
@@ -74,7 +75,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/videos/edits", openaiHandlers.XAIVideosEdits)
 		v1.POST("/videos/extensions", openaiHandlers.XAIVideosExtensions)
 		v1.GET("/videos/:request_id", openaiHandlers.XAIVideosRetrieve)
-		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
+		v1.POST("/messages", s.agentbus.InjectMiddleware(), claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
@@ -71,6 +72,10 @@ type Server struct {
 
 	// configFilePath is the absolute path to the YAML config file for persistence.
 	configFilePath string
+
+	// agentbus links Claude Code sessions across machines (catapultam fork).
+	agentbus     *agentbus.Store
+	agentbusStop chan struct{}
 
 	// currentPath is the absolute path to the current working directory.
 	currentPath string
@@ -191,6 +196,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
+	s.initAgentbus()
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
 	s.handlers.SetPluginHost(optionState.pluginHost)
@@ -407,6 +413,7 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	s.stopAgentbus()
 
 	if s.keepAliveEnabled {
 		select {
