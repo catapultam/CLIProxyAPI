@@ -18,7 +18,7 @@ every session sends inference to this proxy (`ANTHROPIC_BASE_URL`).
   that exits 2 wakes a session idle at its prompt and its stderr reaches the
   model ("Stop hook feedback" label, model replied without user input).
 - Addressing: every session gets an automatic address, and can also claim a
-  friendly name.
+  friendly name; `/rename` in Claude Code sets it automatically.
 - The bus lives inside the CLIProxyAPI fork. Tailnet only; nothing is published
   outside it. Upstream drift is acceptable.
 - Machines set themselves up when a session on them first talks to the proxy:
@@ -115,8 +115,8 @@ All under `/v1/agentbus`, behind the existing client API key middleware.
 | `POST /send` | `{from_session, to, body, reply_to?}` → `{id}` |
 | `POST /name` | `{session, name}` → claim or clear (empty) a name |
 | `GET /inbox?session=` | Claim and return all pending messages |
-| `POST /hello` | `{session, machine, cwd}` from the wake hook at session start |
-| `GET /wait?session=&machine=&cwd=` | Long-poll up to 50 s; returns claimed messages, or 204 on timeout; a newer waiter for the same session makes older ones return 409 |
+| `POST /hello` | `{session, machine, cwd, name?}` from the wake hook at session start |
+| `GET /wait?session=&machine=&cwd=&name=` | Long-poll up to 50 s; returns claimed messages, or 204 on timeout; a newer waiter for the same session makes older ones return 409 |
 | `GET /setup` | Shell script that installs the wake hook on the calling machine |
 
 `from_session` is the sender's session ID, which the injected note already
@@ -169,8 +169,13 @@ changed since the last note; otherwise only messages are injected.
 2. Writes the waiter script to `~/.claude/hooks/agentbus/wait.sh`.
 3. Posts `/hello` for the current session so the machine name appears at once.
 
-The waiter (`wait.sh`): reads the hook's stdin JSON (`session_id`, `cwd`),
-loops `curl /wait` (50 s per call). On 200 it prints the messages to stderr and
+The waiter (`wait.sh`): reads the hook's stdin JSON (`session_id`, `cwd`,
+`transcript_path`). Claude Code's `/rename` writes
+`{"type":"custom-title","customTitle":"..."}` lines into the transcript; the
+waiter sends the latest `customTitle` as `name` with `/hello` and `/wait`, and
+the backend applies it as the session's friendly name (same uniqueness rule as
+`POST /name`; a taken name is ignored). Because the waiter re-arms after every
+turn, a rename shows up within one turn. It then loops `curl /wait` (50 s per call). On 200 it prints the messages to stderr and
 exits 2 (wake). On 409 (a newer waiter took over) or when the base URL or token
 is missing it exits 0 silently. On network errors it retries with backoff up to
 a few minutes, then exits 0.
