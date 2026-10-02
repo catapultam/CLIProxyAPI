@@ -100,6 +100,8 @@ type Store struct {
 	mu    sync.Mutex
 	byID  map[string]*session
 	dirty bool
+	// waitTimeout bounds one /wait long-poll (defaultWaitTimeout when zero).
+	waitTimeout time.Duration
 }
 
 // NewStore returns an empty store persisted at path (empty disables saving).
