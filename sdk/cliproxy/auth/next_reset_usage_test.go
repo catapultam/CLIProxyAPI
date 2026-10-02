@@ -98,15 +98,6 @@ func TestPooledUsageForModelOnlyCountsCredentialsServingTheModel(t *testing.T) {
 	}
 }
 
-func TestPooledUsageForModelKeepsPollerActive(t *testing.T) {
-	withNextReset(t)
-	nextResetMarkActive(nrNow.Add(-10 * time.Hour))
-	NewManager(nil, nil, nil).PooledUsageForModel("claude-opus-5-5", nrNow)
-	if got := time.Unix(0, nextResetLastPick.Load()); !got.Equal(nrNow) {
-		t.Fatalf("last activity = %v", got)
-	}
-}
-
 func TestPooledUsageReportListsEveryProviderWeekly(t *testing.T) {
 	withNextReset(t)
 	reg := registry.GetGlobalRegistry()

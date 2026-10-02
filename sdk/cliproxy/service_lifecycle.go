@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
@@ -13,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -98,7 +100,7 @@ func (s *Service) Run(ctx context.Context) error {
 			cfg := s.cfg
 			s.cfgMu.RUnlock()
 			return helps.NewProxyAwareHTTPClient(reqCtx, cfg, auth, 0).Do(req)
-		})
+		}, s.nextResetStatePath())
 	}
 
 	if !homeEnabled {
@@ -380,4 +382,16 @@ func (s *Service) ensureAuthDir() error {
 		return fmt.Errorf("cliproxy: auth path exists but is not a directory: %s", s.cfg.AuthDir)
 	}
 	return nil
+}
+
+// nextResetStatePath is where the next-reset strategy keeps usage snapshots
+// across restarts: WRITABLE_PATH when set, else next to the config file.
+func (s *Service) nextResetStatePath() string {
+	if base := util.WritablePath(); base != "" {
+		return filepath.Join(base, "next-reset-state.json")
+	}
+	if s.configPath != "" {
+		return filepath.Join(filepath.Dir(s.configPath), "next-reset-state.json")
+	}
+	return ""
 }

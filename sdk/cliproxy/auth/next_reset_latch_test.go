@@ -105,16 +105,15 @@ func tokenAuth(a *Auth) *Auth {
 	return a
 }
 
-func TestNextResetPollerConfirmsLatchedBeforeRoutine(t *testing.T) {
+func TestNextResetPollerPollsLatchedFirstThenEveryDueAccount(t *testing.T) {
 	withNextReset(t)
-	nextResetMarkActive(nrNow)
 	full := tokenAuth(claudeAuth("z-full", 100, -time.Minute))
 	fresh := tokenAuth(claudeAuth("a-fresh", 10, 100*time.Hour))
 	nextResetBlocked(full, nrNow) // latch it
 	d := &fakeUsageDoer{status: 200, body: `{"seven_day":{"utilization":4,"resets_at":"2026-10-09T00:00:00Z"}}`}
 	p := newTestPoller([]*Auth{fresh, full}, d)
 	p.runOnce(context.Background(), nrNow.Add(time.Minute))
-	if len(d.calls) != 1 || !strings.HasPrefix(d.calls[0], "z-full https://api.anthropic.com/api/oauth/usage") {
+	if len(d.calls) != 2 || !strings.HasPrefix(d.calls[0], "z-full https://api.anthropic.com/api/oauth/usage") {
 		t.Fatalf("calls = %v", d.calls)
 	}
 	if nextResetIsLatched("z-full") {
@@ -122,9 +121,8 @@ func TestNextResetPollerConfirmsLatchedBeforeRoutine(t *testing.T) {
 	}
 }
 
-func TestNextResetPollerConfirmsLatchedWhileIdle(t *testing.T) {
+func TestNextResetPollerRechecksLatchedEveryRetry(t *testing.T) {
 	withNextReset(t)
-	nextResetMarkActive(nrNow.Add(-10 * time.Hour))
 	full := tokenAuth(codexAuth("c", 100, -time.Minute))
 	nextResetBlocked(full, nrNow)
 	d := &fakeUsageDoer{status: 200, body: `{"rate_limit":{"secondary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":1}}}`}
@@ -136,7 +134,6 @@ func TestNextResetPollerConfirmsLatchedWhileIdle(t *testing.T) {
 	if !nextResetIsLatched("c") {
 		t.Fatal("still-full codex account released")
 	}
-	// Re-polled only after the latch retry interval.
 	p.runOnce(context.Background(), nrNow.Add(time.Minute))
 	if len(d.calls) != 1 {
 		t.Fatalf("re-polled too soon: %v", d.calls)
@@ -147,13 +144,61 @@ func TestNextResetPollerConfirmsLatchedWhileIdle(t *testing.T) {
 	}
 }
 
-func TestNextResetPollerSkipsRoutineWhenIdle(t *testing.T) {
+func TestNextResetPollerCadence(t *testing.T) {
 	withNextReset(t)
-	nextResetMarkActive(nrNow.Add(-10 * time.Hour))
-	d := &fakeUsageDoer{status: 200, body: `{}`}
-	p := newTestPoller([]*Auth{tokenAuth(claudeAuth("a", 10, 100*time.Hour))}, d)
-	p.runOnce(context.Background(), nrNow)
-	if len(d.calls) != 0 {
-		t.Fatalf("idle routine poll: %v", d.calls)
+	// 5h window resets in 2h; weekly in 100h.
+	a := tokenAuth(claudeAuth("a", 10, 100*time.Hour))
+	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Reset"] = strconv.FormatInt(nrNow.Add(2*time.Hour).Unix(), 10)
+	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Utilization"] = "0.5"
+	d := &fakeUsageDoer{status: 500}
+	p := newTestPoller([]*Auth{a}, d)
+	p.runOnce(context.Background(), nrNow) // startup: never polled
+	if len(d.calls) != 1 {
+		t.Fatalf("startup calls = %v", d.calls)
 	}
+	p.backoff = map[string]time.Time{}
+	p.runOnce(context.Background(), nrNow.Add(time.Hour))
+	if len(d.calls) != 1 {
+		t.Fatalf("polled before anything was due: %v", d.calls)
+	}
+	p.runOnce(context.Background(), nrNow.Add(2*time.Hour+time.Minute)) // 5h reset passed
+	if len(d.calls) != 2 {
+		t.Fatalf("anticipated reset not polled: %v", d.calls)
+	}
+	p.backoff = map[string]time.Time{}
+	p.runOnce(context.Background(), nrNow.Add(4*time.Hour))
+	if len(d.calls) != 2 {
+		t.Fatalf("polled again inside the routine interval: %v", d.calls)
+	}
+	p.runOnce(context.Background(), nrNow.Add(5*time.Hour+2*time.Minute))
+	if len(d.calls) != 3 {
+		t.Fatalf("routine 3h poll missing: %v", d.calls)
+	}
+}
+
+func TestNextResetStateRoundTrip(t *testing.T) {
+	withNextReset(t)
+	path := t.TempDir() + "/state.json"
+	nextResetPolled.set("a", nextResetSnapshot{Weekly: nextResetWindow{Known: true, UsedPct: 42, ResetsAt: nrNow.Add(time.Hour)}, ObservedAt: nrNow})
+	nextResetPolled.set("old", nextResetSnapshot{ObservedAt: nrNow.Add(-8 * 24 * time.Hour)})
+	nextResetLatches.set("b", nrNow)
+	if err := saveNextResetState(path); err != nil {
+		t.Fatal(err)
+	}
+	if nextResetStateDirty.Load() {
+		t.Fatal("save left state dirty")
+	}
+	nextResetPolled = newNextResetPolledStore()
+	nextResetLatches = &nextResetLatchStore{since: make(map[string]time.Time)}
+	loadNextResetState(path, nrNow)
+	if snap, ok := nextResetPolled.get("a"); !ok || snap.Weekly.UsedPct != 42 || !snap.Weekly.ResetsAt.Equal(nrNow.Add(time.Hour)) {
+		t.Fatalf("restored a = %+v %v", snap, ok)
+	}
+	if _, ok := nextResetPolled.get("old"); ok {
+		t.Fatal("snapshot older than a week restored")
+	}
+	if !nextResetIsLatched("b") {
+		t.Fatal("latch not restored")
+	}
+	loadNextResetState(t.TempDir()+"/missing.json", nrNow) // must not panic
 }

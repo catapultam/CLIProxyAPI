@@ -226,6 +226,7 @@ func (p *nextResetPolledStore) set(authID string, snap nextResetSnapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.data[authID] = snap
+	nextResetStateDirty.Store(true)
 }
 
 func (p *nextResetPolledStore) get(authID string) (nextResetSnapshot, bool) {

@@ -99,9 +99,6 @@ func (m *Manager) pooledUsage(now time.Time, fable bool, include func(*Auth) boo
 	if m == nil {
 		return out
 	}
-	// A status line asking for usage means a client is active, so keep the
-	// poller refreshing.
-	nextResetMarkActive(now)
 	var short, weekly pooledAccumulator
 	for _, auth := range m.List() {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !nextResetTracked(auth) {

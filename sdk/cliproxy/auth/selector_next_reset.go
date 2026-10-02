@@ -70,7 +70,6 @@ func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	nextResetMarkActive(now)
 
 	ranked := make([]nextResetAssessment, 0, len(available))
 	for _, auth := range available {

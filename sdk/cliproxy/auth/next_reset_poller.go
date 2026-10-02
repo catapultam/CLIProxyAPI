@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -21,25 +20,15 @@ const (
 	codexUsageURL        = "https://chatgpt.com/backend-api/wham/usage"
 	codexUsageUserAgent  = "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"
 
-	nextResetPollEvery      = time.Minute
-	nextResetPollStaleAfter = 15 * time.Minute
-	// nextResetPollLatchedEarly re-checks a latched credential before its
-	// expected reset, so an early reset is noticed.
-	nextResetPollLatchedEarly = 30 * time.Minute
-	// nextResetPollIdleAfter stops routine polling when the strategy has made
-	// no pick for this long. Latched credentials are still confirmed.
-	nextResetPollIdleAfter = 2 * time.Hour
-	nextResetPollTimeout   = 30 * time.Second
+	nextResetPollEvery = time.Minute
+	// nextResetPollRoutine refreshes every credential at least this often.
+	nextResetPollRoutine = 3 * time.Hour
+	nextResetPollTimeout = 30 * time.Second
 
 	nextResetBackoffAuth    = 30 * time.Minute
 	nextResetBackoffLimited = 15 * time.Minute
 	nextResetBackoffOther   = 5 * time.Minute
 )
-
-// nextResetLastPick is the unix-nano time of the last next-reset pick.
-var nextResetLastPick atomic.Int64
-
-func nextResetMarkActive(now time.Time) { nextResetLastPick.Store(now.UnixNano()) }
 
 func withPrevalidatedAuthCandidates(ctx context.Context) context.Context {
 	if ctx == nil {
@@ -52,12 +41,12 @@ func withPrevalidatedAuthCandidates(ctx context.Context) context.Context {
 // credential's proxy settings.
 type NextResetHTTPDoer func(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
 
-// nextResetPoller reads the Claude and Codex usage endpoints, one credential
-// per tick. Latched credentials come first: once their expected reset passes
-// they are polled until the endpoint confirms room, and before that they are
-// re-checked occasionally for early resets. Other credentials are refreshed
-// when their poll is stale, only while the strategy is in use. The poller is
-// read-only: it never refreshes or writes credentials.
+// nextResetPoller reads the Claude and Codex usage endpoints proactively, with
+// or without traffic: every credential at startup and every three hours, and
+// any credential as soon as one of its windows reaches its reset time. A
+// latched credential whose reset has passed is polled every two minutes until
+// the endpoint confirms room. The poller is read-only: it never refreshes or
+// writes credentials.
 type nextResetPoller struct {
 	list   func() []*Auth
 	do     NextResetHTTPDoer
@@ -69,7 +58,10 @@ type nextResetPoller struct {
 	lastPoll map[string]time.Time
 }
 
-func (p *nextResetPoller) due(auth *Auth, now time.Time, idle bool) (int, bool) {
+// due reports whether auth should be polled now, and its priority (lower
+// first): 0 for a latched credential past its reset, 1 for a credential with a
+// window that reset since the last poll, 2 for the routine refresh.
+func (p *nextResetPoller) due(auth *Auth, now time.Time) (int, bool) {
 	p.mu.Lock()
 	until, polled := p.backoff[auth.ID], p.lastPoll[auth.ID]
 	p.mu.Unlock()
@@ -78,38 +70,48 @@ func (p *nextResetPoller) due(auth *Auth, now time.Time, idle bool) (int, bool) 
 	}
 	since := now.Sub(polled)
 	if nextResetIsLatched(auth.ID) {
-		_, expected := nextResetBlocked(auth, now)
-		if !expected.After(now.Add(nextResetLatchRetry)) {
+		if _, expected := nextResetBlocked(auth, now); !expected.After(now.Add(nextResetLatchRetry)) {
 			return 0, since >= nextResetLatchRetry
 		}
-		return 1, since >= nextResetPollLatchedEarly
 	}
-	if idle {
-		return 0, false
+	if snap, ok := nextResetView(auth, p.store); ok {
+		for _, w := range []nextResetWindow{snap.Short, snap.Weekly, snap.Fable} {
+			if w.Known && !w.ResetsAt.IsZero() && w.ResetsAt.After(polled) && !w.ResetsAt.After(now) {
+				return 1, true
+			}
+		}
 	}
-	return 2, since >= nextResetPollStaleAfter
+	return 2, since >= nextResetPollRoutine
 }
 
 func (p *nextResetPoller) runOnce(ctx context.Context, now time.Time) {
 	if p.active != nil && !p.active() {
 		return
 	}
-	idle := now.Sub(time.Unix(0, nextResetLastPick.Load())) > nextResetPollIdleAfter
-	auths := p.list()
-	sort.Slice(auths, func(i, j int) bool { return auths[i].ID < auths[j].ID })
-	var pick *Auth
-	pickRank := 3
-	for _, auth := range auths {
+	type dueAuth struct {
+		auth *Auth
+		rank int
+	}
+	var due []dueAuth
+	for _, auth := range p.list() {
 		if auth == nil || auth.Disabled || !nextResetTracked(auth) || authAccessToken(auth) == "" {
 			continue
 		}
-		rank, ok := p.due(auth, now, idle)
-		if ok && rank < pickRank {
-			pick, pickRank = auth, rank
+		if rank, ok := p.due(auth, now); ok {
+			due = append(due, dueAuth{auth: auth, rank: rank})
 		}
 	}
-	if pick != nil {
-		p.fetch(ctx, pick, now)
+	sort.Slice(due, func(i, j int) bool {
+		if due[i].rank != due[j].rank {
+			return due[i].rank < due[j].rank
+		}
+		return due[i].auth.ID < due[j].auth.ID
+	})
+	for _, d := range due {
+		if ctx.Err() != nil {
+			return
+		}
+		p.fetch(ctx, d.auth, now)
 	}
 }
 
@@ -188,16 +190,16 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 	}
 }
 
-// StartNextResetPoller polls the usage endpoints while the next-reset strategy
-// is the active selector (directly or as the session-affinity fallback). It
-// stops when ctx is cancelled.
-func (m *Manager) StartNextResetPoller(ctx context.Context, do NextResetHTTPDoer) {
+// StartNextResetPoller restores saved usage state from statePath, then polls
+// the usage endpoints while the next-reset strategy is the active selector
+// (directly or as the session-affinity fallback): at startup, then checking
+// every minute what is due, and saving state whenever it changed. It stops
+// when ctx is cancelled. An empty statePath disables persistence.
+func (m *Manager) StartNextResetPoller(ctx context.Context, do NextResetHTTPDoer, statePath string) {
 	if m == nil || do == nil {
 		return
 	}
-	// Count startup as activity so a fresh process fills its usage data
-	// before the first pick instead of routing blind.
-	nextResetMarkActive(time.Now())
+	loadNextResetState(statePath, time.Now())
 	p := &nextResetPoller{
 		list:     m.List,
 		do:       do,
@@ -206,22 +208,34 @@ func (m *Manager) StartNextResetPoller(ctx context.Context, do NextResetHTTPDoer
 		backoff:  make(map[string]time.Time),
 		lastPoll: make(map[string]time.Time),
 	}
+	save := func() {
+		if !nextResetStateDirty.Load() {
+			return
+		}
+		if errSave := saveNextResetState(statePath); errSave != nil {
+			log.Warnf("next-reset: save state %s: %v", statePath, errSave)
+		}
+	}
+	tick := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("next-reset: usage poller recovered from panic: %v", r)
+			}
+		}()
+		p.runOnce(ctx, time.Now())
+		save()
+	}
 	go func() {
+		tick()
 		ticker := time.NewTicker(nextResetPollEvery)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
+				save()
 				return
 			case <-ticker.C:
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							log.Errorf("next-reset: usage poller recovered from panic: %v", r)
-						}
-					}()
-					p.runOnce(ctx, time.Now())
-				}()
+				tick()
 			}
 		}
 	}()

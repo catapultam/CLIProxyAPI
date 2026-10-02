@@ -42,13 +42,17 @@ func (l *nextResetLatchStore) set(authID string, since time.Time) {
 	defer l.mu.Unlock()
 	if _, exists := l.since[authID]; !exists {
 		l.since[authID] = since
+		nextResetStateDirty.Store(true)
 	}
 }
 
 func (l *nextResetLatchStore) clear(authID string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.since, authID)
+	if _, exists := l.since[authID]; exists {
+		delete(l.since, authID)
+		nextResetStateDirty.Store(true)
+	}
 }
 
 // nextResetWindowFull reports a window that was full when observed, whatever
