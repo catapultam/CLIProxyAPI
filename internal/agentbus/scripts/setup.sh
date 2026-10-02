@@ -7,15 +7,34 @@ if [ -z "$ANTHROPIC_BASE_URL" ] || [ -z "$ANTHROPIC_AUTH_TOKEN" ]; then
 	echo "agentbus setup: ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN must be set (they are in Claude Code sessions that use the proxy)" >&2
 	exit 1
 fi
-PY=$(command -v python3 || command -v python || true)
-if [ -z "$PY" ]; then
-	echo "agentbus setup: python3 is required" >&2
+# find_python sets PY (and PYARGS for the Windows py launcher) to the first
+# interpreter that actually runs; the Windows Store python3 stub does not.
+find_python() {
+	if [ -n "$AGENTBUS_PYTHON" ] && "$AGENTBUS_PYTHON" -c 'import json, socket, urllib.parse' >/dev/null 2>&1; then
+		PY=$AGENTBUS_PYTHON PYARGS=
+		return 0
+	fi
+	for cand in python3 python; do
+		if "$cand" -c 'import json, socket, urllib.parse' >/dev/null 2>&1; then
+			PY=$cand PYARGS=
+			return 0
+		fi
+	done
+	if py -3 -c 'import json, socket, urllib.parse' >/dev/null 2>&1; then
+		PY=py PYARGS=-3
+		return 0
+	fi
+	return 1
+}
+NO_PYTHON_MSG="no working Python found (tried \$AGENTBUS_PYTHON, python3, python, py -3). Install Python 3, or set AGENTBUS_PYTHON to a working interpreter in the env block of Claude Code settings, then run setup again."
+if ! find_python; then
+	echo "agentbus setup: $NO_PYTHON_MSG" >&2
 	exit 1
 fi
 
 # Resolve the Claude Code config dir and the hook path the way Claude Code
 # sees them (Windows paths with forward slashes on Windows).
-PATHS=$("$PY" -c '
+PATHS=$("$PY" $PYARGS -c '
 import os
 base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
 base = os.path.abspath(base)
@@ -30,7 +49,7 @@ curl -fsS -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_BASE_URL/
 mv "$WAITER.tmp" "$WAITER"
 chmod +x "$WAITER"
 
-"$PY" - "$CONFIG_DIR/settings.json" "$WAITER" <<'PYEOF'
+"$PY" $PYARGS - "$CONFIG_DIR/settings.json" "$WAITER" <<'PYEOF'
 import json, os, shutil, sys
 
 path, command = sys.argv[1], sys.argv[2]
@@ -61,4 +80,8 @@ else:
     print("agentbus: wake hook already present in " + path)
 PYEOF
 
+if ! sh "$WAITER" --check; then
+	echo "agentbus setup: the wake hook was installed but its check failed. Fix the problem above and run setup again." >&2
+	exit 1
+fi
 echo "agentbus: setup complete. New sessions on this machine can be woken by messages; restart this session to be woken too."

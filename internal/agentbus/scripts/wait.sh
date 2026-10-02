@@ -4,14 +4,64 @@
 # prints it to stderr and exits 2, which wakes the session. A newer waiter for
 # the same session (409) or missing configuration exits 0 silently.
 
+# find_python sets PY (and PYARGS for the Windows py launcher) to the first
+# interpreter that actually runs; the Windows Store python3 stub does not.
+find_python() {
+	if [ -n "$AGENTBUS_PYTHON" ] && "$AGENTBUS_PYTHON" -c 'import json, socket, urllib.parse' >/dev/null 2>&1; then
+		PY=$AGENTBUS_PYTHON PYARGS=
+		return 0
+	fi
+	for cand in python3 python; do
+		if "$cand" -c 'import json, socket, urllib.parse' >/dev/null 2>&1; then
+			PY=$cand PYARGS=
+			return 0
+		fi
+	done
+	if py -3 -c 'import json, socket, urllib.parse' >/dev/null 2>&1; then
+		PY=py PYARGS=-3
+		return 0
+	fi
+	return 1
+}
+NO_PYTHON_MSG="no working Python found (tried \$AGENTBUS_PYTHON, python3, python, py -3). Install Python 3, or set AGENTBUS_PYTHON to a working interpreter in the env block of Claude Code settings, then run setup again."
+
+# --check: verify this machine can run the waiter, for setup and for agents
+# diagnosing a session that is never woken.
+if [ "$1" = "--check" ]; then
+	if ! find_python; then
+		echo "agentbus check: $NO_PYTHON_MSG" >&2
+		exit 1
+	fi
+	if [ -z "$ANTHROPIC_BASE_URL" ] || [ -z "$ANTHROPIC_AUTH_TOKEN" ]; then
+		echo "agentbus check: ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN must be set (they come from the env block of Claude Code settings)." >&2
+		exit 1
+	fi
+	CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 		-H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" "$ANTHROPIC_BASE_URL/v1/agentbus/peers") || CODE=000
+	case "$CODE" in
+	200)
+		echo "agentbus: OK (python: $PY $PYARGS, proxy: $ANTHROPIC_BASE_URL)"
+		exit 0
+		;;
+	401 | 403)
+		echo "agentbus check: the proxy rejected ANTHROPIC_AUTH_TOKEN (HTTP $CODE)." >&2
+		;;
+	000)
+		echo "agentbus check: cannot reach $ANTHROPIC_BASE_URL (is this machine on the tailnet?)." >&2
+		;;
+	*)
+		echo "agentbus check: unexpected HTTP $CODE from $ANTHROPIC_BASE_URL/v1/agentbus/peers." >&2
+		;;
+	esac
+	exit 1
+fi
+
 [ -n "$ANTHROPIC_BASE_URL" ] && [ -n "$ANTHROPIC_AUTH_TOKEN" ] || exit 0
-PY=$(command -v python3 || command -v python || true)
-[ -n "$PY" ] || exit 0
+find_python || exit 0
 
 INPUT=$(cat)
 # Line 1: query string for /wait. Line 2: session id. The friendly name is the
 # latest /rename title recorded in the transcript.
-PARSED=$(printf '%s' "$INPUT" | "$PY" -c '
+PARSED=$(printf '%s' "$INPUT" | "$PY" $PYARGS -c '
 import json, socket, sys, urllib.parse
 try:
     d = json.load(sys.stdin)
@@ -51,7 +101,7 @@ while :; do
 		"$ANTHROPIC_BASE_URL/v1/agentbus/wait?$QUERY") || CODE=000
 	case "$CODE" in
 	200)
-		"$PY" - "$TMP" "$SESSION" >&2 <<'PYEOF'
+		"$PY" $PYARGS - "$TMP" "$SESSION" >&2 <<'PYEOF'
 import json, sys
 path, session = sys.argv[1], sys.argv[2]
 with open(path, encoding="utf-8") as f:

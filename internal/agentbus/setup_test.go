@@ -174,3 +174,96 @@ func TestWaiterExitsWithoutConfiguration(t *testing.T) {
 		t.Fatalf("waiter without config: %v", err)
 	}
 }
+
+// brokenPython3Path returns a PATH whose first entry holds a python3 that
+// fails like the Windows Store stub, and a working python next to it.
+func brokenPython3Path(t *testing.T) string {
+	t.Helper()
+	real, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	dir := t.TempDir()
+	stub := "#!/bin/sh\necho 'Python was not found; run without arguments to install from the Microsoft Store' >&2\nexit 9\n"
+	if err = os.WriteFile(filepath.Join(dir, "python3"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Symlink(real, filepath.Join(dir, "python")); err != nil {
+		t.Fatal(err)
+	}
+	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
+}
+
+func TestWaiterSkipsBrokenPython3(t *testing.T) {
+	requireTools(t, "sh", "curl")
+	s, srv := scriptServer(t)
+	s.Hello(sidB, "pc", "/b", "")
+	go func() {
+		for s.Address(sidA) == "" {
+			time.Sleep(50 * time.Millisecond)
+		}
+		_, _ = s.Send(sidB, s.Address(sidA), "stub-proof", "")
+	}()
+	home := t.TempDir()
+	cmd := exec.Command("sh", "-c", waiterScript)
+	cmd.Env = append(scriptEnv(home, srv.URL), "PATH="+brokenPython3Path(t))
+	cmd.Stdin = strings.NewReader(`{"session_id":"` + sidA + `","cwd":"/a"}`)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 || !strings.Contains(stderr.String(), "stub-proof") {
+		t.Fatalf("err %v, stderr:\n%s", err, stderr.String())
+	}
+}
+
+func TestWaiterCheckReportsProblems(t *testing.T) {
+	requireTools(t, "sh", "curl", "python3")
+	_, srv := scriptServer(t)
+	home := t.TempDir()
+
+	ok := exec.Command("sh", "-c", waiterScript, "wait.sh", "--check")
+	ok.Env = scriptEnv(home, srv.URL)
+	if out, err := ok.CombinedOutput(); err != nil || !strings.Contains(string(out), "agentbus: OK") {
+		t.Fatalf("healthy check: %v\n%s", err, out)
+	}
+
+	noPython := exec.Command("sh", "-c", waiterScript, "wait.sh", "--check")
+	noPython.Env = append(scriptEnv(home, srv.URL), "PATH=/nonexistent:/bin:/usr/bin", "AGENTBUS_PYTHON=/nonexistent/python")
+	stubDir := t.TempDir()
+	stub := "#!/bin/sh\nexit 9\n"
+	for _, name := range []string{"python3", "python", "py"} {
+		if err := os.WriteFile(filepath.Join(stubDir, name), []byte(stub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	noPython.Env = append(scriptEnv(home, srv.URL), "PATH="+stubDir+":/bin:/usr/bin")
+	out, err := noPython.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "no working Python") {
+		t.Fatalf("broken python check: %v\n%s", err, out)
+	}
+
+	unreachable := exec.Command("sh", "-c", waiterScript, "wait.sh", "--check")
+	unreachable.Env = scriptEnv(home, "http://127.0.0.1:1")
+	out, err = unreachable.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "cannot reach") {
+		t.Fatalf("unreachable check: %v\n%s", err, out)
+	}
+}
+
+func TestSetupFailsLoudlyWithoutWorkingPython(t *testing.T) {
+	requireTools(t, "sh", "curl")
+	_, srv := scriptServer(t)
+	stubDir := t.TempDir()
+	for _, name := range []string{"python3", "python", "py"} {
+		if err := os.WriteFile(filepath.Join(stubDir, name), []byte("#!/bin/sh\nexit 9\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("sh", "-c", setupScript)
+	cmd.Env = append(scriptEnv(t.TempDir(), srv.URL), "PATH="+stubDir+":/bin:/usr/bin")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "no working Python") {
+		t.Fatalf("setup with broken python: %v\n%s", err, out)
+	}
+}

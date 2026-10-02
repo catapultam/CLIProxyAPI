@@ -181,10 +181,11 @@ func noteText(sid, self, name string, peers []string, note, setupHint bool, msgs
 		fmt.Fprintf(&b, "Send:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/send\" -d '{\"from_session\":\"%s\",\"to\":\"<name or address>\",\"body\":\"...\"}'  (add \"reply_to\":\"<message id>\" when replying)\n", auth, sid)
 		fmt.Fprintf(&b, "Peers: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/peers\"\n", auth)
 		fmt.Fprintf(&b, "Inbox: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/inbox?session=%s\"\n", auth, sid)
-		b.WriteString("Your name follows /rename. Only message peers when it helps the user's work.\n")
+		b.WriteString("Your name follows /rename. Messages to you arrive in your next request, or wake you while idle once this machine is set up. Only message peers when it helps the user's work.\n")
+		b.WriteString("If you are never woken by messages, diagnose this machine with: sh \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/agentbus/wait.sh\" --check\n")
 	}
 	if setupHint {
-		fmt.Fprintf(&b, "This machine cannot yet wake idle sessions when messages arrive. Set it up once with: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/setup\" | sh\n", auth)
+		fmt.Fprintf(&b, "This machine cannot yet wake idle sessions when messages arrive. Set it up once with: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/setup\" | sh  (it checks itself at the end; if it reports a problem, fix the cause and run it again)\n", auth)
 	}
 	for _, m := range msgs {
 		head := fmt.Sprintf("Message %s from %s", m.ID, m.From)
