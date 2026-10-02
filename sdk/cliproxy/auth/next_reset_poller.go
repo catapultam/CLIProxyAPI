@@ -195,6 +195,9 @@ func (m *Manager) StartNextResetPoller(ctx context.Context, do NextResetHTTPDoer
 	if m == nil || do == nil {
 		return
 	}
+	// Count startup as activity so a fresh process fills its usage data
+	// before the first pick instead of routing blind.
+	nextResetMarkActive(time.Now())
 	p := &nextResetPoller{
 		list:     m.List,
 		do:       do,

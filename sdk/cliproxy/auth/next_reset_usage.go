@@ -35,6 +35,9 @@ func (m *Manager) PooledUsageForModel(model string, now time.Time) PooledUsage {
 	if m == nil {
 		return out
 	}
+	// A status line asking for usage means a client is active, so keep the
+	// poller refreshing.
+	nextResetMarkActive(now)
 	reg := registry.GetGlobalRegistry()
 	fable := strings.Contains(strings.ToLower(model), "fable")
 	var short, weekly pooledAccumulator

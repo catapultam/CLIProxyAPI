@@ -91,3 +91,12 @@ func TestPooledUsageForModelOnlyCountsCredentialsServingTheModel(t *testing.T) {
 		t.Fatalf("codex pool = %+v %+v", got, got.SevenDay)
 	}
 }
+
+func TestPooledUsageForModelKeepsPollerActive(t *testing.T) {
+	withNextReset(t)
+	nextResetMarkActive(nrNow.Add(-10 * time.Hour))
+	NewManager(nil, nil, nil).PooledUsageForModel("claude-opus-5-5", nrNow)
+	if got := time.Unix(0, nextResetLastPick.Load()); !got.Equal(nrNow) {
+		t.Fatalf("last activity = %v", got)
+	}
+}
