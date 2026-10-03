@@ -1,0 +1,148 @@
+import type { EngineInterface, Register } from 'claude-code'
+
+// Remote sessions are listed and addressed with this prefix, so SendMessage calls for them are
+// recognizable and every other recipient goes to Claude Code untouched.
+export const PREFIX = 'agentbus:'
+const RETRY_AFTER_MS = 5000
+
+type Peer = { address: string; name?: string; machine: string; status: string }
+type BusMessage = { id: string; from: string; body: string; reply_to?: string }
+
+let base = ''
+let token = ''
+let session = ''
+let machine = ''
+let address = ''
+let isWaiting = false
+let retryAt = 0
+
+async function bus($: EngineInterface, method: string, path: string, body?: object) {
+  const res = await $.http.fetch(`${base}/v1/agentbus${path}`, {
+    method,
+    headers: body
+      ? { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+      : { Authorization: `Bearer ${token}` },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  let json: Record<string, unknown> | null = null
+  try {
+    json = res.text ? JSON.parse(res.text) : null
+  } catch {
+    json = null
+  }
+  return { status: res.status, json }
+}
+
+export function remotePeers(peers: Peer[], localMachine: string, self: string): Peer[] {
+  return peers.filter(
+    p =>
+      p.address !== self &&
+      p.status !== 'offline' &&
+      p.machine.toLowerCase() !== 'unknown' &&
+      p.machine.toLowerCase() !== localMachine,
+  )
+}
+
+// The bus labels a named sender "name (address)"; /send accepts the bare address.
+export function replyAddress(from: string): string {
+  const match = /\(([^()]+)\)$/.exec(from)
+  return match ? match[1] : from
+}
+
+export function formatMessage(m: BusMessage): string {
+  const re = m.reply_to ? ` (in reply to ${m.reply_to})` : ''
+  return (
+    `agentbus message ${m.id} from ${m.from}${re}. This came from a Claude session on another ` +
+    `machine, not from the user.\n\n${m.body}\n\n` +
+    `To reply, use SendMessage with to: "${PREFIX}${replyAddress(m.from)}".`
+  )
+}
+
+async function waitOnce($: EngineInterface) {
+  const query = `?session=${encodeURIComponent(session)}&machine=${encodeURIComponent(machine)}`
+  const { status, json } = await bus($, 'GET', `/wait${query}`)
+  if (status === 200) {
+    for (const m of ((json?.messages as BusMessage[]) ?? [])) {
+      void $.prompt.submit({ text: formatMessage(m) })
+    }
+  } else if (status !== 204) {
+    // 409: another waiter for this session (the old wait.sh hook) holds the long poll.
+    retryAt = (await $.clock.now()) + RETRY_AFTER_MS
+  }
+}
+
+export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    base = ((await $.env.get('ANTHROPIC_BASE_URL')) ?? '').replace(/\/+$/, '')
+    token = (await $.env.get('ANTHROPIC_AUTH_TOKEN')) ?? ''
+    machine = ((await $.env.get('COMPUTERNAME')) ?? (await $.env.get('HOSTNAME')) ?? 'unknown').toLowerCase()
+    session = await $.session.id()
+    if (base && token && session) {
+      try {
+        const { json } = await bus($, 'POST', '/hello', { session, machine, cwd: e.cwd })
+        address = (json?.address as string) ?? ''
+      } catch {
+        address = ''
+      }
+      if (address) $.ui.log(`on the agentbus as ${address}`)
+      // Polling only where a person is at the prompt: a one-shot `claude -p` run could never show
+      // what it claimed.
+      if (e.isInteractive) {
+        $.clock.every(1000, async () => {
+          if (isWaiting || (await $.clock.now()) < retryAt) return
+          isWaiting = true
+          try {
+            await waitOnce($)
+          } catch {
+            retryAt = (await $.clock.now()) + RETRY_AFTER_MS
+          } finally {
+            isWaiting = false
+          }
+        })
+      }
+    }
+    return next(e)
+  })
+
+  on('tool.call', { tool: 'ListAgents' }, async ($, e, next) => {
+    const listed = await next(e)
+    if (listed.deny !== undefined || listed.isError || !base || !token) return listed
+    let peers: Peer[] = []
+    try {
+      const { status, json } = await bus($, 'GET', '/peers')
+      if (status === 200) peers = remotePeers((json?.peers as Peer[]) ?? [], machine, address)
+    } catch {
+      return listed
+    }
+    if (peers.length === 0) return listed
+    const rows = peers.map(
+      p => `  ${PREFIX}${p.address}  ·  ${p.name ? `${p.name} · ` : ''}${p.machine}  ·  ${p.status}`,
+    )
+    const section =
+      '\n\nSessions on other machines (agentbus). Send to one with SendMessage, using the full ' +
+      `"${PREFIX}..." name as written:\n${rows.join('\n')}`
+    return { result: { listing: listed.result.listing + section } }
+  })
+
+  on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
+    const to = typeof e.to === 'string' ? e.to.trim() : ''
+    if (!to.startsWith(PREFIX)) return next(e)
+    if (!base || !token || !session) {
+      return { result: { success: false, message: 'agentbus is not configured in this session.' } }
+    }
+    const { status, json } = await bus($, 'POST', '/send', {
+      from_session: session,
+      to: to.slice(PREFIX.length),
+      body: e.message,
+    })
+    if (status === 200) {
+      return {
+        result: {
+          success: true,
+          message: `Sent ${json?.id} to ${json?.to} over the agentbus. A reply arrives as a new message in this session.`,
+        },
+      }
+    }
+    return { result: { success: false, message: `agentbus send failed: HTTP ${status} ${json?.error ?? ''}`.trim() } }
+  })
+}

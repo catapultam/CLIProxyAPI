@@ -142,6 +142,9 @@ func (s *Server) setupRoutes() {
 		})
 	})
 
+	// Claude Code plugin marketplace (no API key: see internal/marketplace).
+	s.registerPluginRoutes()
+
 	// OAuth callback endpoints (reuse main server port)
 	// These endpoints receive provider redirects and persist
 	// the short-lived code/state for the waiting goroutine.
