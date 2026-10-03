@@ -440,7 +440,12 @@ func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool, error) {
 			// An old record from the main channel.
 			channel = b.channelID
 		}
-		return postTarget{channel: channel, threadTS: r.ThreadTS}, channel != "", nil
+		thread := r.ThreadTS
+		if r.TopLevel {
+			// Answer at the level the message was written at.
+			thread = ""
+		}
+		return postTarget{channel: channel, threadTS: thread}, channel != "", nil
 	}
 	if owner, ok := b.state.replyOwner(o.ReplyTo); ok && owner != o.SessionID {
 		other := b.bus.Address(owner)

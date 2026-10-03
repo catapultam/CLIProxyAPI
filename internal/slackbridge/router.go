@@ -511,8 +511,18 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 	return "", false
 }
 
+// topLevelOutside reports whether ev was written at the top level of a
+// conversation other than the main channel, where an answer to it goes at
+// the top level too (replyRecord.TopLevel). In the main channel answers
+// always go in a thread.
+func (b *Bridge) topLevelOutside(ev messageEvent) bool {
+	outside := isDM(ev) || ev.Channel != b.channelID
+	return outside && (ev.ThreadTS == "" || ev.ThreadTS == ev.TS)
+}
+
 // recordDelivery remembers that msgID, delivered to sid, came from ev, so sid
-// can answer in that conversation and thread. With adopt (a top-level post),
+// can answer in that conversation and thread, at the level ev was written at
+// outside the main channel. With adopt (a top-level post),
 // later messages there reach sid too: in the channel the post's thread
 // becomes one of sid's threads (its home thread when it has none and its
 // home is the channel); in a DM the post is linked to sid, so thread
@@ -523,7 +533,7 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 // returns the one to put on ev now, which is a later receipt when one beat
 // the record (see state.record).
 func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, queued string) string {
-	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid, TS: ev.TS, Receipt: queued}
+	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid, TS: ev.TS, Receipt: queued, TopLevel: b.topLevelOutside(ev)}
 	if !isDM(ev) {
 		reaction := b.state.record(r)
 		if adopt {

@@ -408,7 +408,8 @@ func (b *Bridge) noticeLinked(channel, sid, body string) {
 		log.Warnf("slack: link notice for %s not delivered: %v", b.bus.Address(sid), err)
 		return
 	}
-	b.state.record(replyRecord{ID: msgID, Channel: channel, Session: nsid, Link: true})
+	// An answer to the notice is a top-level post in the conversation.
+	b.state.record(replyRecord{ID: msgID, Channel: channel, Session: nsid, Link: true, TopLevel: true})
 }
 
 // noticeUnlinked tells sid that a conversation it was linked to no longer
@@ -483,7 +484,7 @@ func (b *Bridge) deliverGuest(ev messageEvent, sid, text, name string) {
 	nsid, msgID, err := b.bus.DeliverGuest(sid, text, b.guestLabel(name, ev.User), b.viaOf(ev))
 	switch {
 	case err == nil:
-		r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: nsid, TS: ev.TS, Receipt: reactionQueued, Link: true}
+		r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: nsid, TS: ev.TS, Receipt: reactionQueued, Link: true, TopLevel: b.topLevelOutside(ev)}
 		b.react(ev, b.state.record(r))
 	case errors.Is(err, agentbus.ErrUnknownTarget):
 		b.reply(ev, sessionEnded)

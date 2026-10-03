@@ -288,7 +288,8 @@ func TestForeignConversationTagIsDelivered(t *testing.T) {
 		t.Fatalf("reactions = %v", got)
 	}
 	sendReply(t, b, bus, sidB, "hello there", msgs[0].ID)
-	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["thread_ts"] != "1700002700.000001" || got["text"] != "hello there" {
+	// A top-level message is answered at the top level (item 10).
+	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["thread_ts"] != "" || !strings.HasSuffix(got["text"], "hello there") {
 		t.Fatalf("answer = %+v", got)
 	}
 
@@ -403,7 +404,7 @@ func TestUnlinkedThreadReplyAfterTagGoesToTheTaggedAgent(t *testing.T) {
 	b.handleEvent("EvTR1", foreignMsg("UALEX", "bridge: look at this", "1700003200.000001", ""))
 	tagged := claimOne(t, bus, sidB)
 	sendReply(t, b, bus, sidB, "looked", tagged.ID)
-	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["thread_ts"] != "1700003200.000001" {
+	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["thread_ts"] != "" {
 		t.Fatalf("answer = %+v", got)
 	}
 	// A plain reply under it reaches the tagged agent, marked as from a group.

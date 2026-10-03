@@ -56,6 +56,11 @@ type replyRecord struct {
 	// linked to it (a guest's message, or the link notice). An answer goes
 	// there only while Channel is still linked to Session.
 	Link bool `json:"link,omitempty"`
+	// TopLevel marks a message written at the top level of a conversation
+	// other than the main channel (a DM, a group DM, another channel): an
+	// answer to it is posted at the top level there too, not in a thread.
+	// Records saved before it existed keep their ThreadTS routing.
+	TopLevel bool `json:"top_level,omitempty"`
 }
 
 // convLink ties a whole Slack conversation other than the main channel (a

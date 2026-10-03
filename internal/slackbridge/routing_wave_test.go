@@ -80,7 +80,7 @@ func TestHandOffMovesSlackRoutingToTheNewSession(t *testing.T) {
 		t.Fatalf("post = %+v", got)
 	}
 	sendReply(t, b, bus, sidC, "hi bob", guest.ID)
-	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["text"] != "hi bob" {
+	if got := lastPost(t, f); got["channel"] != "GMPIM1" || !strings.HasSuffix(got["text"], "hi bob") {
 		t.Fatalf("answer to guest = %+v", got)
 	}
 	if bus.Pending(sidA) {

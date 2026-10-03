@@ -333,7 +333,8 @@ func TestLinkedConversationInbound(t *testing.T) {
 		t.Fatalf("reactions after read = %v", got)
 	}
 	sendReply(t, b, bus, sidA, "hello bob", m.ID)
-	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["thread_ts"] != "1700004500.000002" || got["text"] != "hello bob" {
+	// A top-level message is answered at the top level (item 10).
+	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["thread_ts"] != "" || !strings.HasSuffix(got["text"], "hello bob") {
 		t.Fatalf("answer = %+v", got)
 	}
 
