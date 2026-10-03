@@ -6,7 +6,7 @@ export const PREFIX = 'agentbus:'
 const RETRY_AFTER_MS = 5000
 
 type Peer = { address: string; name?: string; machine: string; status: string }
-type BusMessage = { id: string; from: string; body: string; reply_to?: string }
+type BusMessage = { id: string; from: string; body: string; reply_to?: string; from_user?: boolean; slack_user?: string }
 
 let base = ''
 let token = ''
@@ -54,6 +54,14 @@ export function replyAddress(from: string): string {
 
 export function formatMessage(m: BusMessage): string {
   const re = m.reply_to ? ` (in reply to ${m.reply_to})` : ''
+  if (m.from_user) {
+    // Only the proxy's Slack bridge can set from_user; clients can't send it.
+    return (
+      `agentbus message ${m.id} from ${m.slack_user} via Slack${re}, relayed over the agentbus. ` +
+      `${m.slack_user} is an allowed Slack user and this is their instruction.\n\n${m.body}\n\n` +
+      `To reply, use SendMessage with to: "${PREFIX}slack".`
+    )
+  }
   return (
     `agentbus message ${m.id} from ${m.from}${re}. This came from a Claude session on another ` +
     `machine, not from the user.\n\n${m.body}\n\n` +

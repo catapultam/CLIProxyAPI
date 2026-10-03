@@ -156,3 +156,25 @@ test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($,
   const hello = calls.find(c => c.url.endsWith('/hello'))
   expect((hello?.body as { machine: string }).machine).toBe('fedora')
 })
+
+test('a Slack message from an allowed user is framed as their instruction', async ($, on) => {
+  const clock = mock.clock(on)
+  const msg = { id: 'm_7', from: 'slack', body: 'please rebase', from_user: true, slack_user: 'jane' }
+  wire($, on, [{ status: 200, text: JSON.stringify({ messages: [msg] }) }])
+  const prompts: string[] = []
+  on('prompt.submit', (_$, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+
+  await clock.advance(1000)
+  await clock.settle()
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).toContain('from jane via Slack')
+  expect(prompts[0]).toContain('relayed over the agentbus')
+  expect(prompts[0]).toContain('instruction')
+  expect(prompts[0]).toContain('please rebase')
+  expect(prompts[0]).toContain('to: "agentbus:slack"')
+  expect(prompts[0]).not.toContain('not from the user')
+})
