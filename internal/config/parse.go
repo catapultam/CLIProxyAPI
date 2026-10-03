@@ -74,6 +74,13 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.RemoteManagement.SecretKey = string(hashed)
 	}
 
+	// Hash a plaintext management login password in-memory only, mirroring
+	// the remote-management.secret-key handling above. ParseConfigBytes never
+	// persists, so the returned changed-fields map is intentionally discarded.
+	if _, errLogin := cfg.normalizeLoginAccount(); errLogin != nil {
+		return nil, errLogin
+	}
+
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository

@@ -331,6 +331,66 @@ type RemoteManagement struct {
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
 	// BaseURL specifies the base URL of the remote management API for TUI client mode (e.g. "https://proxy.example.com").
 	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+
+	// Login holds the management panel's username/password and passkey account, nested under 'login'.
+	Login LoginConfig `yaml:"login,omitempty"`
+}
+
+// LoginConfig holds the single management-panel account used by the
+// username/password and passkey login feature. It lives next to secret-key
+// inside RemoteManagement, which is itself excluded from the JSON config
+// view (see RemoteManagement's 'json:"-"' tag on Config), so this struct
+// needs no field-level json tags of its own.
+//
+// See docs/superpowers/specs/2026-10-02-management-login-design.md.
+type LoginConfig struct {
+	// Username is the single admin account's username.
+	Username string `yaml:"username,omitempty"`
+	// PasswordHash is the argon2id hash of the account password. YAML key
+	// intentionally 'password-hash' to mirror secret-key's own naming.
+	PasswordHash string `yaml:"password-hash,omitempty"`
+	// Password is a plaintext value a human can write by hand; it is hashed
+	// into PasswordHash on load and cleared, the same way secret-key works.
+	Password string `yaml:"password,omitempty"`
+	// SessionSecret signs session cookies/tokens (HMAC key). Generated the
+	// first time an account is created; rotating it invalidates every
+	// existing session (sign-out-all, password change).
+	SessionSecret string `yaml:"session-secret,omitempty"`
+	// UserHandle is the WebAuthn user.id for this account (base64url, 32
+	// random bytes), generated with the account.
+	UserHandle string `yaml:"user-handle,omitempty"`
+	// PasskeyRPID is the WebAuthn relying party ID. Empty disables passkeys.
+	PasskeyRPID string `yaml:"passkey-rp-id,omitempty"`
+	// PasskeyOrigins lists the origins WebAuthn ceremonies are accepted
+	// from. Empty defaults to https://<passkey-rp-id>.
+	PasskeyOrigins []string `yaml:"passkey-origins,omitempty"`
+	// Passkeys lists the registered WebAuthn credentials for this account.
+	Passkeys []PasskeyCredential `yaml:"passkeys,omitempty"`
+}
+
+// PasskeyCredential is the subset of a webauthn.Credential persisted in
+// config.yaml. Sign counters are intentionally not stored: synced passkeys
+// always report 0, and persisting the counter would rewrite config.yaml on
+// every login.
+type PasskeyCredential struct {
+	// ID is the base64url-encoded WebAuthn credential ID.
+	ID string `yaml:"id"`
+	// PublicKey is the base64url-encoded CBOR COSE public key.
+	PublicKey string `yaml:"public-key"`
+	// AttestationType is the attestation type reported at registration (e.g. "none").
+	AttestationType string `yaml:"attestation-type,omitempty"`
+	// Transports lists the authenticator transports reported at registration.
+	Transports []string `yaml:"transports,omitempty"`
+	// AAGUID is the base64url-encoded authenticator model identifier.
+	AAGUID string `yaml:"aaguid,omitempty"`
+	// BackupEligible reports whether the credential is eligible to be backed up/synced.
+	BackupEligible bool `yaml:"backup-eligible,omitempty"`
+	// BackupState reports whether the credential has been backed up/synced.
+	BackupState bool `yaml:"backup-state,omitempty"`
+	// Name is a human-friendly label the account owner assigns (e.g. "Pixel 9").
+	Name string `yaml:"name,omitempty"`
+	// Created is when the passkey was registered.
+	Created time.Time `yaml:"created,omitempty"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
