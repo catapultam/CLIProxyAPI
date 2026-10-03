@@ -3,10 +3,22 @@ package slackbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 
 	log "github.com/sirupsen/logrus"
 )
+
+// dialError wraps a websocket dial error for logging. A *url.Error carries
+// the whole socket URL, ticket included, so it is replaced outright.
+func dialError(errDial error) error {
+	var urlErr *url.Error
+	if errors.As(errDial, &urlErr) {
+		return errors.New("dial: malformed socket URL")
+	}
+	return fmt.Errorf("dial: %w", errDial)
+}
 
 type envelope struct {
 	Type       string          `json:"type"`
@@ -51,7 +63,7 @@ func (b *Bridge) connectOnce(ctx context.Context) (bool, error) {
 	}
 	conn, _, errDial := b.dialer.DialContext(ctx, wsURL, nil)
 	if errDial != nil {
-		return false, fmt.Errorf("dial: %w", errDial)
+		return false, dialError(errDial)
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()

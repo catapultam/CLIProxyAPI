@@ -1,11 +1,31 @@
 package slackbridge
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
 )
+
+func TestDialErrorHidesSocketTicket(t *testing.T) {
+	// A control character makes url.Parse fail before any network access.
+	_, _, errDial := websocket.DefaultDialer.Dial("wss://127.0.0.1:1/link/?ticket=SECRET-TICKET\x7f", nil)
+	if errDial == nil {
+		t.Fatal("malformed URL dialed")
+	}
+	if !strings.Contains(errDial.Error(), "SECRET-TICKET") {
+		t.Fatalf("precondition: gorilla's error no longer includes the URL: %v", errDial)
+	}
+	if got := dialError(errDial).Error(); strings.Contains(got, "SECRET-TICKET") || got != "dial: malformed socket URL" {
+		t.Fatalf("dialError = %q", got)
+	}
+	if got := dialError(errors.New("connection refused")).Error(); got != "dial: connection refused" {
+		t.Fatalf("dialError = %q", got)
+	}
+}
 
 func TestStopWithoutStartIsSafe(t *testing.T) {
 	f := newFakeSlack(t)
