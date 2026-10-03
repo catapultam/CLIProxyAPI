@@ -162,6 +162,46 @@ func TestModelRewriteYAMLRoundTrip(t *testing.T) {
 	}
 }
 
+func TestModelRewriteLegacyLayoutRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := "port: 8317\nrequest-retry: 2\nrouting:\n  model-rewrite:\n    - match: '*opus*'\n      to: claude-opus-5-5\n"
+	if errWrite := os.WriteFile(path, []byte(raw), 0600); errWrite != nil {
+		t.Fatalf("write: %v", errWrite)
+	}
+	cfg, errLoad := LoadConfig(path)
+	if errLoad != nil {
+		t.Fatalf("LoadConfig: %v", errLoad)
+	}
+	want := []ModelRewriteRule{{Match: "*opus*", To: "claude-opus-5-5"}, {Match: "*sonnet*", To: "claude-sonnet-5-5"}}
+	cfg.Routing.ModelRewrite = want
+	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
+		t.Fatalf("save: %v", errSave)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read: %v", errRead)
+	}
+	if IsV8ConfigLayout(mustYAMLRoot(t, data)) {
+		t.Fatalf("legacy save migrated the layout:\n%s", data)
+	}
+	reloaded, errReload := LoadConfig(path)
+	if errReload != nil {
+		t.Fatalf("reload: %v", errReload)
+	}
+	if !reflect.DeepEqual(reloaded.Routing.ModelRewrite, want) || reloaded.RequestRetry != 2 {
+		t.Fatalf("legacy round trip = %#v retry %d, want %#v retry 2\n%s", reloaded.Routing.ModelRewrite, reloaded.RequestRetry, want, data)
+	}
+}
+
+func mustYAMLRoot(t *testing.T, data []byte) *yaml.Node {
+	t.Helper()
+	var doc yaml.Node
+	if errUnmarshal := yaml.Unmarshal(data, &doc); errUnmarshal != nil || len(doc.Content) == 0 {
+		t.Fatalf("unmarshal: %v", errUnmarshal)
+	}
+	return doc.Content[0]
+}
+
 func TestSanitizeModelRewriteNode(t *testing.T) {
 	var doc yaml.Node
 	if errUnmarshal := yaml.Unmarshal([]byte(modelRewriteV8YAML), &doc); errUnmarshal != nil {
