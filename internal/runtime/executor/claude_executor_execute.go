@@ -394,6 +394,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		if msgID := claudeMessageIDFromSSE(data); msgID != "" {
 			commitClaudeContinuity(diagnosticsState, msgID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
+			helps.RecordClaudeThreadOwner(bodyForUpstream, msgID, auth)
 		}
 		lines := bytes.Split(data, []byte("\n"))
 		for i, line := range lines {
@@ -410,7 +411,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		data = bytes.Join(lines, []byte("\n"))
 	} else {
-		commitClaudeContinuity(diagnosticsState, claudeMessageIDFromResponse(data), helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
+		msgID := claudeMessageIDFromResponse(data)
+		commitClaudeContinuity(diagnosticsState, msgID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
+		helps.RecordClaudeThreadOwner(bodyForUpstream, msgID, auth)
 		reporter.ObserveResponseModel(data)
 		var errRestore error
 		data, errRestore = restoreClaudeOAuthToolNamesFromResponse(data, oauthToolNamesReverseMap)

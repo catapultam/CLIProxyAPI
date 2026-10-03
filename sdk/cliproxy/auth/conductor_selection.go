@@ -2156,6 +2156,26 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
+	// A Claude thread continuation can only be served by the credential that owns the
+	// thread, so prefer it over session affinity. Picking it through the normal path
+	// with a temporary pin keeps availability filtering and rebinds session affinity
+	// to the owner. When the owner is unavailable, fall back to normal selection.
+	if ownerID := claudeThreadContinueOwner(opts); ownerID != "" && pinnedAuthIDFromMetadata(opts.Metadata) == "" {
+		if _, used := tried[ownerID]; !used {
+			opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = ownerID
+			auth, executor, provider, errPick := m.pickNextMixedSelect(ctx, providers, model, opts, tried)
+			delete(opts.Metadata, cliproxyexecutor.PinnedAuthMetadataKey)
+			if errPick == nil {
+				logEntryWithRequestID(ctx).Debugf("claude thread: routing continuation to owner auth=%s", ownerID)
+				return auth, executor, provider, nil
+			}
+			logEntryWithRequestID(ctx).Debugf("claude thread: owner auth=%s unavailable, falling back to normal selection: %v", ownerID, errPick)
+		}
+	}
+	return m.pickNextMixedSelect(ctx, providers, model, opts, tried)
+}
+
+func (m *Manager) pickNextMixedSelect(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 

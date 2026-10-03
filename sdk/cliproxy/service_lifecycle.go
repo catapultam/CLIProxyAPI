@@ -117,6 +117,7 @@ func (s *Service) Run(ctx context.Context) error {
 			s.cfgMu.RUnlock()
 			return helps.NewProxyAwareHTTPClient(reqCtx, cfg, auth, 0).Do(req)
 		}, s.nextResetStatePath())
+		coreauth.StartClaudeThreadOwnerPersistence(ctx, s.runtimeStatePath("claude-thread-owners.json"))
 	}
 
 	if !homeEnabled {
@@ -348,6 +349,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 				}
 			}
 		}
+		coreauth.SaveClaudeThreadOwners()
 
 		if s.pluginHost != nil {
 			sdktranslator.SetPluginHooks(nil)
@@ -393,11 +395,17 @@ func (s *Service) ensureAuthDir() error {
 // nextResetStatePath is where the next-reset strategy keeps usage snapshots
 // across restarts: WRITABLE_PATH when set, else next to the config file.
 func (s *Service) nextResetStatePath() string {
+	return s.runtimeStatePath("next-reset-state.json")
+}
+
+// runtimeStatePath places a runtime state file in WRITABLE_PATH when set, else
+// next to the config file. It returns "" when neither is known.
+func (s *Service) runtimeStatePath(name string) string {
 	if base := util.WritablePath(); base != "" {
-		return filepath.Join(base, "next-reset-state.json")
+		return filepath.Join(base, name)
 	}
 	if s.configPath != "" {
-		return filepath.Join(filepath.Dir(s.configPath), "next-reset-state.json")
+		return filepath.Join(filepath.Dir(s.configPath), name)
 	}
 	return ""
 }
