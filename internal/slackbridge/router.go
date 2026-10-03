@@ -357,10 +357,13 @@ func (b *Bridge) send(ev messageEvent, user allowedUser, sid, text string, adopt
 //   - a top-level "name: …" or "@name …" goes to that agent;
 //   - any other top-level message goes to the agent the user last talked to
 //     in the DM (dmLast, while it hasn't expired), else to the agent the DM
-//     is linked to, or gets a help reply.
+//     is linked to, or gets a help reply. So does a "name: …" or "@name …"
+//     whose name is no agent's, whole, with a reply saying where it went
+//     (without dmLast or a link, it gets the not-found help).
 //
-// "!" commands take the same routes, with the same owner rule. Every
-// delivery makes its agent the user's dmLast.
+// "!" commands take the same routes, with the same owner rule, except that
+// a command never falls back: its name must be an agent's. Every delivery
+// makes its agent the user's dmLast.
 func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link convLink, linkedDM bool) {
 	b.rememberDM(ev.User, ev.Channel)
 	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
@@ -384,22 +387,37 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 		b.send(ev, user, sid, text, false)
 		return
 	}
+	// unresolved marks a "name: …" or "@name …" whose name is no agent's
+	// (say, how an agent introduced itself): the whole text goes where a
+	// plain message would, and the reply says where.
+	unresolved := false
 	if target, body, addressedOK := parseAddressed(text); addressedOK {
-		notFound := b.notFoundReply(ev, target)
-		if home, isMove := parseMove(body); isMove {
-			b.move(ev, user, target, home, notFound)
+		_, found := b.bus.Resolve(target)
+		_, isMove := parseMove(body)
+		if found || isMove || isBang(body) || !b.dmHasFallback(ev.User, linkedDM) {
+			notFound := b.notFoundReply(ev, target)
+			if home, isMove := parseMove(body); isMove {
+				b.move(ev, user, target, home, notFound)
+				return
+			}
+			if isBang(body) {
+				b.runCommand(ev, user, target, body, notFound, true)
+				return
+			}
+			b.deliverAddressed(ev, target, body, user, notFound)
 			return
 		}
-		if isBang(body) {
-			b.runCommand(ev, user, target, body, notFound, true)
-			return
-		}
-		b.deliverAddressed(ev, target, body, user, notFound)
-		return
-	}
-	if sid, body, ok := b.tagged(ev, text); ok {
+		unresolved = true
+	} else if sid, body, ok := b.tagged(ev, text); ok {
 		b.send(ev, user, sid, body, true)
 		return
+	} else if name, body, atOK := parseAtTagged(ev.Text, text); atOK {
+		if isBang(body) {
+			// A command needs an exact target; it never falls back.
+			b.runCommand(ev, user, name, body, b.notFoundReply(ev, name), true)
+			return
+		}
+		unresolved = true
 	}
 	if home, isMove := parseMove(text); isMove {
 		// A move names its agent by thread or "name:", never by dmLast.
@@ -421,10 +439,18 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 		b.reply(ev, b.help(ev))
 		return
 	}
-	if _, delivered := b.deliver(ev, sid, text, user, sessionEnded, true); delivered && viaLast {
-		// dm_last may be stale: say which agent got it.
+	if _, delivered := b.deliver(ev, sid, text, user, sessionEnded, true); delivered && (viaLast || unresolved) {
+		// dm_last may be stale, or the text named another: say which agent
+		// got it.
 		b.replyInThread(ev, "→ sent to `"+escape(b.agentLabel(ev, sid))+"`")
 	}
+}
+
+// dmHasFallback reports whether a plain top-level message from userID in
+// their DM goes to an agent: their dm_last, or the DM's link.
+func (b *Bridge) dmHasFallback(userID string, linkedDM bool) bool {
+	_, ok := b.state.dmLast(userID)
+	return ok || linkedDM
 }
 
 // dmThreadSession is the session a DM thread reply goes to: the one its
