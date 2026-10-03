@@ -230,6 +230,32 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	waitAuthRegistrations(skippedWaits)
 }
 
+// registerInitialAuths synchronously registers every auth the watcher would load on
+// its initial scan, so the model registry is populated before the HTTP listener opens.
+// Each auth is seeded into the watcher with its revision, so the watcher's own initial
+// scan treats unchanged auths as already applied instead of registering them again.
+func (s *Service) registerInitialAuths(ctx context.Context) {
+	if s == nil || s.watcher == nil {
+		return
+	}
+	auths := s.watcher.SnapshotAuths()
+	updates := make([]watcher.AuthUpdate, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		update := watcher.AuthUpdate{Action: watcher.AuthUpdateActionAdd, ID: auth.ID, Auth: auth}
+		if _, rev := s.watcher.DispatchPersistedAuthUpdateWithRevision(&update); rev > 0 {
+			update.SetRevision(rev)
+		}
+		updates = append(updates, update)
+	}
+	if len(updates) == 0 {
+		return
+	}
+	s.handleAuthUpdates(coreauth.WithSkipPersist(ctx), updates)
+}
+
 func coalesceAuthUpdates(updates []watcher.AuthUpdate) []watcher.AuthUpdate {
 	if len(updates) <= 1 {
 		return updates

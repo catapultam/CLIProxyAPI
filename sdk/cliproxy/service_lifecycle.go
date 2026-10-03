@@ -77,6 +77,16 @@ func (s *Service) Run(ctx context.Context) error {
 	s.applyRetryConfig(s.cfg)
 	s.configureCooldownStateStore(s.cfg)
 
+	if !homeEnabled {
+		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
+		watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
+		if errCreate != nil {
+			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
+		}
+		s.watcher = watcherWrapper
+		watcherWrapper.SetConfig(s.cfg)
+	}
+
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
@@ -92,6 +102,12 @@ func (s *Service) Run(ctx context.Context) error {
 			includeBaseline: true,
 			auths:           s.coreManager.List(),
 		})
+		// Register the models of the auths on disk before the HTTP listener opens.
+		// Otherwise requests that arrive while the watcher's initial scan is still
+		// queued see an empty model registry and fail with a non-retryable 400
+		// model_not_found. This runs before auto-refresh starts so a refresh job
+		// cannot bump an auth's generation and make its registration look stale.
+		s.registerInitialAuths(ctx)
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(ctx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
@@ -191,24 +207,14 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if !homeEnabled {
-		var watcherWrapper *WatcherWrapper
-		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
-
-		watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
-		if errCreate != nil {
-			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
-		}
-		s.watcher = watcherWrapper
 		s.ensureAuthUpdateQueue(ctx)
 		if s.authUpdates != nil {
-			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
+			s.watcher.SetAuthUpdateQueue(s.authUpdates)
 		}
-		watcherWrapper.SetConfig(s.cfg)
-		s.registerPluginAuthParser()
 
 		watcherCtx, watcherCancel := context.WithCancel(context.Background())
 		s.watcherCancel = watcherCancel
-		if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
+		if errStart := s.watcher.Start(watcherCtx); errStart != nil {
 			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
 		}
 		log.Info("file watcher started for config and auth directory changes")
