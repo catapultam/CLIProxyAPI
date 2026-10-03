@@ -14,10 +14,10 @@ const (
 	howToAddress = "To reach an agent, reply in its thread, or post `name: message` at the top level (the name or address from its thread header)."
 	commandHelp  = "Commands (for people set in config.yaml): `@agents allow @person` lets someone instruct agents; `@agents remove @person` takes that back. " +
 		"`@agents chat @person [@person …] with <agent>` opens a group DM linked to an agent; `@agents dm @person with <agent>` opens the bot's DM with that person, linked to an agent. " +
-		"`@agents link <agent>` links the conversation it's posted in; `@agents unlink` undoes that. In a linked conversation, everyone who isn't allowed is a guest: the agent gets their messages as input, not instructions."
+		"`@agents link <agent>` links the conversation it's posted in; `@agents unlink` undoes that. From the main channel or your DM with the bot, `@agents links` lists linked conversations, and `@agents unlink @person` or `@agents unlink <conversation id>` unlinks them. In a linked conversation, everyone who isn't allowed is a guest: the agent gets their messages as input, not instructions."
 	ownersOnly = "Only people set in config.yaml (allowed-emails) can allow or remove users."
 	// ownersOnlyLinks refuses chat, dm, link and unlink from a non-owner.
-	ownersOnlyLinks = "Only people set in config.yaml (allowed-emails) can open, link or unlink conversations."
+	ownersOnlyLinks = "Only people set in config.yaml (allowed-emails) can open, list, link or unlink conversations."
 	notSavedNote    = " (not saved; this reverts when the proxy restarts)"
 	// ownersOnlyCommands refuses a "!" command from a non-owner.
 	ownersOnlyCommands = "Only owners can run commands."
@@ -88,6 +88,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	}
 	if b.alreadySeen(key) {
 		return
+	}
+	if linked {
+		// So an owner can later unlink every conversation this person is in.
+		b.state.noteMember(ev.Channel, ev.User)
 	}
 	if !allowed {
 		b.routeGuest(ev, link)
@@ -522,7 +526,7 @@ func (b *Bridge) onlineHint() string {
 func (b *Bridge) command(ev messageEvent, user allowedUser, cmd botCommand) {
 	if !user.config {
 		log.Infof("slack: refused %s by non-owner %s", cmd.verb, user.ID)
-		if cmd.opensLink() {
+		if cmd.opensLink() || cmd.verb == "links" {
 			b.replyCommand(ev, ownersOnlyLinks)
 		} else {
 			b.replyCommand(ev, ownersOnly)
@@ -543,7 +547,16 @@ func (b *Bridge) command(ev messageEvent, user allowedUser, cmd botCommand) {
 	case "link":
 		b.linkHere(ev, user, cmd.agent)
 	case "unlink":
-		b.unlinkHere(ev, user)
+		switch {
+		case target != "":
+			b.unlinkPerson(ev, user, target)
+		case cmd.conv != "":
+			b.unlinkByID(ev, user, cmd.conv)
+		default:
+			b.unlinkHere(ev, user)
+		}
+	case "links":
+		b.listLinks(ev)
 	case "allow":
 		b.cmdMu.Lock()
 		b.cmdSeq[target]++

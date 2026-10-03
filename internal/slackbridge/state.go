@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +68,29 @@ type convLink struct {
 	// Seen is when the session was last known to be on the bus. The link is
 	// dropped once that is more than linkAbsentTTL ago.
 	Seen time.Time `json:"seen"`
+	// Kind is kindDM, kindGroup or kindChannel (empty in links saved before
+	// it was recorded).
+	Kind string `json:"kind,omitempty"`
+	// Members are the user IDs known to be in the conversation: everyone a
+	// chat or dm command opened it with, the owner who linked it in place,
+	// and anyone who wrote there while it was linked (at most
+	// maxLinkMembers). An owner can unlink every conversation a person is in.
+	Members []string `json:"members,omitempty"`
+}
+
+// Conversation kinds of a link.
+const (
+	kindDM      = "dm"
+	kindGroup   = "group"
+	kindChannel = "channel"
+	// maxLinkMembers caps the user IDs a link remembers.
+	maxLinkMembers = 100
+)
+
+// linkedConv is a live link and the conversation it is for.
+type linkedConv struct {
+	Channel string
+	convLink
 }
 
 // dmLink ties a top-level message in a DM to a session, so a thread reply
@@ -703,32 +728,74 @@ func (st *state) threadSession(channel, threadTS string) (string, bool) {
 	return newest, newest != ""
 }
 
-// linkConversation links channel to sid, as owner by did, replacing any
-// link it had. It returns the session channel was linked to before (empty
-// for none) and the save error.
-func (st *state) linkConversation(channel, sid, by string) (string, error) {
+// linkConversation links channel (of kind) to sid, as owner by did, with
+// members known to be in it (added to those a live link there knew),
+// replacing any link it had. It returns the session channel was linked to
+// before (empty for none) and the save error.
+func (st *state) linkConversation(channel, sid, by, kind string, members []string) (string, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	prev := ""
+	var known []string
 	if l, ok := st.liveConvLocked(channel); ok {
-		prev = l.Session
+		prev, known = l.Session, l.Members
+	}
+	for _, id := range members {
+		if !slices.Contains(known, id) && len(known) < maxLinkMembers {
+			known = append(known, id)
+		}
 	}
 	now := st.now()
-	st.convs[channel] = convLink{Session: sid, By: by, At: now, Seen: now}
+	st.convs[channel] = convLink{Session: sid, By: by, At: now, Seen: now, Kind: kind, Members: slices.Clone(known)}
 	return prev, st.saveLocked()
 }
 
-// unlinkConversation removes channel's link. It returns the session it was
-// linked to, whether there was a live link, and the save error.
-func (st *state) unlinkConversation(channel string) (string, bool, error) {
+// unlinkConversation removes channel's link. It returns the link, whether
+// there was a live one, and the save error.
+func (st *state) unlinkConversation(channel string) (convLink, bool, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	l, ok := st.liveConvLocked(channel)
 	if _, present := st.convs[channel]; !present {
-		return "", false, nil
+		return convLink{}, false, nil
 	}
 	delete(st.convs, channel)
-	return l.Session, ok, st.saveLocked()
+	return l, ok, st.saveLocked()
+}
+
+// noteMember records userID as in channel's live link, saving when it is
+// new there.
+func (st *state) noteMember(channel, userID string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	l, ok := st.liveConvLocked(channel)
+	if !ok || slices.Contains(l.Members, userID) || len(l.Members) >= maxLinkMembers {
+		return
+	}
+	l.Members = append(slices.Clone(l.Members), userID)
+	st.convs[channel] = l
+	if errSave := st.saveLocked(); errSave != nil {
+		logSaveError(errSave)
+	}
+}
+
+// conversations lists the live links, oldest first.
+func (st *state) conversations() []linkedConv {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var out []linkedConv
+	for channel := range st.convs {
+		if l, ok := st.liveConvLocked(channel); ok {
+			out = append(out, linkedConv{Channel: channel, convLink: l})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].At.Equal(out[j].At) {
+			return out[i].At.Before(out[j].At)
+		}
+		return out[i].Channel < out[j].Channel
+	})
+	return out
 }
 
 // conversation returns channel's link, unless its session has been absent

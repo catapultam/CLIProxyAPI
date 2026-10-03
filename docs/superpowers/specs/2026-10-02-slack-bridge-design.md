@@ -576,14 +576,32 @@ input.
   does the agent on unlink). Linking the owner's own DM makes the agent their
   `dm_last`; a linked DM's plain messages fall back to the link when
   `dm_last` has expired.
-- *Who may.* Only owners (config users) may chat, dm, link or unlink.
-  An allowed non-owner gets "Only people set in config.yaml (allowed-emails)
-  can open, link or unlink conversations."; a guest gets that (or the
-  allow/remove refusal); all refusals are logged (user ID only). In an
-  unlinked conversation the bot answers only these four commands from
-  allowed users and ignores allow/remove.
+- *Revoking from afar (fix round 1).* An owner may not be in the
+  conversation (a `dm` opens Bob's DM without them; they may have left a
+  group DM), so in the main channel or their DM with the bot:
+  - `@agents links` lists every live link: conversation id, kind
+    (dm/group/channel), its known members by label (never a mention, so no
+    one is pinged), the agent's address, who linked it and when (UTC).
+  - `@agents unlink @person` unlinks every live link whose known members
+    include that person; `@agents unlink <conversation id>` unlinks that
+    one.
+  Each unlink removes the link, sends the agent the unlinked notice, posts
+  "This conversation is no longer linked to an agent." at the top level of
+  that conversation and confirms where the command was given. Posted in
+  any other conversation these answer "Run `@agents links` … in the main
+  channel or your DM with the bot." (the listing would show who else is
+  linked where). Bare `@agents unlink` keeps unlinking in place.
+- *Who may.* Only owners (config users) may chat, dm, link, unlink or list
+  links. An allowed non-owner gets "Only people set in config.yaml
+  (allowed-emails) can open, list, link or unlink conversations."; a guest
+  gets that (or the allow/remove refusal); all refusals are logged (user ID
+  only). In an unlinked conversation the bot answers only chat, dm, link
+  and unlink from allowed users and ignores allow/remove and links.
 - *State.* `slack-state.json` `conversations`: channel ID → `{session, by,
-  at, seen}`. `seen` is when the session was last on the bus
+  at, seen, kind, members}`. `kind` is dm, group or channel. `members` are
+  the user IDs known to be there: everyone `chat`/`dm` opened it with, the
+  owner who linked it in place, and anyone who writes there while it is
+  linked (capped at 100; kept on a relink). `seen` is when the session was last on the bus
   (`Store.SessionSeen`), moved up on every lookup and on start; a link whose
   session has been absent for 7 days is dropped (lookups skip it, and the
   next save, the start-up refresh or a lookup prunes it). No other expiry.
@@ -615,7 +633,9 @@ input.
     cached in memory (a failed lookup uses the user ID and isn't cached).
     The first message of an uncached guest waits for the lookup on the job
     queue, and that guest's later messages queue behind it, so they stay in
-    order. A guest's text is delivered whole (no tags; a leading bot
+    order. When the job runs, the link is checked again: if the
+    conversation was unlinked or relinked (a different session or a newer
+    linking) meanwhile, the message is dropped and logged. A guest's text is delivered whole (no tags; a leading bot
     mention is dropped). A guest's `!command` gets "Only owners can run
     commands." and an `@agents` command the owner-only refusal; neither is
     delivered.

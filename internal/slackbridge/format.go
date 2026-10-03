@@ -78,12 +78,15 @@ func parseAtTagged(raw, text string) (string, string, bool) {
 
 // botCommand is an "@bot <verb> …" command.
 type botCommand struct {
-	// verb is allow, remove, chat, dm, link or unlink.
+	// verb is allow, remove, chat, dm, link, unlink or links.
 	verb string
-	// users: the person to allow or remove, to DM, or to add to a chat.
+	// users: the person to allow or remove, to DM, to add to a chat, or
+	// whose linked conversations to unlink.
 	users []string
 	// agent is the agent to chat, DM or link with, as written.
 	agent string
+	// conv is the conversation id "unlink <id>" names.
+	conv string
 	// ok is false when the arguments don't fit the verb.
 	ok bool
 }
@@ -93,14 +96,17 @@ func (c botCommand) opensLink() bool {
 	return c.verb == "chat" || c.verb == "dm" || c.verb == "link" || c.verb == "unlink"
 }
 
-var commandVerbs = map[string]bool{"allow": true, "remove": true, "chat": true, "dm": true, "link": true, "unlink": true}
+var commandVerbs = map[string]bool{"allow": true, "remove": true, "chat": true, "dm": true, "link": true, "unlink": true, "links": true}
+
+// conversationID is the shape of a Slack conversation id.
+var conversationID = regexp.MustCompile(`^[A-Z0-9]{2,32}$`)
 
 // parseCommand reads a message that starts by mentioning the bot
 // (mentioned). When the next word is a command verb it returns the command:
 //
 //	@bot allow @user | @bot remove @user
 //	@bot chat @user [@user …] with <agent> | @bot dm @user with <agent>
-//	@bot link <agent> | @bot unlink
+//	@bot link <agent> | @bot unlink [@user | <conversation id>] | @bot links
 //
 // Otherwise cmd.verb is empty and rest is the raw text after the mention.
 func parseCommand(text, botID string) (cmd botCommand, rest string, mentioned bool) {
@@ -125,8 +131,22 @@ func parseCommand(text, botID string) (cmd botCommand, rest string, mentioned bo
 		if len(args) == 1 {
 			cmd.agent, cmd.ok = agentArg(args[0])
 		}
-	case "unlink":
+	case "links":
 		cmd.ok = len(args) == 0
+	case "unlink":
+		switch {
+		case len(args) == 0:
+			cmd.ok = true
+		case len(args) > 1:
+		case strings.HasPrefix(args[0], "<"):
+			if id, ok := mentionID(args); ok {
+				cmd.users, cmd.ok = []string{id}, true
+			}
+		default:
+			if id := strings.Trim(args[0], "`"); conversationID.MatchString(id) {
+				cmd.conv, cmd.ok = id, true
+			}
+		}
 	case "chat", "dm":
 		n := len(args)
 		if n < 3 || !strings.EqualFold(args[n-2], "with") {

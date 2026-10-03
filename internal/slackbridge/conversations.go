@@ -22,6 +22,11 @@ const (
 	notLinked       = "This conversation isn't linked to an agent."
 	needSomeone     = "Name at least one other person: `@agents chat @person with <agent>`."
 	tooLarge        = "That message is over the 16 KiB agentbus limit and was not delivered."
+	// noLongerLinked is posted in a conversation an owner unlinked from
+	// elsewhere.
+	noLongerLinked = "This conversation is no longer linked to an agent."
+	// manageLinksWhere answers links and unlink-from-afar posted elsewhere.
+	manageLinksWhere = "Run `@agents links` and `@agents unlink @person` or `@agents unlink <conversation id>` in the main channel or your DM with the bot."
 )
 
 // conversationLink returns channel's link while its session hasn't been
@@ -127,7 +132,11 @@ func (b *Bridge) applyOpen(ctx context.Context, owner allowedUser, verb string, 
 		}
 		names = append(names, "@"+b.guestLabel(b.guestName(ctx, id), id))
 	}
-	prev, errSave := b.state.linkConversation(channel, sid, owner.ID)
+	linkKind := kindGroup
+	if verb == "dm" {
+		linkKind = kindDM
+	}
+	prev, errSave := b.state.linkConversation(channel, sid, owner.ID, linkKind, members)
 	if verb == "dm" {
 		if u, ok := b.state.user(members[0]); ok {
 			// Their plain messages there go to the linked agent from now on.
@@ -161,7 +170,7 @@ func (b *Bridge) linkHere(ev messageEvent, owner allowedUser, agent string) {
 		b.replyCommand(ev, b.notFoundAgent(agent))
 		return
 	}
-	prev, errSave := b.state.linkConversation(ev.Channel, sid, owner.ID)
+	prev, errSave := b.state.linkConversation(ev.Channel, sid, owner.ID, linkKindOf(ev), []string{ev.User})
 	if isDM(ev) {
 		// The owner's own DM: plain messages go to the linked agent now.
 		b.state.setDMLast(ev.User, sid)
@@ -184,19 +193,158 @@ func (b *Bridge) unlinkHere(ev messageEvent, owner allowedUser) {
 		b.replyCommand(ev, mainNotLinkable)
 		return
 	}
-	prev, ok, errSave := b.state.unlinkConversation(ev.Channel)
+	l, ok, errSave := b.state.unlinkConversation(ev.Channel)
 	if !ok {
 		b.replyCommand(ev, notLinked)
 		return
 	}
-	b.noticeUnlinked(prev, owner)
-	log.Infof("slack: %s unlinked %s from %s", owner.ID, ev.Channel, b.bus.Address(prev))
-	confirm := fmt.Sprintf("Unlinked this conversation from `%s`. Messages here no longer reach it; tag an agent (`name: message`) to reach one.", escape(b.bus.Address(prev)))
+	b.noticeUnlinked(l.Session, owner)
+	log.Infof("slack: %s unlinked %s from %s", owner.ID, ev.Channel, b.bus.Address(l.Session))
+	confirm := fmt.Sprintf("Unlinked this conversation from `%s`. Messages here no longer reach it; tag an agent (`name: message`) to reach one.", escape(b.bus.Address(l.Session)))
 	if errSave != nil {
 		logSaveError(errSave)
 		confirm += notSavedNote
 	}
 	b.replyCommand(ev, confirm)
+}
+
+// managesFromAfar reports whether ev is where an owner lists and revokes
+// links: the main channel or their DM with the bot. Elsewhere the listing
+// could show guests who else is linked where.
+func (b *Bridge) managesFromAfar(ev messageEvent) bool {
+	if isDM(ev) || ev.Channel == b.channelID {
+		return true
+	}
+	b.replyCommand(ev, manageLinksWhere)
+	return false
+}
+
+// listLinks runs "links": every live link, with its conversation id, kind,
+// known members, agent, who linked it and when. People are named by label,
+// never mentioned, so the listing pings no one.
+func (b *Bridge) listLinks(ev messageEvent) {
+	if !b.managesFromAfar(ev) {
+		return
+	}
+	links := b.state.conversations()
+	if len(links) == 0 {
+		b.replyCommand(ev, "No conversations are linked.")
+		return
+	}
+	lines := []string{"Linked conversations:"}
+	for _, l := range links {
+		var who []string
+		for _, id := range l.Members {
+			who = append(who, b.personName(id))
+		}
+		members := "members not recorded"
+		if len(who) > 0 {
+			members = "with " + strings.Join(who, ", ")
+		}
+		lines = append(lines, fmt.Sprintf("• `%s` %s %s → `%s`, linked by %s on %s", escape(l.Channel), kindName(l.Kind), members,
+			escape(b.bus.Address(l.Session)), b.personName(l.By), l.At.UTC().Format("2006-01-02 15:04 UTC")))
+	}
+	b.replyCommand(ev, strings.Join(lines, "\n"))
+}
+
+// personName names a user without pinging them: @label for an allowed
+// user, @label for a guest whose name is known, else their user ID.
+func (b *Bridge) personName(userID string) string {
+	if u, ok := b.state.user(userID); ok {
+		return "@" + u.Label
+	}
+	b.guestMu.Lock()
+	name, ok := b.guestNames[userID]
+	b.guestMu.Unlock()
+	if ok && strings.TrimSpace(name) != "" {
+		return "@" + b.guestLabel(name, userID)
+	}
+	return "`" + escape(userID) + "`"
+}
+
+// kindName shows a link's kind; links saved before kinds were recorded
+// have none.
+func kindName(kind string) string {
+	if kind == "" {
+		return "conversation"
+	}
+	return kind
+}
+
+// linkKindOf is the link kind of the conversation ev was written in.
+func linkKindOf(ev messageEvent) string {
+	switch {
+	case isDM(ev):
+		return kindDM
+	case ev.ChannelType == "mpim":
+		return kindGroup
+	}
+	return kindChannel
+}
+
+// unlinkPerson runs "unlink @person": it revokes every live link whose
+// known members include userID.
+func (b *Bridge) unlinkPerson(ev messageEvent, owner allowedUser, userID string) {
+	if !b.managesFromAfar(ev) {
+		return
+	}
+	var done []string
+	failed := false
+	for _, l := range b.state.conversations() {
+		if !slices.Contains(l.Members, userID) {
+			continue
+		}
+		if revoked, ok, errSave := b.revoke(l.Channel, owner); ok {
+			done = append(done, fmt.Sprintf("`%s` (%s, `%s`)", escape(l.Channel), kindName(revoked.Kind), escape(b.bus.Address(revoked.Session))))
+			failed = failed || errSave != nil
+		}
+	}
+	if len(done) == 0 {
+		b.replyCommand(ev, fmt.Sprintf("<@%s> isn't in any linked conversation.", userID))
+		return
+	}
+	confirm := fmt.Sprintf("Unlinked the conversations <@%s> is in: %s.", userID, strings.Join(done, ", "))
+	if failed {
+		confirm += notSavedNote
+	}
+	b.replyCommand(ev, confirm)
+}
+
+// unlinkByID runs "unlink <conversation id>".
+func (b *Bridge) unlinkByID(ev messageEvent, owner allowedUser, channel string) {
+	if !b.managesFromAfar(ev) {
+		return
+	}
+	l, ok, errSave := b.revoke(channel, owner)
+	if !ok {
+		b.replyCommand(ev, fmt.Sprintf("No linked conversation `%s`.", escape(channel)))
+		return
+	}
+	confirm := fmt.Sprintf("Unlinked `%s` (%s) from `%s`.", escape(channel), kindName(l.Kind), escape(b.bus.Address(l.Session)))
+	if errSave != nil {
+		confirm += notSavedNote
+	}
+	b.replyCommand(ev, confirm)
+}
+
+// revoke unlinks channel on an owner's word from elsewhere: the agent is
+// told, and the conversation gets a note that it no longer reaches one. It
+// returns the link and whether there was a live one.
+func (b *Bridge) revoke(channel string, owner allowedUser) (convLink, bool, error) {
+	l, ok, errSave := b.state.unlinkConversation(channel)
+	if errSave != nil {
+		logSaveError(errSave)
+	}
+	if !ok {
+		return convLink{}, false, nil
+	}
+	b.noticeUnlinked(l.Session, owner)
+	b.enqueueCommand(func(ctx context.Context) error {
+		_, err := b.api.postMessage(ctx, b.cfg.BotToken, channel, noLongerLinked, "")
+		return err
+	})
+	log.Infof("slack: %s unlinked %s from %s", owner.ID, channel, b.bus.Address(l.Session))
+	return l, true, errSave
 }
 
 // relinked is what the confirmation adds when the conversation was linked
@@ -308,7 +456,13 @@ func (b *Bridge) routeGuest(ev messageEvent, link convLink) {
 	// A dropped job (queue overflow) leaves the count up, so that guest's
 	// later messages keep going through the queue; they still arrive.
 	b.enqueue(func(ctx context.Context) error {
-		b.deliverGuest(ev, link.Session, text, b.guestName(ctx, ev.User))
+		// The link may have changed while this waited: deliver only over the
+		// same link (same session, same linking).
+		if now, ok := b.conversationLink(ev.Channel); ok && now.Session == link.Session && now.At.Equal(link.At) {
+			b.deliverGuest(ev, link.Session, text, b.guestName(ctx, ev.User))
+		} else {
+			log.Infof("slack: dropped a queued message from guest %s in %s: the conversation was unlinked or relinked", ev.User, ev.Channel)
+		}
 		b.guestMu.Lock()
 		if b.guestQueued[ev.User]--; b.guestQueued[ev.User] <= 0 {
 			delete(b.guestQueued, ev.User)

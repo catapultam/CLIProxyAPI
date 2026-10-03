@@ -498,10 +498,10 @@ func TestLinkPrunedOnLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.now = clock.now
-	if _, err = st.linkConversation("GOLD", sidA, "UALEX"); err != nil {
+	if _, err = st.linkConversation("GOLD", sidA, "UALEX", kindGroup, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = st.linkConversation("GNEW", sidB, "UALEX"); err != nil {
+	if _, err = st.linkConversation("GNEW", sidB, "UALEX", kindGroup, nil); err != nil {
 		t.Fatal(err)
 	}
 
