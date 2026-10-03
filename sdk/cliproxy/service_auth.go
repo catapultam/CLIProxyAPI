@@ -230,18 +230,35 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	waitAuthRegistrations(skippedWaits)
 }
 
-// registerInitialAuths synchronously registers every auth the watcher would load on
-// its initial scan, so the model registry is populated before the HTTP listener opens.
-// Each auth is seeded into the watcher with its revision, so the watcher's own initial
-// scan treats unchanged auths as already applied instead of registering them again.
-func (s *Service) registerInitialAuths(ctx context.Context) {
+// initialAuthRegistrationWait bounds how long startup waits for the initial auth
+// registration before it opens the HTTP listener. No upstream connection exists yet;
+// this only keeps a hung model lookup (such as a plugin ModelsForAuth call) from
+// keeping the listener closed forever.
+var initialAuthRegistrationWait = 30 * time.Second
+
+// registerInitialAuths registers every auth the watcher would load on its initial
+// scan, so the model registry is populated before the HTTP listener opens. Each auth
+// is seeded into the watcher with its revision, so the watcher's own initial scan
+// treats unchanged auths as already applied instead of registering them again.
+//
+// It waits at most initialAuthRegistrationWait. Past that it logs a warning and
+// returns while the registration finishes in the background; the registration is
+// not cancelled, because the seeded revisions make the watcher skip these auths. The
+// returned channel closes when the registration has finished.
+func (s *Service) registerInitialAuths(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	if s == nil || s.watcher == nil {
-		return
+		close(done)
+		return done
 	}
 	auths := s.watcher.SnapshotAuths()
 	updates := make([]watcher.AuthUpdate, 0, len(auths))
 	for _, auth := range auths {
 		if auth == nil || auth.ID == "" {
+			continue
+		}
+		// registerConfigAPIKeyAuths has already registered config API keys.
+		if coreauth.IsConfigAPIKeyAuth(auth) {
 			continue
 		}
 		update := watcher.AuthUpdate{Action: watcher.AuthUpdateActionAdd, ID: auth.ID, Auth: auth}
@@ -251,9 +268,22 @@ func (s *Service) registerInitialAuths(ctx context.Context) {
 		updates = append(updates, update)
 	}
 	if len(updates) == 0 {
-		return
+		close(done)
+		return done
 	}
-	s.handleAuthUpdates(coreauth.WithSkipPersist(ctx), updates)
+	go func() {
+		defer close(done)
+		s.handleAuthUpdates(coreauth.WithSkipPersist(ctx), updates)
+	}()
+	timer := time.NewTimer(initialAuthRegistrationWait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-timer.C:
+		log.Warnf("initial auth registration still running after %s; opening the listener while it finishes in the background", initialAuthRegistrationWait)
+	}
+	return done
 }
 
 func coalesceAuthUpdates(updates []watcher.AuthUpdate) []watcher.AuthUpdate {
