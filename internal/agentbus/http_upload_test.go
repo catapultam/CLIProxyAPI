@@ -3,6 +3,8 @@ package agentbus
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"image"
 	"image/png"
@@ -360,5 +362,153 @@ func TestHTTPSlackUploadRepeatedSessionLastWins(t *testing.T) {
 	}
 	if n := len(fb.posted()); n != 1 {
 		t.Fatalf("posted = %d", n)
+	}
+}
+
+// jsonUpload builds a JSON upload. data nil leaves data_base64 out.
+func jsonUpload(t *testing.T, fields map[string]string, data []byte) *http.Request {
+	t.Helper()
+	body := map[string]string{}
+	for k, v := range fields {
+		body[k] = v
+	}
+	if data != nil {
+		body["data_base64"] = base64.StdEncoding.EncodeToString(data)
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rawJSONUpload(string(raw))
+}
+
+func rawJSONUpload(body string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, uploadPath, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	return req
+}
+
+func TestHTTPSlackUploadJSONPostsImage(t *testing.T) {
+	s, r, fb := newUploadServer(t)
+	data := tinyPNG(t)
+	req := jsonUpload(t, map[string]string{"session": sidA, "caption": "!screenshot on pc", "reply_to": "m_0123abcd", "filename": "shot.png"}, data)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- serve(r, req) }()
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("JSON upload hung (bridge called under the store lock?)")
+	}
+	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != `{"ok":true}` {
+		t.Fatalf("upload = %d %s", w.Code, w.Body)
+	}
+	got := fb.posted()
+	if len(got) != 1 || !bytes.Equal(got[0].data, data) || got[0].filename != "shot.png" {
+		t.Fatalf("posted = %+v", got)
+	}
+	want := Outbound{SessionID: sidA, Address: s.Address(sidA), Name: "flyer", Machine: "pc", Body: "!screenshot on pc", ReplyTo: "m_0123abcd"}
+	if got[0].out != want {
+		t.Fatalf("outbound = %+v, want %+v", got[0].out, want)
+	}
+}
+
+func TestHTTPSlackUploadJSONRefusals(t *testing.T) {
+	_, r, fb := newUploadServer(t)
+	data := tinyPNG(t)
+	cases := []struct {
+		name   string
+		req    *http.Request
+		status int
+		want   string
+	}{
+		{"unknown session", jsonUpload(t, map[string]string{"session": sidB}, data), http.StatusBadRequest, "session is not a known session"},
+		{"no session", jsonUpload(t, nil, data), http.StatusBadRequest, "session is required"},
+		{"no data", jsonUpload(t, map[string]string{"session": sidA}, nil), http.StatusBadRequest, "file is required"},
+		{"bad base64", rawJSONUpload(`{"session":"` + sidA + `","data_base64":"not base64!"}`), http.StatusBadRequest, "data_base64 is not valid base64"},
+		{"long caption", jsonUpload(t, map[string]string{"session": sidA, "caption": strings.Repeat("c", maxFieldBytes+1)}, data), http.StatusBadRequest, "caption exceeds 4 KiB"},
+		{"long filename", jsonUpload(t, map[string]string{"session": sidA, "filename": strings.Repeat("f", maxFieldBytes+1)}, data), http.StatusBadRequest, "filename exceeds 4 KiB"},
+		{"invalid JSON", rawJSONUpload(`{"session":`), http.StatusBadRequest, "invalid JSON body"},
+		{"not an object", rawJSONUpload(`["x"]`), http.StatusBadRequest, "invalid JSON body"},
+		{"text", jsonUpload(t, map[string]string{"session": sidA}, []byte("just some text, honest")), http.StatusUnsupportedMediaType, "only PNG, JPEG, GIF or WebP images"},
+		{"empty data", jsonUpload(t, map[string]string{"session": sidA}, []byte{}), http.StatusUnsupportedMediaType, "only PNG, JPEG, GIF or WebP images"},
+	}
+	for _, tc := range cases {
+		w := serve(r, tc.req)
+		if w.Code != tc.status || !strings.Contains(w.Body.String(), tc.want) {
+			t.Fatalf("%s = %d %s", tc.name, w.Code, w.Body)
+		}
+	}
+	if n := len(fb.posted()); n != 0 {
+		t.Fatalf("posted %d refused JSON uploads", n)
+	}
+}
+
+func TestHTTPSlackUploadJSONTooLarge(t *testing.T) {
+	_, r, fb := newUploadServer(t)
+	// An image just over 10 MiB still fits the body cap, so the image cap
+	// itself refuses it.
+	big := append(tinyPNG(t), make([]byte, maxImageBytes)...)
+	w := serve(r, jsonUpload(t, map[string]string{"session": sidA}, big))
+	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), "image exceeds 10 MiB") {
+		t.Fatalf("big image = %d %s", w.Code, w.Body)
+	}
+	// A body over the JSON body cap fails while it is read.
+	w = serve(r, jsonUpload(t, map[string]string{"session": sidA, "junk": strings.Repeat("x", maxJSONUploadBytes)}, tinyPNG(t)))
+	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), "image exceeds 10 MiB") {
+		t.Fatalf("big body = %d %s", w.Code, w.Body)
+	}
+	// Exactly 10 MiB is allowed.
+	exact := append(tinyPNG(t), make([]byte, maxImageBytes-len(tinyPNG(t)))...)
+	if w = serve(r, jsonUpload(t, map[string]string{"session": sidA}, exact)); w.Code != http.StatusOK {
+		t.Fatalf("10 MiB image = %d %s", w.Code, w.Body)
+	}
+	if n := len(fb.posted()); n != 1 {
+		t.Fatalf("posted %d, want only the 10 MiB image", n)
+	}
+}
+
+func TestHTTPSlackUploadJSONNeedsAnImageBridge(t *testing.T) {
+	s, r := newTestServer(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	for _, b := range []Bridge{nil, &fakeBridge{users: []string{"alex"}}} {
+		s.SetBridge(b)
+		w := serve(r, jsonUpload(t, map[string]string{"session": sidA}, tinyPNG(t)))
+		if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "slack is not enabled") {
+			t.Fatalf("bridge %T: JSON upload = %d %s", b, w.Code, w.Body)
+		}
+	}
+}
+
+func TestHTTPSlackUploadJSONSharesTheSlots(t *testing.T) {
+	s, r, fb := newUploadServer(t)
+	for i := 0; i < maxUploads; i++ {
+		s.uploadSlots <- struct{}{}
+	}
+	w := serve(r, jsonUpload(t, map[string]string{"session": sidA}, tinyPNG(t)))
+	if w.Code != http.StatusTooManyRequests || strings.TrimSpace(w.Body.String()) != `{"error":"too many image uploads in progress"}` {
+		t.Fatalf("JSON upload with every slot held = %d %s", w.Code, w.Body)
+	}
+	if n := len(fb.posted()); n != 0 {
+		t.Fatalf("posted %d uploads over the cap", n)
+	}
+	for i := 0; i < maxUploads; i++ {
+		<-s.uploadSlots
+	}
+	data := tinyPNG(t)
+	reqs := []*http.Request{
+		jsonUpload(t, map[string]string{"session": sidA}, data),
+		jsonUpload(t, map[string]string{"session": sidB}, data),
+		jsonUpload(t, map[string]string{"session": sidA}, []byte("plain text")),
+		jsonUpload(t, map[string]string{"session": sidA}, append(tinyPNG(t), make([]byte, maxImageBytes)...)),
+		rawJSONUpload(`{`),
+	}
+	for i, req := range reqs {
+		if w := serve(r, req); w.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d got 429: a slot leaked", i)
+		}
+		if n := len(s.uploadSlots); n != 0 {
+			t.Fatalf("after request %d, %d slots still held", i, n)
+		}
 	}
 }
