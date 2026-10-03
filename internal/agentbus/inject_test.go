@@ -249,6 +249,9 @@ func TestInjectNoModSessionGetsInstallInstructions(t *testing.T) {
 	if !strings.Contains(text, want) {
 		t.Fatalf("install instructions missing: %s", text)
 	}
+	if !strings.Contains(text, "new-machine.md in the private repo catapultam/homelab-notes") {
+		t.Fatalf("note does not point at the setup runbook: %s", text)
+	}
 	assertNoHookMention(t, text)
 }
 
