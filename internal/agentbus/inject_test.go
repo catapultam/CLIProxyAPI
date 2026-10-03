@@ -271,3 +271,57 @@ func TestInjectResendsNoteWhenModStarts(t *testing.T) {
 		t.Fatalf("mod instructions missing after flip: %s", got.body)
 	}
 }
+
+func TestInjectSlackLineWhenBridgeAttached(t *testing.T) {
+	clock := &fakeClock{now: t0}
+	s, r, got := newInjectServer(t, clock)
+	s.SetBridge(&fakeBridge{users: []string{"alex", "jane"}})
+	post(r, sidA, "", stringContentBody)
+	note := strings.Join(lastUserTexts(got.body), "\n")
+	for _, want := range []string{`alex, jane`, `"agentbus:slack"`, `@<name>`, `finish a task, get blocked, or need a decision`} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("note missing %q:\n%s", want, note)
+		}
+	}
+}
+
+func TestInjectNoSlackLineWithoutBridge(t *testing.T) {
+	clock := &fakeClock{now: t0}
+	s, r, got := newInjectServer(t, clock)
+	_ = s
+	post(r, sidA, "", stringContentBody)
+	if strings.Contains(strings.Join(lastUserTexts(got.body), "\n"), "Slack") {
+		t.Fatalf("slack line without a bridge: %s", got.body)
+	}
+}
+
+func TestInjectNoteAgainWhenSlackUsersChange(t *testing.T) {
+	clock := &fakeClock{now: t0}
+	s, r, got := newInjectServer(t, clock)
+	fb := &fakeBridge{users: []string{"alex"}}
+	s.SetBridge(fb)
+	post(r, sidA, "", stringContentBody)
+	post(r, sidA, "", stringContentBody)
+	if strings.Contains(got.body, "<agentbus>") {
+		t.Fatal("note repeated with nothing new")
+	}
+	fb.users = []string{"alex", "jane"}
+	post(r, sidA, "", stringContentBody)
+	if !strings.Contains(got.body, "alex, jane") {
+		t.Fatalf("note not refreshed after the allowlist changed: %s", got.body)
+	}
+}
+
+func TestInjectFromUserHeader(t *testing.T) {
+	clock := &fakeClock{now: t0}
+	s, r, got := newInjectServer(t, clock)
+	s.Touch(sidA)
+	if _, err := s.Deliver(sidA, "please rebase", "jane"); err != nil {
+		t.Fatal(err)
+	}
+	post(r, sidA, "", stringContentBody)
+	text := strings.Join(lastUserTexts(got.body), "\n")
+	if !strings.Contains(text, "from jane via Slack") || !strings.Contains(text, "their instruction") || !strings.Contains(text, "please rebase") {
+		t.Fatalf("header = %s", text)
+	}
+}

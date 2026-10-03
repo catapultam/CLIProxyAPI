@@ -33,6 +33,13 @@ func (s *Store) SetBridge(b Bridge) {
 	s.bridge = b
 }
 
+// currentBridge returns the attached bridge, or nil when Slack is off.
+func (s *Store) currentBridge() Bridge {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bridge
+}
+
 func isSlackAddress(target string) bool {
 	return strings.EqualFold(strings.TrimSpace(target), SlackAddress)
 }

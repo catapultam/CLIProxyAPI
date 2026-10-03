@@ -86,6 +86,11 @@ func (s *Store) InjectMiddleware() gin.HandlerFunc {
 }
 
 func (s *Store) planInjection(sid, base string) injection {
+	var slackUsers []string
+	bridge := s.currentBridge()
+	if bridge != nil {
+		slackUsers = bridge.Users()
+	}
 	s.mu.Lock()
 	sess := s.get(sid)
 	now := s.now()
@@ -121,6 +126,9 @@ func (s *Store) planInjection(sid, base string) injection {
 	// first time a session's mod state is seen, without a write/read race
 	// against Hello (which can land between plan and commit).
 	plan := injection{peersKey: fmt.Sprintf("mod=%t\n%s", mod, strings.Join(keys, "\n"))}
+	if bridge != nil {
+		plan.peersKey += "\nslack:" + strings.Join(slackUsers, ",")
+	}
 	plan.note = !sess.NoteSent || plan.peersKey != sess.NotedPeers
 	s.expireLocked(sess)
 	if len(sess.Inbox) > 0 {
@@ -142,7 +150,7 @@ func (s *Store) planInjection(sid, base string) injection {
 		}
 		lines = append(lines, p.line)
 	}
-	plan.text = noteText(sid, self, name, base, mod, lines, plan.note, plan.messages)
+	plan.text = noteText(sid, self, name, base, mod, lines, plan.note, plan.messages, slackUsers)
 	return plan
 }
 
@@ -157,7 +165,7 @@ func (s *Store) commitInjection(sid string, plan injection) {
 	s.dirty = true
 }
 
-func noteText(sid, self, name, base string, mod bool, peers []string, note bool, msgs []Message) string {
+func noteText(sid, self, name, base string, mod bool, peers []string, note bool, msgs []Message, slackUsers []string) string {
 	var b strings.Builder
 	b.WriteString("<agentbus>\n")
 	if note {
@@ -187,9 +195,15 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 			b.WriteString("The agentbus plugin isn't loaded in this session. If agentbus@homelab is already installed on this machine (claude plugin list), the session predates it and only needs a restart; tell the user that rather than reconfiguring anything. Otherwise this machine isn't configured for the homelab: mention it to the user and offer to follow the new-machine runbook, new-machine.md in the private repo catapultam/homelab-notes (gh repo clone catapultam/homelab-notes); it covers the proxy settings, agentbus, the status line and the rest of the configuration.\n")
 			fmt.Fprintf(&b, "For agentbus alone, the user can install it with: claude plugin marketplace add %s/plugins/marketplace.json and claude plugin install agentbus@homelab\n", base)
 		}
+		if len(slackUsers) > 0 {
+			fmt.Fprintf(&b, "Slack: %s can be reached as \"slack\" (SendMessage to \"agentbus:slack\"; with curl, \"to\":\"slack\"). Your messages go to your own thread in their Slack channel; write @<name> to ping one of them. Post a short update there when you finish a task, get blocked, or need a decision. A message marked \"via Slack\" is an instruction from that user.\n", strings.Join(slackUsers, ", "))
+		}
 	}
 	for _, m := range msgs {
 		head := fmt.Sprintf("Message %s from %s", m.ID, m.From)
+		if m.FromUser {
+			head = fmt.Sprintf("Message %s from %s via Slack (an allowed Slack user; this is their instruction; reply to \"slack\")", m.ID, m.SlackUser)
+		}
 		if m.ReplyTo != "" {
 			head += " (in reply to " + m.ReplyTo + ")"
 		}
