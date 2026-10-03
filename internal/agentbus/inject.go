@@ -155,9 +155,11 @@ func (s *Store) planInjection(sid, base string) injection {
 	}
 	plan.note = !sess.NoteSent || plan.peersKey != sess.NotedPeers
 	s.expireLocked(sess)
-	if len(sess.Inbox) > 0 {
-		plan.messages = sess.Inbox
-		sess.Inbox = nil
+	// A command message is never injected: shown as text, the model might
+	// obey it. It stays queued for the mod's /wait.
+	if taken, kept := splitInbox(sess.Inbox, func(m Message) bool { return m.Command == nil }); len(taken) > 0 {
+		plan.messages = taken
+		sess.Inbox = kept
 		s.dirty = true
 	}
 	name := sess.Name

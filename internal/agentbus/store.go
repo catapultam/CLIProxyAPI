@@ -47,6 +47,10 @@ var (
 	ErrEmptyBody     = errors.New("message body is empty")
 	ErrNameTaken     = errors.New("name already taken")
 	ErrInvalidName   = errors.New("invalid name")
+	// ErrCommandUnsupported means the target session's agentbus mod can't
+	// run commands (no mod, or older than MinCommandModVersion).
+	ErrCommandUnsupported = errors.New("session can't run commands")
+	ErrInvalidCommand     = errors.New("invalid command")
 )
 
 var (
@@ -59,6 +63,8 @@ var (
 	validMachine = validName
 	// validReplyTo is the shape of an id from newMessageID.
 	validReplyTo = regexp.MustCompile(`^m_[0-9a-f]{1,64}$`)
+	// validModVersion is a plain dotted version as the mod reports it.
+	validModVersion = regexp.MustCompile(`^[0-9]{1,6}(\.[0-9]{1,6}){0,3}$`)
 )
 
 // Message is one queued message.
@@ -70,10 +76,43 @@ type Message struct {
 	ReplyTo   string    `json:"reply_to,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	// FromUser marks an instruction from an allowed Slack user. Only Deliver
-	// sets it; clients can never send it.
+	// and DeliverCommand set it; clients can never send it.
 	FromUser  bool   `json:"from_user,omitempty"`
 	SlackUser string `json:"slack_user,omitempty"`
+	// SlackUserID is the Slack user ID of the owner who sent Command. Only
+	// DeliverCommand sets it, and /wait re-checks it before handing the
+	// command out.
+	SlackUserID string `json:"slack_user_id,omitempty"`
+	// Command is an owner's remote command for the agentbus mod to run.
+	// Only DeliverCommand sets it; clients can never send it, and such a
+	// message leaves the store only through /wait, never by injection.
+	Command *Command `json:"command,omitempty"`
 }
+
+// Command is a remote command for the session's agentbus mod. Kind picks the
+// fields used:
+//   - slash: Command (without "/") and Args, final as given;
+//   - prompt: Text, with {args} replaced by Args by the mod;
+//   - shell: Argv (OS key -> argv), where an element that is exactly {args}
+//     becomes Args as one argv value and {out} a temp file path; Output is
+//     text or image; Timeout is in seconds.
+type Command struct {
+	Name    string              `json:"name"`
+	Kind    string              `json:"kind"`
+	Command string              `json:"command,omitempty"`
+	Args    string              `json:"args,omitempty"`
+	Text    string              `json:"text,omitempty"`
+	Argv    map[string][]string `json:"argv,omitempty"`
+	Output  string              `json:"output,omitempty"`
+	Timeout int                 `json:"timeout,omitempty"`
+}
+
+// Command kinds.
+const (
+	CommandSlash  = "slash"
+	CommandPrompt = "prompt"
+	CommandShell  = "shell"
+)
 
 // Peer is one session as other sessions see it.
 type Peer struct {
@@ -94,6 +133,7 @@ type session struct {
 	LastRequest time.Time `json:"last_request"`
 	WaiterSeen  time.Time `json:"waiter_seen"`
 	Mod         bool      `json:"mod,omitempty"`
+	ModVersion  string    `json:"mod_version,omitempty"`
 	Waits       bool      `json:"waits,omitempty"`
 	Closed      bool      `json:"closed,omitempty"`
 	NoteSent    bool      `json:"note_sent,omitempty"`
@@ -201,6 +241,24 @@ func (s *Store) Hello(id, machine, cwd, name string, mod bool) {
 	if name = strings.TrimSpace(name); validName.MatchString(name) && !strings.EqualFold(name, sess.Name) && s.nameFree(name, id) {
 		sess.Name = name
 	}
+	s.dirty = true
+}
+
+// SetModVersion records the agentbus mod version a known session reports.
+// A value validModVersion rejects (including empty) is ignored, so the last
+// valid version stands.
+func (s *Store) SetModVersion(id, version string) {
+	version = strings.TrimSpace(version)
+	if !validModVersion.MatchString(version) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[id]
+	if !ok || sess.ModVersion == version {
+		return
+	}
+	sess.ModVersion = version
 	s.dirty = true
 }
 
@@ -409,6 +467,18 @@ func (s *Store) expireLocked(sess *session) {
 
 // Claim removes and returns every pending message for a session.
 func (s *Store) Claim(id string) []Message {
+	return s.claimWhere(id, func(Message) bool { return true })
+}
+
+// ClaimPlain removes and returns a session's pending messages except those
+// carrying a Command, which stay queued for the mod's /wait.
+func (s *Store) ClaimPlain(id string) []Message {
+	return s.claimWhere(id, func(m Message) bool { return m.Command == nil })
+}
+
+// claimWhere removes and returns the pending messages take accepts, in
+// order, and leaves the rest queued.
+func (s *Store) claimWhere(id string, take func(Message) bool) []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.byID[id]
@@ -416,13 +486,26 @@ func (s *Store) Claim(id string) []Message {
 		return nil
 	}
 	s.expireLocked(sess)
-	if len(sess.Inbox) == 0 {
+	out, kept := splitInbox(sess.Inbox, take)
+	if len(out) == 0 {
 		return nil
 	}
-	out := sess.Inbox
-	sess.Inbox = nil
+	sess.Inbox = kept
 	s.dirty = true
 	return out
+}
+
+// splitInbox splits msgs into those take accepts and the rest, both in
+// order, without sharing a backing array with msgs.
+func splitInbox(msgs []Message, take func(Message) bool) (taken, kept []Message) {
+	for _, m := range msgs {
+		if take(m) {
+			taken = append(taken, m)
+		} else {
+			kept = append(kept, m)
+		}
+	}
+	return taken, kept
 }
 
 // Pending reports whether a session has unclaimed messages.
@@ -646,6 +729,10 @@ func (s *Store) Load() error {
 		}
 		if sess.Machine != "" && !validMachine.MatchString(sess.Machine) {
 			sess.Machine = ""
+			s.dirty = true
+		}
+		if sess.ModVersion != "" && !validModVersion.MatchString(sess.ModVersion) {
+			sess.ModVersion = ""
 			s.dirty = true
 		}
 		for i := range sess.Inbox {

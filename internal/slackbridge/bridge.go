@@ -26,6 +26,9 @@ type Config struct {
 	Channel       string
 	AllowedEmails []string
 	StatePath     string
+	// CommandsDir holds the agent command registry (<name>.yaml files).
+	// Empty means no registry: only harness commands and !commands work.
+	CommandsDir string
 	// APIBase overrides https://slack.com/api/ (tests).
 	APIBase string
 }
@@ -38,8 +41,9 @@ func (c Config) complete() bool {
 type job func(ctx context.Context) error
 
 var (
-	_ agentbus.Bridge      = (*Bridge)(nil)
-	_ agentbus.ImagePoster = (*Bridge)(nil)
+	_ agentbus.Bridge       = (*Bridge)(nil)
+	_ agentbus.ImagePoster  = (*Bridge)(nil)
+	_ agentbus.OwnerChecker = (*Bridge)(nil)
 )
 
 // Bridge links the agentbus to one Slack channel. It implements
@@ -50,7 +54,9 @@ type Bridge struct {
 	api    *api
 	dialer *websocket.Dialer
 	state  *state
-	jobs   chan job
+	// cmdRegistry is the agent command registry; nil when CommandsDir is empty.
+	cmdRegistry *registry
+	jobs        chan job
 	// commands holds allow jobs and command replies. runJobs drains it
 	// first, and enqueue's drop-oldest never touches it.
 	commands   chan job
@@ -92,18 +98,19 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 		log.Warnf("slack: load state (starting empty): %v", errLoad)
 	}
 	return &Bridge{
-		cfg:        cfg,
-		bus:        bus,
-		api:        newAPI(cfg.APIBase),
-		dialer:     websocket.DefaultDialer,
-		state:      st,
-		jobs:       make(chan job, jobQueueSize),
-		commands:   make(chan job, commandQueueSize),
-		backoff:    defaultBackoff,
-		retryDelay: 2 * time.Second,
-		seen:       map[string]bool{},
-		cmdSeq:     map[string]uint64{},
-		opening:    map[string]*openGate{},
+		cfg:         cfg,
+		bus:         bus,
+		api:         newAPI(cfg.APIBase),
+		dialer:      websocket.DefaultDialer,
+		state:       st,
+		cmdRegistry: newRegistry(cfg.CommandsDir),
+		jobs:        make(chan job, jobQueueSize),
+		commands:    make(chan job, commandQueueSize),
+		backoff:     defaultBackoff,
+		retryDelay:  2 * time.Second,
+		seen:        map[string]bool{},
+		cmdSeq:      map[string]uint64{},
+		opening:     map[string]*openGate{},
 	}, nil
 }
 
@@ -116,6 +123,13 @@ func logSaveError(err error) { log.Warnf("slack: save state: %v", err) }
 
 // Users lists the allowed users' labels.
 func (b *Bridge) Users() []string { return b.state.labels() }
+
+// IsOwner reports whether userID is an allowed user seeded from config. It
+// implements agentbus.OwnerChecker.
+func (b *Bridge) IsOwner(userID string) bool {
+	u, ok := b.state.user(userID)
+	return ok && u.config
+}
 
 // Post queues a session's message for its thread. It never blocks.
 func (b *Bridge) Post(o agentbus.Outbound) {

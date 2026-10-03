@@ -15,7 +15,11 @@ const (
 	commandHelp  = "Commands (for people set in config.yaml): `@agents allow @person` lets someone instruct agents; `@agents remove @person` takes that back."
 	ownersOnly   = "Only people set in config.yaml (allowed-emails) can allow or remove users."
 	notSavedNote = " (not saved; this reverts when the proxy restarts)"
-	onlineLimit  = 10
+	// ownersOnlyCommands refuses a "!" command from a non-owner.
+	ownersOnlyCommands = "Only owners can run commands."
+	howToCommand       = "Run a command in an agent's thread (`!compact`), or at the top level as `name: !compact`. `!commands` lists them."
+	sessionEnded       = "That agent's session has ended, so this wasn't delivered."
+	onlineLimit        = 10
 )
 
 type messageEvent struct {
@@ -68,18 +72,105 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 			}
 			return
 		}
-		b.deliver(ev, sid, text, user, "That agent's session has ended, so this wasn't delivered.")
+		if isBang(text) {
+			b.runCommand(ev, user, sid, text, sessionEnded, false)
+			return
+		}
+		b.deliver(ev, sid, text, user, sessionEnded)
 		return
 	}
 	target, body, addressedOK := parseAddressed(text)
 	if !addressedOK {
+		if isBang(text) {
+			// Only !commands needs no target; runCommand explains the rest.
+			b.runCommand(ev, user, "", text, "", false)
+			return
+		}
 		b.reply(ev, howToAddress)
 		return
 	}
 	notFound := fmt.Sprintf("No agent called `%s`. %s", escape(target), b.onlineHint())
+	if isBang(body) {
+		b.runCommand(ev, user, target, body, notFound, true)
+		return
+	}
 	if sid, delivered := b.deliver(ev, target, body, user, notFound); delivered {
 		b.state.setThread(sid, ev.TS)
 	}
+}
+
+// runCommand handles "!name rest" from user for target (a session id, name
+// or address; empty at the top level without "name:"). Only owners may run
+// commands. !commands is answered here; anything else resolves against the
+// registry (falling through to the Claude Code slash command of that name)
+// and is delivered as a command message the target's mod runs. adopt makes
+// the post's thread one of the target's threads, as for a top-level
+// "name: message". notFound is the reply when target is unknown.
+func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, notFound string, adopt bool) {
+	if !user.config {
+		log.Infof("slack: refused a command from non-owner %s", user.ID)
+		b.reply(ev, ownersOnlyCommands)
+		return
+	}
+	name, rest, errParse := parseBang(text)
+	if errParse != nil {
+		b.reply(ev, errParse.Error())
+		return
+	}
+	if name == listCommandsName {
+		b.reply(ev, b.commandList())
+		return
+	}
+	if target == "" {
+		b.reply(ev, howToCommand)
+		return
+	}
+	cmd := agentbus.Command{Name: name, Kind: agentbus.CommandSlash, Command: name, Args: rest}
+	if entry, found := b.cmdRegistry.lookup(name); found {
+		if entry.err != nil {
+			b.reply(ev, fmt.Sprintf("`!%s` is misconfigured.", name))
+			return
+		}
+		if errArgs := entry.spec.checkArgs(rest); errArgs != nil {
+			log.Infof("slack: refused !%s from %s: arguments not accepted", name, user.ID)
+			b.reply(ev, errArgs.Error())
+			return
+		}
+		cmd = entry.spec.command(rest)
+	}
+	display := target
+	if adopt {
+		display = escape(target)
+	}
+	sid, capable, errCapable := b.bus.CommandCapable(target)
+	if errCapable == nil && !adopt {
+		display = escape(b.bus.Address(sid))
+	}
+	if errCapable == nil && !capable {
+		errCapable = agentbus.ErrCommandUnsupported
+	}
+	var msgID string
+	if errCapable == nil {
+		sid, msgID, errCapable = b.bus.DeliverCommand(sid, cmd, user.Label, user.ID)
+	}
+	switch {
+	case errCapable == nil:
+	case errors.Is(errCapable, agentbus.ErrUnknownTarget):
+		b.reply(ev, notFound)
+		return
+	case errors.Is(errCapable, agentbus.ErrCommandUnsupported):
+		b.reply(ev, fmt.Sprintf("`%s` can't run commands (agentbus plugin %s+ required)", display, agentbus.MinCommandModVersion))
+		return
+	default:
+		b.reply(ev, "Not delivered: "+escape(errCapable.Error()))
+		return
+	}
+	b.state.recordReply(msgID, ev.Channel, replyThread(ev), sid)
+	if adopt {
+		b.state.setThread(sid, ev.TS)
+	}
+	b.react(ev, "gear")
+	log.Infof("slack: %s sent !%s (%s) to %s", user.ID, cmd.Name, cmd.Kind, b.bus.Address(sid))
 }
 
 func (b *Bridge) alreadySeen(eventID string) bool {

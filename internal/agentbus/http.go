@@ -83,13 +83,15 @@ func (s *Store) handleName(c *gin.Context) {
 	}
 }
 
+// handleInbox returns a session's pending messages, except command messages:
+// those leave the store only through /wait (the mod).
 func (s *Store) handleInbox(c *gin.Context) {
 	id := strings.TrimSpace(c.Query("session"))
 	if id == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
 		return
 	}
-	msgs := s.Claim(id)
+	msgs := s.ClaimPlain(id)
 	if msgs == nil {
 		msgs = []Message{}
 	}
@@ -155,7 +157,7 @@ func (s *Store) handleWait(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "superseded by a newer waiter"})
 			return
 		}
-		if msgs := s.Claim(id); len(msgs) > 0 {
+		if msgs := s.ClaimForWait(id); len(msgs) > 0 {
 			c.JSON(http.StatusOK, gin.H{"messages": msgs})
 			return
 		}

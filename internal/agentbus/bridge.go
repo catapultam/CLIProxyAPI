@@ -86,8 +86,8 @@ func isSlackAddress(target string) bool {
 
 // Deliver queues a message from an allowed Slack user for a session given by
 // id, name or address, and returns that session's id and the new message's
-// id. Only the Slack bridge calls it, and it is the only way a message gets
-// FromUser.
+// id. Only the Slack bridge calls it, and together with DeliverCommand it is
+// the only way a message gets FromUser.
 func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string, err error) {
 	if strings.TrimSpace(body) == "" {
 		return "", "", ErrEmptyBody
@@ -95,25 +95,42 @@ func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string
 	if len(body) > MaxBodyBytes {
 		return "", "", ErrBodyTooLarge
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, sess, err := s.deliverTargetLocked(target)
+	if err != nil {
+		return "", "", err
+	}
+	msg := s.fromSlackLocked(sess, body, slackUser)
+	s.enqueueLocked(sess, msg)
+	return id, msg.ID, nil
+}
+
+// deliverTargetLocked finds the session the bridge addresses as target (id,
+// name or address). The caller holds s.mu.
+func (s *Store) deliverTargetLocked(target string) (string, *session, error) {
 	if isSlackAddress(target) {
 		// A session id is whatever the client sends in /hello, so a client
 		// could register "slack" as its own session id and otherwise reach
 		// this through the byID fast path below. Reject it the same way
 		// resolveLocked rejects the name/address forms.
-		return "", "", ErrUnknownTarget
+		return "", nil, ErrUnknownTarget
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	id := strings.TrimSpace(target)
 	if _, ok := s.byID[id]; !ok {
 		resolved, found := s.resolveLocked(target)
 		if !found {
-			return "", "", ErrUnknownTarget
+			return "", nil, ErrUnknownTarget
 		}
 		id = resolved
 	}
-	sess := s.byID[id]
-	msg := Message{
+	return id, s.byID[id], nil
+}
+
+// fromSlackLocked builds a message from an allowed Slack user to sess. The
+// caller holds s.mu.
+func (s *Store) fromSlackLocked(sess *session, body, slackUser string) Message {
+	return Message{
 		ID:        newMessageID(),
 		From:      SlackAddress,
 		To:        s.addressLocked(sess),
@@ -122,6 +139,4 @@ func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string
 		SlackUser: slackUser,
 		CreatedAt: s.now(),
 	}
-	s.enqueueLocked(sess, msg)
-	return id, msg.ID, nil
 }
