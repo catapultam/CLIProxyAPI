@@ -24,6 +24,7 @@ func (s *Store) Register(group *gin.RouterGroup) {
 	group.GET("/inbox", s.handleInbox)
 	group.POST("/hello", s.handleHello)
 	group.GET("/wait", s.handleWait)
+	group.POST("/ack", s.handleAck)
 	group.POST("/bye", s.handleBye)
 	group.POST("/slack/upload", s.handleSlackUpload)
 }
@@ -189,4 +190,25 @@ func (s *Store) handleWait(c *gin.Context) {
 		case <-recheck.C:
 		}
 	}
+}
+
+type ackRequest struct {
+	Session string   `json:"session"`
+	IDs     []string `json:"ids"`
+}
+
+// handleAck is the mod reporting that messages it got from /wait were read:
+// the turn their prompt started completed, or their command ran. Only ids
+// /wait handed to that session count (Store.Ack). It returns how many did.
+func (s *Store) handleAck(c *gin.Context) {
+	var req ackRequest
+	if errBind := c.ShouldBindJSON(&req); errBind != nil || strings.TrimSpace(req.Session) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
+		return
+	}
+	if len(req.IDs) > maxAckIDs {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many ids"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"acked": s.Ack(strings.TrimSpace(req.Session), req.IDs)})
 }

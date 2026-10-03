@@ -123,7 +123,16 @@ func versionSegment(parts []string, i int) int {
 	return n
 }
 
-// ClaimForWait claims a session's messages for the mod's /wait. A command
+// ClaimForWait claims a session's messages for the mod's /wait (claimForWait)
+// and reports the Slack ones as received (Receipts): they await the mod's
+// /ack.
+func (s *Store) ClaimForWait(id, waiterVersion string) []Message {
+	msgs := s.claimForWait(id, waiterVersion)
+	s.received(id, msgs)
+	return msgs
+}
+
+// claimForWait claims a session's messages for the mod's /wait. A command
 // message is handed out only while its sender is still an owner according to
 // the attached bridge. Otherwise (the sender was demoted, no bridge is
 // attached, or the bridge can't tell) it is dropped, logged, and refused in
@@ -134,7 +143,7 @@ func versionSegment(parts []string, i int) int {
 // can't run commands (an older mod would show one to the model as an
 // instruction), so command messages stay queued, where they expire after
 // commandTTL.
-func (s *Store) ClaimForWait(id, waiterVersion string) []Message {
+func (s *Store) claimForWait(id, waiterVersion string) []Message {
 	if !versionAtLeast(strings.TrimSpace(waiterVersion), MinCommandModVersion) {
 		return s.ClaimPlain(id)
 	}

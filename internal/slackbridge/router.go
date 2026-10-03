@@ -239,8 +239,7 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		b.replyCommand(ev, "Not delivered: "+escape(errCapable.Error()))
 		return
 	}
-	b.recordDelivery(ev, msgID, sid, adopt)
-	b.react(ev, "gear")
+	b.react(ev, b.recordDelivery(ev, msgID, sid, adopt, reactionCommand))
 	log.Infof("slack: %s sent !%s (%s) to %s", user.ID, cmd.Name, cmd.Kind, b.bus.Address(sid))
 }
 
@@ -274,8 +273,7 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 	sid, msgID, err := b.bus.DeliverVia(target, body, user.Label, via)
 	switch {
 	case err == nil:
-		b.recordDelivery(ev, msgID, sid, adopt)
-		b.react(ev, "inbox_tray")
+		b.react(ev, b.recordDelivery(ev, msgID, sid, adopt, reactionQueued))
 	case errors.Is(err, agentbus.ErrUnknownTarget):
 		b.reply(ev, notFound)
 	case errors.Is(err, agentbus.ErrBodyTooLarge):
@@ -291,21 +289,26 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 // becomes one of sid's threads; in a DM the post is linked to sid, so thread
 // replies under it reach sid. Every delivery from a DM also makes sid the
 // user's dmLast.
-func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool) {
-	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid}
+//
+// queued is the receipt reaction the message starts with; recordDelivery
+// returns the one to put on ev now, which is a later receipt when one beat
+// the record (see state.record).
+func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, queued string) string {
+	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid, TS: ev.TS, Receipt: queued}
 	if !isDM(ev) {
-		b.state.record(r)
+		reaction := b.state.record(r)
 		if adopt {
 			b.state.setThread(sid, ev.TS)
 		}
-		return
+		return reaction
 	}
 	r.DMUser = ev.User
-	b.state.record(r)
+	reaction := b.state.record(r)
 	b.state.setDMLast(ev.User, sid)
 	if adopt {
 		b.state.linkDM(ev.Channel, ev.TS, sid, false)
 	}
+	return reaction
 }
 
 func (b *Bridge) onlineHint() string {

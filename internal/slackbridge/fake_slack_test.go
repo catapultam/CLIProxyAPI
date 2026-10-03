@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,26 @@ type fakeSlack struct {
 	// it is recorded, then wait until postHold is closed before answering.
 	postHold    chan struct{}
 	postEntered chan struct{}
+	// reactions holds the bot's reactions now on each message, as Slack
+	// would: adding one twice is already_reacted, removing an absent one
+	// no_reaction.
+	reactions map[reactionKey]bool
+}
+
+type reactionKey struct{ channel, ts, name string }
+
+// reactionsOn lists the bot's reactions now on message ts in channel, sorted.
+func (f *fakeSlack) reactionsOn(channel, ts string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for k, on := range f.reactions {
+		if on && k.channel == channel && k.ts == ts {
+			out = append(out, k.name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // holdPosts makes every chat.postMessage block until the returned release is
@@ -77,12 +98,13 @@ const uploadSecret = "presigned-sig-0123"
 func newFakeSlack(t *testing.T) *fakeSlack {
 	t.Helper()
 	f := &fakeSlack{
-		t:        t,
-		users:    []fakeUser{{ID: "UALEX", Name: "alex", Display: "Alex", Email: "alex@example.com"}, {ID: "UJANE", Name: "jane", Display: "Jane D", Email: "jane@example.com"}, {ID: "UJANE2", Name: "jane2", Display: "jane d", Email: "jane2@example.com"}, {ID: "UEVE", Name: "eve", Display: "Eve"}, {ID: "UHOOK", Name: "ci", Display: "CI", Bot: true}},
-		channels: []fakeChannel{{ID: "CGEN", Name: "general"}, {ID: "CAGENTS", Name: "agents"}},
-		fail:     map[string]string{},
-		toClient: make(chan string, 16),
-		acks:     make(chan string, 16),
+		t:         t,
+		users:     []fakeUser{{ID: "UALEX", Name: "alex", Display: "Alex", Email: "alex@example.com"}, {ID: "UJANE", Name: "jane", Display: "Jane D", Email: "jane@example.com"}, {ID: "UJANE2", Name: "jane2", Display: "jane d", Email: "jane2@example.com"}, {ID: "UEVE", Name: "eve", Display: "Eve"}, {ID: "UHOOK", Name: "ci", Display: "CI", Bot: true}},
+		channels:  []fakeChannel{{ID: "CGEN", Name: "general"}, {ID: "CAGENTS", Name: "agents"}},
+		fail:      map[string]string{},
+		reactions: map[reactionKey]bool{},
+		toClient:  make(chan string, 16),
+		acks:      make(chan string, 16),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/", f.handleAPI)
@@ -230,7 +252,23 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		ts := "1700000000." + strconv.Itoa(100000+f.nextTS)
 		f.mu.Unlock()
 		writeJSON(w, map[string]any{"ok": true, "ts": ts, "channel": r.PostForm.Get("channel")})
-	case "reactions.add":
+	case "reactions.add", "reactions.remove":
+		key := reactionKey{r.PostForm.Get("channel"), r.PostForm.Get("timestamp"), r.PostForm.Get("name")}
+		f.mu.Lock()
+		has := f.reactions[key]
+		switch {
+		case method == "reactions.add" && has:
+			code = "already_reacted"
+		case method == "reactions.remove" && !has:
+			code = "no_reaction"
+		default:
+			f.reactions[key] = method == "reactions.add"
+		}
+		f.mu.Unlock()
+		if code != "" {
+			writeJSON(w, map[string]any{"ok": false, "error": code})
+			return
+		}
 		writeJSON(w, map[string]any{"ok": true})
 	case "conversations.open":
 		// A 1:1 DM with the bot: its id is "D" + the user's id.

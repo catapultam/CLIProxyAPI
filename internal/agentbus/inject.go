@@ -19,6 +19,10 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// oneShotHint follows Slack messages injected into a session without the
+// agentbus mod.
+const oneShotHint = "This message is shown to you once. If you can't act on it now, write it into your task list."
+
 const (
 	headerSession   = "X-Claude-Code-Session-Id"
 	headerAgent     = "X-Claude-Code-Agent-Id"
@@ -181,15 +185,21 @@ func (s *Store) planInjection(sid, base string) injection {
 	return plan
 }
 
+// commitInjection records what a request that succeeded carried, and reports
+// the Slack messages in it as read (Receipts) once s.mu is released.
 func (s *Store) commitInjection(sid string, plan injection) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	sess := s.get(sid)
 	if plan.note {
 		sess.NoteSent = true
 		sess.NotedPeers = plan.peersKey
 	}
 	s.dirty = true
+	r, _ := s.bridge.(Receipts)
+	s.mu.Unlock()
+	if ids := slackIDs(plan.messages); r != nil && len(ids) > 0 {
+		r.Read(ids)
+	}
 }
 
 func noteText(sid, self, name, base string, mod bool, peers []string, note bool, msgs []Message, slackUsers []string) string {
@@ -251,6 +261,10 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 			head += " (in reply to " + inline(m.ReplyTo) + ")"
 		}
 		b.WriteString(head + ":\n" + quoteBody(m.Body) + "\n")
+	}
+	// Without the mod, nothing re-surfaces a Slack instruction later.
+	if !mod && len(slackIDs(msgs)) > 0 {
+		b.WriteString(oneShotHint + "\n")
 	}
 	b.WriteString("</agentbus>")
 	return b.String()

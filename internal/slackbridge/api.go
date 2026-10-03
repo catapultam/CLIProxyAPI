@@ -192,6 +192,17 @@ func (a *api) addReaction(ctx context.Context, token, channel, ts, name string) 
 	return err
 }
 
+// removeReaction takes the bot's reaction name off a message; one that isn't
+// there (no_reaction) is fine.
+func (a *api) removeReaction(ctx context.Context, token, channel, ts, name string) error {
+	_, err := a.call(ctx, token, "reactions.remove", url.Values{"channel": {channel}, "timestamp": {ts}, "name": {name}})
+	var apiErr *apiError
+	if errors.As(err, &apiErr) && apiErr.code == "no_reaction" {
+		return nil
+	}
+	return err
+}
+
 // getUploadURL starts an external file upload (files.upload is deprecated)
 // and returns the pre-signed URL to POST the bytes to, and the file id.
 func (a *api) getUploadURL(ctx context.Context, token, filename string, length int) (string, string, error) {

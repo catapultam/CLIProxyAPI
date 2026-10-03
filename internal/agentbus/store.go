@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -154,9 +155,12 @@ type session struct {
 	NoteSent    bool      `json:"note_sent,omitempty"`
 	NotedPeers  string    `json:"noted_peers,omitempty"`
 	Inbox       []Message `json:"inbox,omitempty"`
-	inflight    int
-	waiterGen   uint64
-	notify      chan struct{}
+	// Unacked holds the Slack messages /wait handed out that the mod hasn't
+	// acknowledged (/ack) yet, with when; see Receipts.
+	Unacked   map[string]time.Time `json:"unacked,omitempty"`
+	inflight  int
+	waiterGen uint64
+	notify    chan struct{}
 }
 
 func (s *session) lastSeen() time.Time {
@@ -502,6 +506,7 @@ func (s *Store) expireLocked(sess *session) {
 		s.dirty = true
 	}
 	sess.Inbox = kept
+	s.expireUnackedLocked(sess)
 }
 
 // commandExpired reports whether command message m is older than commandTTL.
@@ -756,6 +761,7 @@ func (s *Store) Save() error {
 		}
 		cp := *sess
 		cp.Inbox = append([]Message(nil), sess.Inbox...)
+		cp.Unacked = maps.Clone(sess.Unacked)
 		state.Sessions = append(state.Sessions, &cp)
 	}
 	s.dirty = false
@@ -822,6 +828,12 @@ func (s *Store) Load() error {
 		}
 		for i := range sess.Inbox {
 			if cleanLoadedMessage(&sess.Inbox[i]) {
+				s.dirty = true
+			}
+		}
+		for id := range sess.Unacked {
+			if !validReplyTo.MatchString(id) {
+				delete(sess.Unacked, id)
 				s.dirty = true
 			}
 		}

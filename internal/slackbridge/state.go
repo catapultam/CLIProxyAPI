@@ -41,6 +41,12 @@ type replyRecord struct {
 	DMUser  string    `json:"dm_user,omitempty"`
 	Session string    `json:"session"`
 	At      time.Time `json:"at"`
+	// TS is the user's Slack message itself, where its receipt shows as a
+	// reaction. Records from before receipts have none.
+	TS string `json:"ts,omitempty"`
+	// Receipt is the receipt reaction on TS now: the queued one it was
+	// delivered with, then reactionReceived, then reactionRead.
+	Receipt string `json:"receipt,omitempty"`
 }
 
 // dmLink ties a top-level message in a DM to a session, so a thread reply
@@ -97,12 +103,17 @@ type state struct {
 	dmLinks  []dmLink               // top-level DM messages, oldest first, at most maxDMLinks
 	dmLasts  map[string]dmLastEntry // user ID -> the agent they last talked to in their DM
 	users    []allowedUser          // config users first
+	// early holds receipts for message ids not recorded yet (a waiter can
+	// claim a message before deliver records it); record applies them. Not
+	// persisted; earlyRing evicts the oldest past maxEarlyReceipts.
+	early     map[string]string
+	earlyRing []string
 }
 
 // loadState reads path; a missing file is an empty state. On a corrupt file it
 // returns an empty state and the error.
 func loadState(path string) (*state, error) {
-	st := &state{path: path, now: time.Now, threads: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}}
+	st := &state{path: path, now: time.Now, threads: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, early: map[string]string{}}
 	if path == "" {
 		return st, nil
 	}
@@ -309,10 +320,17 @@ func (st *state) setThread(sid, ts string) bool {
 
 // record remembers delivered message r (stamped now): where it came from
 // and the session it went to. Expired entries are dropped, and the oldest
-// when there are more than maxReplies.
-func (st *state) record(r replyRecord) {
+// when there are more than maxReplies. It returns r's receipt reaction:
+// r.Receipt, or a later one that arrived before the record (early).
+func (st *state) record(r replyRecord) string {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if e, ok := st.early[r.ID]; ok {
+		delete(st.early, r.ID)
+		if receiptRank(e) > receiptRank(r.Receipt) {
+			r.Receipt = e
+		}
+	}
 	now := st.now()
 	cutoff := now.Add(-replyTTL)
 	kept := st.replies[:0]
@@ -330,20 +348,101 @@ func (st *state) record(r replyRecord) {
 	if errSave := st.saveLocked(); errSave != nil {
 		logSaveError(errSave)
 	}
+	return r.Receipt
 }
 
 // replyLocked finds the unexpired entry for msgID. The caller holds st.mu.
 func (st *state) replyLocked(msgID string) (replyRecord, bool) {
-	if msgID == "" {
+	i, ok := st.replyIndexLocked(msgID)
+	if !ok {
 		return replyRecord{}, false
+	}
+	return st.replies[i], true
+}
+
+// replyIndexLocked finds the index of the unexpired entry for msgID in
+// st.replies. The caller holds st.mu.
+func (st *state) replyIndexLocked(msgID string) (int, bool) {
+	if msgID == "" {
+		return 0, false
 	}
 	cutoff := st.now().Add(-replyTTL)
 	for i := len(st.replies) - 1; i >= 0; i-- {
 		if r := st.replies[i]; r.ID == msgID {
-			return r, r.At.After(cutoff)
+			return i, r.At.After(cutoff)
 		}
 	}
-	return replyRecord{}, false
+	return 0, false
+}
+
+// receiptChange is a receipt reaction to add to message ts in channel, and
+// the one it replaces (empty for none).
+type receiptChange struct {
+	channel, ts, add, remove string
+}
+
+// advanceReceipts moves each recorded message in ids to receipt reaction
+// when that is further along than its current one, and returns the
+// reactions to change. A receipt never moves back. An id with no record yet
+// is kept in early for record; an expired one, or one recorded before
+// receipts (no TS), is ignored.
+func (st *state) advanceReceipts(ids []string, reaction string) []receiptChange {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	rank := receiptRank(reaction)
+	var out []receiptChange
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		i, ok := st.replyIndexLocked(id)
+		if !ok {
+			if !st.knownLocked(id) {
+				st.noteEarlyLocked(id, reaction)
+			}
+			continue
+		}
+		r := &st.replies[i]
+		if r.TS == "" || rank <= receiptRank(r.Receipt) {
+			continue
+		}
+		out = append(out, receiptChange{channel: r.Channel, ts: r.TS, add: reaction, remove: r.Receipt})
+		r.Receipt = reaction
+	}
+	if len(out) > 0 {
+		if errSave := st.saveLocked(); errSave != nil {
+			logSaveError(errSave)
+		}
+	}
+	return out
+}
+
+// knownLocked reports whether msgID has a record, expired or not. The caller
+// holds st.mu.
+func (st *state) knownLocked(msgID string) bool {
+	for i := len(st.replies) - 1; i >= 0; i-- {
+		if st.replies[i].ID == msgID {
+			return true
+		}
+	}
+	return false
+}
+
+// noteEarlyLocked keeps a receipt for msgID until record sees it, evicting
+// the oldest past maxEarlyReceipts. The caller holds st.mu.
+func (st *state) noteEarlyLocked(msgID, reaction string) {
+	if prev, ok := st.early[msgID]; ok {
+		if receiptRank(reaction) > receiptRank(prev) {
+			st.early[msgID] = reaction
+		}
+		return
+	}
+	st.early[msgID] = reaction
+	st.earlyRing = append(st.earlyRing, msgID)
+	if len(st.earlyRing) > maxEarlyReceipts {
+		delete(st.early, st.earlyRing[0])
+		st.earlyRing = st.earlyRing[1:]
+	}
 }
 
 // replyTarget returns the record of msgID when it was delivered to sid and
