@@ -85,7 +85,9 @@ Slack user". Rules:
    edit/delete subtype. Everything else is dropped, so nothing from a
    non-allowed user ever reaches an agent.
 3. The message also carries `slack_user` (the allowed user's configured name),
-   so the agent knows who is instructing it.
+   so the agent knows who is instructing it. The allowlist is matched on the
+   Slack user ID only; Slack display names are never read or trusted, since
+   their owners can change them.
 4. The framing always says the message arrived over agentbus via Slack, even
    when it is from an allowed user.
 
