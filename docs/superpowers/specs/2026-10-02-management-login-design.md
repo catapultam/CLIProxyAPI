@@ -113,7 +113,7 @@ Authenticated (key or session), under `/v8/management/account`:
 | Route | Request | Response |
 |---|---|---|
 | `GET /account` | none | `200 {"configured": bool, "username": "", "passkeys": [{"id", "name", "created_at"}], "passkey_rp_id": "", "passkey_origins": []}` |
-| `PUT /account` | `{"username", "password", "current_password"?}` | `200` session response for the caller. On first setup it generates `session-secret` and `user-handle`. Changing an existing password over a session requires the correct `current_password` (`403` otherwise); over the management key it is not required. `400` for policy failures (password < 12 chars, empty username) |
+| `PUT /account` | `{"username", "password", "current_password"?}` | `200` session response for the caller. On first setup it generates `session-secret` and `user-handle`, and the password is required. On an existing account an empty `password` keeps the current one, so a username-only change is valid. Over a session, any change to an existing account requires the correct `current_password` (`403` otherwise); over the management key it is never required. `session-secret` rotates only when the password changes. `400` for policy failures (password < 12 chars, empty username) |
 | `PUT /account/passkey-settings` | `{"rp_id", "origins": []}` | `200` updated account view. Lets the panel configure passkeys; the panel pre-fills from `window.location` |
 | `POST /account/passkeys/begin` | none | `200 {"ceremony_id", "options": <protocol.CredentialCreation JSON>}`. Uses resident key = required, user verification = preferred, and excludeCredentials = existing passkeys. `409` when rp-id is not set or no account exists |
 | `POST /account/passkeys/finish` | `{"ceremony_id", "name", "credential": <toJSON() output>}` | `200 {"id", "name", "created_at"}` |
@@ -123,7 +123,12 @@ Authenticated (key or session), under `/v8/management/account`:
 
 These routes persist through the same path the other management config writers use: mutate the config under the handler's lock, then save with comment preservation. The existing watcher/store sync then takes over.
 
-The origin check: WebAuthn verification must accept every origin in `passkey-origins`. If that list is empty, it defaults to `https://<rp-id>`.
+The origin check: WebAuthn verification must accept every origin in `passkey-origins`. If that list is empty, it defaults to `https://<rp-id>`. `GET session/status` and `GET /account` return this effective list, and `session/status` also returns `passkey_rp_id`.
+
+Other contract details:
+- `retry_after` is rounded up to whole seconds and is at least 1.
+- The CORS middleware adds `X-CPA-Session-Refresh` to `Access-Control-Expose-Headers` so cross-origin bearer clients can read it. ACAO stays `*` with no Allow-Credentials, so clients must never send credentialed (`withCredentials`) requests.
+- Because tokens are stateless, logout clears the cookie but cannot revoke a copied bearer token; "Sign out all devices" is the revocation path.
 
 - **Passkey library:** `github.com/go-webauthn/webauthn` (new dependency).
 - **Ceremony challenges:** kept in memory with a 5-minute TTL and are single-use. A restart in the middle of a ceremony just means pressing the button again.
