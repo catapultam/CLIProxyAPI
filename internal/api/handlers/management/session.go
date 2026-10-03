@@ -195,7 +195,10 @@ func csrfAllowed(c *gin.Context, originsAllowed []string) bool {
 // directly against an HTTPS origin like cakebox's :8443 tailscale serve,
 // which carries neither Origin nor Referer.
 func isHTTPSRequest(c *gin.Context, allowedOrigins []string) bool {
-	if c.Request.TLS != nil {
+	// The server's protocol-sniffing bufferedConn always implements
+	// ConnectionState, so net/http sets a zero-value Request.TLS even on plain
+	// HTTP connections; only a completed handshake means real TLS.
+	if c.Request.TLS != nil && c.Request.TLS.HandshakeComplete {
 		return true
 	}
 	if proto := c.GetHeader("X-Forwarded-Proto"); strings.EqualFold(strings.TrimSpace(proto), "https") {

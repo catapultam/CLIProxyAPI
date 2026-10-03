@@ -1,6 +1,7 @@
 package management
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -139,6 +140,27 @@ func sessionCookieFrom(rec *httptest.ResponseRecorder) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+// TestPostSessionLoginNoSecureForZeroValueTLSState covers the real server:
+// its bufferedConn implements ConnectionState, so plain HTTP requests carry a
+// non-nil, zero-value Request.TLS that must not count as HTTPS.
+func TestPostSessionLoginNoSecureForZeroValueTLSState(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	engine := newTestEngine(h)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v8/management/session/login", strings.NewReader(loginJSON("admin", testAccountPassword)))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/json")
+	req.TLS = &tls.ConnectionState{}
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if setCookie := rec.Header().Get("Set-Cookie"); strings.Contains(setCookie, "Secure") {
+		t.Fatalf("Set-Cookie = %q, expected no Secure for a zero-value TLS state", setCookie)
+	}
 }
 
 func TestPostSessionLoginSuccess(t *testing.T) {
