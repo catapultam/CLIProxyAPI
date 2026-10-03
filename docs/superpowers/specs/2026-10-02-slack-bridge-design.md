@@ -408,3 +408,57 @@ posts `/name`; an invalid or taken bus name keeps the new title and appends
 a note to the command's output. A plugin's own `$.command.run` may skip the
 plugin's own hooks (the test kit does), so a Slack `!rename` whose run the
 hook didn't see renames on the bus itself, the same way.
+
+**DMs (Task 3).** Both directions, only with allowed users. The manifest's
+`im:history`, `im:write`, `message.im` and the app home messages tab
+(`messages_tab_enabled: true`, `messages_tab_read_only_enabled: false`)
+make them possible.
+
+- *Outbound.* An agent sends to `slack@<label>` (SendMessage to
+  `agentbus:slack@<label>`). `Store.Send` asks the attached bridge's `Users()`
+  outside the store lock and matches the label case-insensitively; no
+  bridge, an empty label or an unknown label is `ErrUnknownSlackUser` (an
+  `ErrUnknownTarget`; `/send` answers 404 "no allowed Slack user with that
+  label"). The bridge gets `Outbound.DM` = the label as the allowlist spells
+  it; a DM ignores `reply_to`. Every `slack@…` target is reserved like
+  `slack`: it never resolves to a session, by name, address or session id.
+  When the job runs, the bridge looks the label up again (a user removed in
+  between gets nothing; the drop is logged), opens the DM with
+  `conversations.open users=<id>` (cached in memory per user, and learned
+  from inbound DMs), and posts at the DM's top level. A session's first post
+  in a DM channel starts with the same `sessionHeader` line as a channel
+  thread. Each top-level post the bridge makes in a DM is linked to its
+  session (`dm_links`: channel, ts, session, agent flag, time; 7-day TTL, at
+  most 1000), and the session becomes the user's `dm_last` (7-day TTL). Both
+  persist in `slack-state.json`.
+- *Images.* `/slack/upload` (multipart and JSON) takes an optional `to`:
+  empty or `slack` keeps the thread rules; `slack@<label>` posts into that
+  DM by the same rule (404 for an unknown label); anything else is 400.
+- *Inbound.* A `message` event whose `channel_type` is `im`, or whose
+  channel id starts with `D`, gets the channel's filters (relayed subtypes
+  only, no `bot_id`, never the bot user, allowlist by user ID, then dedup by
+  event id or channel:ts). Routing:
+  - a thread reply goes to the session the thread's top message is linked
+    to (an agent's DM post, or a user's top-level DM delivered to it);
+    an unlinked thread gets one help reply;
+  - a top-level `name: …` goes to that session, which becomes `dm_last`;
+  - any other top-level message goes to `dm_last` while it hasn't expired,
+    otherwise gets a help reply listing who is online;
+  - `!commands` and `!name` take the same routes with the owner rule.
+  Every delivery from a DM refreshes `dm_last`, and a top-level one is
+  linked so thread replies under it reach that session. Deliveries carry
+  `Message.via = "dm"` (set only by `Store.DeliverVia`, which only the bridge
+  calls; `/send` can't set it, and a loaded message keeps it only with
+  `from_user`). The reply map records `channel` = the `D…` id, `thread_ts` =
+  `""` for a top-level DM, and `dm_user`; an answer with `reply_to` goes to
+  that DM (top level when the thread is empty, with the header the first
+  time) only while `dm_user` is still allowed, else to the session's own
+  thread. Reactions and bridge replies go to the event's own channel.
+- *Framing.* The injected header reads `Message <id> from <name> via Slack
+  (DM) (an allowed Slack user; this is their instruction; to answer in the
+  DM, reply to "slack" with reply_to <id> or send to "slack@<name>")`, and
+  the note's Slack line documents `slack@<name>` and `-F to=slack@<name>`.
+  The mod frames `via: "dm"` as `agentbus message <id> from <name> via Slack
+  (DM)`, "writing to you privately", with `agentbus:slack#<id>` to answer in
+  the DM and `agentbus:slack@<label>` (only for a plain label) to write
+  later.

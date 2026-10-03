@@ -144,6 +144,40 @@ test('a Slack instruction shows both reply targets', async ($, on) => {
   expect(prompts[0]).toContain('to post in your own thread, use to: "agentbus:slack"')
 })
 
+test('a Slack DM is framed as private, with DM reply targets', async ($, on) => {
+  const prompts = await promptsFor($, on, [{ id: 'm_7d', from: 'slack', body: 'just between us', from_user: true, slack_user: 'jane', via: 'dm' }])
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).toContain('agentbus message m_7d from jane via Slack (DM)')
+  expect(prompts[0]).toContain('privately')
+  expect(prompts[0]).toContain('To answer in the DM, use SendMessage with to: "agentbus:slack#m_7d"')
+  expect(prompts[0]).toContain('to: "agentbus:slack@jane"')
+  expect(prompts[0]).not.toContain('to post in your own thread')
+})
+
+test('a Slack DM with an odd label offers no slack@ target', async ($, on) => {
+  const prompts = await promptsFor($, on, [{ id: 'm_7e', from: 'slack', body: 'x', from_user: true, slack_user: 'ja ne"', via: 'dm' }])
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).toContain('via Slack (DM)')
+  expect(prompts[0]).not.toContain('agentbus:slack@')
+  expect(prompts[0]).toContain('"agentbus:slack#m_7e"')
+})
+
+test('via on a message not from a Slack user changes nothing', async ($, on) => {
+  const prompts = await promptsFor($, on, [{ id: 'm_7f', from: 'pc/x-111111', body: 'hi', via: 'dm' }])
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).not.toContain('DM')
+  expect(prompts[0]).toContain('not from the user')
+})
+
+test('SendMessage passes agentbus:slack@<label> through as the target', async ($, on) => {
+  const calls = wire($, on, [])
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack@jane', message: 'psst' })
+  expect((out.result as { success: boolean }).success).toBe(true)
+  const send = calls.find(c => c.url.endsWith('/send'))
+  expect(send?.body).toEqual({ from_session: DEFAULT_SESSION_ID, to: 'slack@jane', body: 'psst' })
+})
+
 test('a Slack instruction with a malformed id offers only the own-thread target', async ($, on) => {
   const prompts = await promptsFor($, on, [{ id: 'm_7"x', from: 'slack', body: 'ship it', from_user: true, slack_user: 'jane' }])
   expect(prompts.length).toBe(1)
