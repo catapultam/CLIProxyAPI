@@ -60,4 +60,34 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/plugins/:id/quota", s.mgmt.GetPluginQuota)
 	v8.POST("/plugins/:id/quota", s.mgmt.FetchPluginQuota)
 	v8.DELETE("/plugins/:id/quota", s.mgmt.ResetPluginQuota)
+
+	// Session routes are public (no management key required) but still gated
+	// by the availability middleware, and still sit under the v8 config-save
+	// context so account mutations persist using v8 comment preservation.
+	// They deliberately do not run mgmt.Middleware(): the session endpoints
+	// are how a session is established in the first place.
+	session := s.engine.Group(prefix + "/session")
+	session.Use(s.managementAvailabilityMiddleware(), func(c *gin.Context) {
+		c.Set(management.ConfigV8ContextKey, true)
+	})
+	session.GET("/status", s.mgmt.GetSessionStatus)
+	session.POST("/login", s.mgmt.PostSessionLogin)
+	session.POST("/passkey/begin", s.mgmt.PostSessionPasskeyBegin)
+	session.POST("/passkey/finish", s.mgmt.PostSessionPasskeyFinish)
+	session.POST("/logout", s.mgmt.PostSessionLogout)
+
+	// Account routes require authentication (session or management key),
+	// via the same mgmt.Middleware() the rest of /v8/management uses.
+	account := s.engine.Group(prefix + "/account")
+	account.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), func(c *gin.Context) {
+		c.Set(management.ConfigV8ContextKey, true)
+	})
+	account.GET("", s.mgmt.GetAccount)
+	account.PUT("", s.mgmt.PutAccount)
+	account.PUT("/passkey-settings", s.mgmt.PutAccountPasskeySettings)
+	account.POST("/passkeys/begin", s.mgmt.PostAccountPasskeysBegin)
+	account.POST("/passkeys/finish", s.mgmt.PostAccountPasskeysFinish)
+	account.PATCH("/passkeys/:id", s.mgmt.PatchAccountPasskey)
+	account.DELETE("/passkeys/:id", s.mgmt.DeleteAccountPasskey)
+	account.POST("/sign-out-all", s.mgmt.PostAccountSignOutAll)
 }

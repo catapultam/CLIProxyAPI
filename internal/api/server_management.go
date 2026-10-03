@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	log "github.com/sirupsen/logrus"
 )
@@ -199,6 +200,19 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 		mgmt.DELETE("/oauth-session", s.mgmt.CancelAuthSession)
 	}
+}
+
+// managementLoginAccountConfigured reports whether a management panel
+// username/password account exists. Per the management login design, a
+// configured account counts as "management enabled" alongside secret-key,
+// so route availability and hot-reload gating stay correct even if
+// secret-key is later cleared while an account remains.
+func managementLoginAccountConfigured(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	login := cfg.RemoteManagement.Login
+	return login.Username != "" && login.PasswordHash != ""
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {

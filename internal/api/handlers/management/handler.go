@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/mgmtauth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
@@ -61,6 +62,17 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
+
+	// loginThrottle enforces the global password-login backoff. It survives
+	// config hot-reloads: only session-secret rotation invalidates tokens.
+	loginThrottle *mgmtauth.Throttle
+	// passkeyCeremonies holds in-memory, single-use WebAuthn ceremony state.
+	// It also survives hot-reloads; ceremonies are keyed by a random id, not
+	// by anything that changes across a reload.
+	passkeyCeremonies *mgmtauth.CeremonyCache
+	// clock is the time source for session tokens and login throttling.
+	// Tests in this package may override it directly.
+	clock mgmtauth.Clock
 }
 
 type configReloadSnapshot struct {
@@ -73,6 +85,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
 
+	clock := mgmtauth.Clock(mgmtauth.SystemClock{})
 	h := &Handler{
 		cfg:                 cfg,
 		configFilePath:      configFilePath,
@@ -81,6 +94,9 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		loginThrottle:       mgmtauth.NewThrottle(clock),
+		passkeyCeremonies:   mgmtauth.NewCeremonyCache(clock),
+		clock:               clock,
 	}
 	h.startAttemptCleanup()
 	return h
@@ -270,6 +286,18 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
 		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
 
+		switch h.tryAuthenticateSession(c) {
+		case sessionAuthOK:
+			c.Set(AuthMethodContextKey, AuthMethodSession)
+			c.Next()
+			return
+		case sessionAuthCSRFBlocked:
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "cross-site request blocked"})
+			return
+		case sessionAuthNone:
+			// Fall through to the unchanged management-key logic below.
+		}
+
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
 
@@ -292,6 +320,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
 			return
 		}
+		c.Set(AuthMethodContextKey, AuthMethodKey)
 		c.Next()
 	}
 }

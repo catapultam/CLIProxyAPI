@@ -126,11 +126,13 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		util.SetLogLevel(cfg)
 	}
 
+	// A configured login account counts as "management enabled" alongside
+	// secret-key, so an account survives secret-key being cleared later.
 	prevSecretEmpty := true
 	if oldCfg != nil {
-		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == ""
+		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == "" && !managementLoginAccountConfigured(oldCfg)
 	}
-	newSecretEmpty := cfg.RemoteManagement.SecretKey == ""
+	newSecretEmpty := cfg.RemoteManagement.SecretKey == "" && !managementLoginAccountConfigured(cfg)
 	if s.envManagementSecret {
 		s.registerManagementRoutes()
 		if s.managementRoutesEnabled.CompareAndSwap(false, true) {

@@ -245,8 +245,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	// Register management routes when configuration or environment secrets are available,
-	// or when a local management password is provided (e.g. TUI mode).
-	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
+	// or when a local management password is provided (e.g. TUI mode). A configured
+	// login account also counts as "management enabled": once it exists it must keep
+	// working even if secret-key is later cleared.
+	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != "" || managementLoginAccountConfigured(cfg)
 	s.managementRoutesEnabled.Store(hasManagementSecret)
 	redisqueue.SetEnabled(hasManagementSecret || (cfg != nil && cfg.Home.Enabled))
 	if hasManagementSecret {
