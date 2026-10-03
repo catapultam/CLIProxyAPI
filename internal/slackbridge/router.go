@@ -1,0 +1,204 @@
+package slackbridge
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
+	log "github.com/sirupsen/logrus"
+)
+
+const (
+	howToAddress = "To reach an agent, reply in its thread, or post `name: message` at the top level (the name or address from its thread header)."
+	commandHelp  = "Commands (for people set in config.yaml): `@agents allow @person` lets someone instruct agents; `@agents remove @person` takes that back."
+	ownersOnly   = "Only people set in config.yaml (allowed-emails) can allow or remove users."
+	notSavedNote = " (not saved; this reverts when the proxy restarts)"
+	onlineLimit  = 10
+)
+
+type messageEvent struct {
+	Type     string `json:"type"`
+	Subtype  string `json:"subtype"`
+	Channel  string `json:"channel"`
+	User     string `json:"user"`
+	BotID    string `json:"bot_id"`
+	Text     string `json:"text"`
+	TS       string `json:"ts"`
+	ThreadTS string `json:"thread_ts"`
+}
+
+// relayedSubtypes are the message subtypes that are a person writing:
+// a plain message, a thread reply also sent to the channel, a message with a file.
+var relayedSubtypes = map[string]bool{"": true, "thread_broadcast": true, "file_share": true}
+
+// handleEvent routes one Slack message. It only touches memory and the job
+// queue, so the socket loop can ack as soon as it returns.
+func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
+	if ev.Type != "message" || !relayedSubtypes[ev.Subtype] || ev.BotID != "" ||
+		ev.Channel != b.channelID || ev.User == "" || ev.User == b.botUserID {
+		return
+	}
+	if b.alreadySeen(eventID) {
+		return
+	}
+	user, ok := b.state.user(ev.User)
+	if !ok {
+		return
+	}
+	if verb, target, isCommand := parseCommand(ev.Text, b.botUserID); isCommand {
+		b.command(ev, user, verb, target)
+		return
+	}
+	text := plainText(ev.Text, b.state.idLabels())
+	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
+		sid, linked := b.state.session(ev.ThreadTS)
+		if !linked {
+			b.reply(ev, "This thread isn't linked to an agent. "+howToAddress)
+			return
+		}
+		b.deliver(ev, sid, text, user, "That agent's session has ended, so this wasn't delivered.")
+		return
+	}
+	target, body, addressedOK := parseAddressed(text)
+	if !addressedOK {
+		b.reply(ev, howToAddress)
+		return
+	}
+	notFound := fmt.Sprintf("No agent called `%s`. %s", escape(target), b.onlineHint())
+	if sid, delivered := b.deliver(ev, target, body, user, notFound); delivered {
+		b.state.setThread(sid, ev.TS)
+	}
+}
+
+func (b *Bridge) alreadySeen(eventID string) bool {
+	if eventID == "" {
+		return false
+	}
+	b.seenMu.Lock()
+	defer b.seenMu.Unlock()
+	if b.seen[eventID] {
+		return true
+	}
+	b.seen[eventID] = true
+	b.seenRing = append(b.seenRing, eventID)
+	if len(b.seenRing) > seenEvents {
+		delete(b.seen, b.seenRing[0])
+		b.seenRing = b.seenRing[1:]
+	}
+	return false
+}
+
+// deliver queues body for target; notFound is the reply when the target is unknown.
+func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string) (string, bool) {
+	sid, err := b.bus.Deliver(target, body, user.Label)
+	switch {
+	case err == nil:
+		b.react(ev, "inbox_tray")
+		return sid, true
+	case errors.Is(err, agentbus.ErrUnknownTarget):
+		b.reply(ev, notFound)
+	case errors.Is(err, agentbus.ErrBodyTooLarge):
+		b.reply(ev, "That message is over the 16 KiB agentbus limit and was not delivered.")
+	default:
+		b.reply(ev, "Not delivered: "+escape(err.Error()))
+	}
+	return "", false
+}
+
+func (b *Bridge) onlineHint() string {
+	var names []string
+	for _, p := range b.bus.Peers() {
+		if p.Address == agentbus.SlackAddress || p.Status == agentbus.StatusOffline {
+			continue
+		}
+		label := p.Address
+		if p.Name != "" {
+			label = p.Name + " (" + p.Address + ")"
+		}
+		names = append(names, "`"+escape(label)+"`")
+		if len(names) == onlineLimit {
+			break
+		}
+	}
+	if len(names) == 0 {
+		return "No agents are online."
+	}
+	return "Online: " + strings.Join(names, ", ")
+}
+
+// command runs allow/remove. Only users seeded from config (owners) may run
+// them, so access granted from Slack can't chain. The check happens before
+// any lookup or enqueue, so a non-owner's attempt never calls users.info.
+func (b *Bridge) command(ev messageEvent, user allowedUser, verb, target string) {
+	if (verb == "allow" || verb == "remove") && !user.config {
+		log.Infof("slack: refused %s of %s by non-owner %s", verb, target, user.ID)
+		b.reply(ev, ownersOnly)
+		return
+	}
+	switch verb {
+	case "allow":
+		b.enqueue(func(ctx context.Context) error {
+			label, isBot, err := b.api.userInfo(ctx, b.cfg.BotToken, target)
+			if err != nil {
+				return b.replyNow(ctx, ev, "Couldn't look that user up: "+escape(err.Error()))
+			}
+			if isBot {
+				return b.replyNow(ctx, ev, "Bots can't be allowed.")
+			}
+			u, added, errAllow := b.state.allow(target, label)
+			if !added {
+				return b.replyNow(ctx, ev, fmt.Sprintf("<@%s> is already allowed, as @%s.", u.ID, u.Label))
+			}
+			confirm := fmt.Sprintf("<@%s> can now instruct agents. Agents know them as @%s.", u.ID, u.Label)
+			if errAllow != nil {
+				logSaveError(errAllow)
+				confirm += notSavedNote
+			}
+			log.Infof("slack: %s allowed %s as @%s", user.ID, u.ID, u.Label)
+			return b.replyNow(ctx, ev, confirm)
+		})
+	case "remove":
+		u, _ := b.state.user(target)
+		switch err := b.state.remove(target); {
+		case errors.Is(err, errConfigUser):
+			b.reply(ev, fmt.Sprintf("@%s is set in config.yaml (allowed-emails) and can't be removed from Slack.", u.Label))
+		case errors.Is(err, errNotAllowed):
+			b.reply(ev, fmt.Sprintf("<@%s> isn't on the list.", target))
+		default:
+			confirm := fmt.Sprintf("<@%s> can no longer instruct agents.", target)
+			if err != nil {
+				logSaveError(err)
+				confirm += notSavedNote
+			}
+			log.Infof("slack: %s removed %s", user.ID, target)
+			b.reply(ev, confirm)
+		}
+	default:
+		b.reply(ev, commandHelp)
+	}
+}
+
+// replyThread is the thread a reply to ev belongs in.
+func replyThread(ev messageEvent) string {
+	if ev.ThreadTS != "" {
+		return ev.ThreadTS
+	}
+	return ev.TS
+}
+
+func (b *Bridge) reply(ev messageEvent, text string) {
+	b.enqueue(func(ctx context.Context) error { return b.replyNow(ctx, ev, text) })
+}
+
+func (b *Bridge) replyNow(ctx context.Context, ev messageEvent, text string) error {
+	_, err := b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, text, replyThread(ev))
+	return err
+}
+
+func (b *Bridge) react(ev messageEvent, name string) {
+	b.enqueue(func(ctx context.Context) error {
+		return b.api.addReaction(ctx, b.cfg.BotToken, b.channelID, ev.TS, name)
+	})
+}
