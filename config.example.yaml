@@ -81,33 +81,8 @@ management:
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
   panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 
-  # Management panel username/password and passkey login. The account is created from inside the
-  # panel after one login with the secret-key above, which remains the break-glass recovery path.
-  # login:
-  #   username: admin
-  #   # Plaintext written by hand is hashed on startup, like secret-key above, then cleared.
-  #   password: "a-strong-password"
-  #   # password-hash: "$argon2id$v=19$m=65536,t=3,p=4$..."  # written back automatically
-  #   # session-secret and user-handle are generated automatically once an account exists;
-  #   # regenerating session-secret (via "sign out all devices" or a password change) invalidates
-  #   # every existing session.
-  #   # session-secret: "<base64, auto-generated>"
-  #   # user-handle: "<base64url, 32 random bytes, auto-generated>"
-  #   # Passkeys (WebAuthn) require a secure (HTTPS) origin. Empty rp-id disables passkeys.
-  #   # passkey-rp-id: cakebox.wyrm-cat.ts.net
-  #   # passkey-origins:
-  #   #   - "https://cakebox.wyrm-cat.ts.net:8443"
-  #   # passkeys registered from the panel's account page are listed here automatically:
-  #   # passkeys:
-  #   #   - id: "<base64url credential id>"
-  #   #     public-key: "<base64url COSE key>"
-  #   #     attestation-type: "none"
-  #   #     transports: ["internal", "hybrid"]
-  #   #     aaguid: "<base64url>"
-  #   #     backup-eligible: true
-  #   #     backup-state: true
-  #   #     name: "Pixel 9"
-  #   #     created: 2026-10-02T21:00:00Z
+  # The management panel's username/password and passkey login account is not configured here: it
+  # lives in management-login.json next to this config file, and is set up entirely from the panel.
 
 # Client authentication for the proxy API. These are not upstream provider keys.
 access:

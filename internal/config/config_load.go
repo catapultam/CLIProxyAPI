@@ -130,19 +130,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, secretPath, hashed)
 	}
 
-	// Hash a plaintext management login password and lazily generate
-	// session-secret/user-handle for an account written by hand, the same
-	// way the block above handles remote-management.secret-key.
-	loginChanged, errLogin := cfg.normalizeLoginAccount()
-	if errLogin != nil {
-		return nil, errLogin
-	}
-	if len(loginChanged) > 0 {
-		if errPersist := persistLoginAccountFields(configFile, data, loginChanged); errPersist != nil {
-			return nil, fmt.Errorf("failed to persist management login account: %w", errPersist)
-		}
-	}
-
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
