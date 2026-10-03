@@ -58,6 +58,10 @@ type Message struct {
 	Body      string    `json:"body"`
 	ReplyTo   string    `json:"reply_to,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	// FromUser marks an instruction from an allowed Slack user. Only Deliver
+	// sets it; clients can never send it.
+	FromUser  bool   `json:"from_user,omitempty"`
+	SlackUser string `json:"slack_user,omitempty"`
 }
 
 // Peer is one session as other sessions see it.
@@ -103,6 +107,8 @@ type Store struct {
 	mu    sync.Mutex
 	byID  map[string]*session
 	dirty bool
+	// bridge relays SlackAddress traffic; nil when Slack is off.
+	bridge Bridge
 	// waitTimeout bounds one /wait long-poll (defaultWaitTimeout when zero).
 	waitTimeout time.Duration
 }
@@ -185,6 +191,9 @@ func (s *Store) Hello(id, machine, cwd, name string, mod bool) {
 }
 
 func (s *Store) nameFree(name, exceptID string) bool {
+	if isSlackAddress(name) {
+		return false
+	}
 	now := s.now()
 	lower := strings.ToLower(name)
 	for id, other := range s.byID {
@@ -297,7 +306,8 @@ func newMessageID() string {
 	return "m_" + hex.EncodeToString(b[:])
 }
 
-// Send queues a message from a known session to a name or address.
+// Send queues a message from a known session to a name or address. Messages
+// to SlackAddress go to the bridge instead of an inbox.
 func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	if strings.TrimSpace(body) == "" {
 		return Message{}, ErrEmptyBody
@@ -306,20 +316,14 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 		return Message{}, ErrBodyTooLarge
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	from, ok := s.byID[fromID]
 	if !ok {
+		s.mu.Unlock()
 		return Message{}, ErrUnknownSender
 	}
-	targetID, ok := s.resolveLocked(to)
-	if !ok {
-		return Message{}, ErrUnknownTarget
-	}
-	target := s.byID[targetID]
 	msg := Message{
 		ID:        newMessageID(),
 		From:      s.addressLocked(from),
-		To:        s.addressLocked(target),
 		Body:      body,
 		ReplyTo:   strings.TrimSpace(replyTo),
 		CreatedAt: s.now(),
@@ -327,13 +331,38 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	if from.Name != "" {
 		msg.From = from.Name + " (" + msg.From + ")"
 	}
+	if b := s.bridge; b != nil && isSlackAddress(to) {
+		out := Outbound{
+			SessionID: fromID,
+			Address:   s.addressLocked(from),
+			Name:      from.Name,
+			Machine:   from.Machine,
+			Cwd:       from.Cwd,
+			Body:      body,
+		}
+		s.mu.Unlock()
+		b.Post(out)
+		msg.To = SlackAddress
+		return msg, nil
+	}
+	defer s.mu.Unlock()
+	targetID, ok := s.resolveLocked(to)
+	if !ok {
+		return Message{}, ErrUnknownTarget
+	}
+	target := s.byID[targetID]
+	msg.To = s.addressLocked(target)
+	s.enqueueLocked(target, msg)
+	return msg, nil
+}
+
+func (s *Store) enqueueLocked(target *session, msg Message) {
 	target.Inbox = append(target.Inbox, msg)
 	if target.notify != nil {
 		close(target.notify)
 		target.notify = nil
 	}
 	s.dirty = true
-	return msg, nil
 }
 
 func (s *Store) expireLocked(sess *session) {
@@ -495,6 +524,9 @@ func (s *Store) Peers() []Peer {
 			Status:   status,
 			LastSeen: sess.lastSeen(),
 		})
+	}
+	if s.bridge != nil {
+		out = append(out, Peer{Address: SlackAddress, Machine: SlackAddress, Status: StatusIdle, LastSeen: now})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].LastSeen.Equal(out[j].LastSeen) {
