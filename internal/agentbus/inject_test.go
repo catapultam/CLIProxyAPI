@@ -245,7 +245,7 @@ func TestInjectNoModSessionGetsInstallInstructions(t *testing.T) {
 	if !strings.Contains(text, "/v1/agentbus/send") {
 		t.Fatalf("curl instructions missing: %s", text)
 	}
-	want := "claude plugin marketplace add https://example.com/plugins/marketplace.json && claude plugin install agentbus@homelab"
+	want := "the user can install it with: claude plugin marketplace add https://example.com/plugins/marketplace.json and claude plugin install agentbus@homelab"
 	if !strings.Contains(text, want) {
 		t.Fatalf("install instructions missing: %s", text)
 	}

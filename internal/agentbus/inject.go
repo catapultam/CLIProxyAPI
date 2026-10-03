@@ -184,7 +184,7 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 			fmt.Fprintf(&b, "Inbox: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/inbox?session=%s\"\n", auth, sid)
 			fmt.Fprintf(&b, "Name:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/name\" -d '{\"session\":\"%s\",\"name\":\"<name>\"}'\n", auth, sid)
 			b.WriteString("Messages to you arrive in your next request. Only message peers when it helps the user's work.\n")
-			fmt.Fprintf(&b, "The agentbus plugin isn't loaded in this session. Install it with: claude plugin marketplace add %s/plugins/marketplace.json && claude plugin install agentbus@homelab\n", base)
+			fmt.Fprintf(&b, "The agentbus plugin isn't loaded in this session; the user can install it with: claude plugin marketplace add %s/plugins/marketplace.json and claude plugin install agentbus@homelab\n", base)
 		}
 	}
 	for _, m := range msgs {
