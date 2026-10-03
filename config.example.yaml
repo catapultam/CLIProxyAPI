@@ -1198,3 +1198,13 @@ plugins:
 #     switch-project: true
 #     switch-preview-model: true
 # antigravity-credits moved to oauth.providers.antigravity.antigravity-credits.
+
+# Slack bridge for the agentbus (catapultam fork). Sessions reach the channel
+# as "slack"; allowed users instruct them by replying in a session's thread.
+# More users can be allowed from Slack with "@agents allow @person".
+# slack:
+#   bot-token: "xoxb-..."
+#   app-token: "xapp-..."
+#   channel: "agents"
+#   allowed-emails:
+#     - "you@example.com"

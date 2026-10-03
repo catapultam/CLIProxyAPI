@@ -33,7 +33,7 @@ func TestAgentbusStateSavedNextToConfig(t *testing.T) {
 	s := newTestServer(t)
 	t.Cleanup(s.stopAgentbus)
 	want := filepath.Join(filepath.Dir(s.configFilePath), "agentbus-state.json")
-	if got := s.agentbusStatePath(); got != want {
+	if got := s.runtimeStatePath("agentbus-state.json"); got != want {
 		t.Fatalf("state path = %q, want %q", got, want)
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/slackbridge"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -76,6 +77,9 @@ type Server struct {
 	// agentbus links Claude Code sessions across machines (catapultam fork).
 	agentbus     *agentbus.Store
 	agentbusStop chan struct{}
+
+	// slack bridges the agentbus to a Slack channel; nil when not configured.
+	slack *slackbridge.Bridge
 
 	// currentPath is the absolute path to the current working directory.
 	currentPath string
