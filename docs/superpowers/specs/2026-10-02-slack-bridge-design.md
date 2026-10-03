@@ -65,10 +65,21 @@ features:
   app_home:
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
+  shortcuts:
+    - name: Ask an agent
+      type: message
+      callback_id: ask_agent
+      description: Send this message to one of your agents
+  slash_commands:
+    - command: /clanker
+      description: Message one of your agents
+      usage_hint: "name: message"
+      should_escape: false
 oauth_config:
   scopes:
     bot:
       - chat:write
+      - commands
       - files:write
       - channels:history
       - groups:history
@@ -77,6 +88,7 @@ oauth_config:
       - mpim:history
       - mpim:read
       - mpim:write
+      - reactions:read
       - reactions:write
       - channels:read
       - groups:read
@@ -85,10 +97,15 @@ oauth_config:
 settings:
   event_subscriptions:
     bot_events:
+      - member_joined_channel
+      - member_left_channel
       - message.channels
       - message.groups
       - message.im
       - message.mpim
+      - reaction_added
+  interactivity:
+    is_enabled: true
   socket_mode_enabled: true
   org_deploy_enabled: false
   token_rotation_enabled: false
@@ -894,3 +911,80 @@ A command report (a `reply_to` a command message starting with ✅ or ❌)
 logs the outcome, the command and the machine, never the output.
 `AGENTBUS_ALLOW_SHELL` is a guard rail, not a security boundary
 (`docs/agent-commands/README.md`).
+
+### Approvals, Ask an agent, broadcasts (mod 0.3.8)
+
+User requests after the 0.3.7 deploy. The manifest above gains `commands`,
+`reactions:read`, the `reaction_added`, `member_joined_channel` and
+`member_left_channel` events (the member events now drop the member cache
+as described under Members), interactivity, the `ask_agent` message
+shortcut and `/clanker`. Reinstall the app after updating it.
+
+**Approvals.** In a linked conversation everyone may talk with the agent;
+only allowed users' messages are instructions. When a guest asks for an
+action, the agent posts `confirm: <what it will do>` (case-insensitive,
+with `reply_to` as usual). The bridge posts the text plus "_Needs approval:
+an allowed user reacts 👍 to approve._" and records a pending approval
+(channel, ts of its post, thread, session, the request's bus id, the text
+cut to 200 characters, created) in the state file; it expires after 24
+hours and is pruned. A `reaction_added` of `+1` or `thumbsup` (any
+`::skin-tone-2`..`6`) on that post by an allowed user (owners and allowed
+users) delivers once, through `Store.DeliverApproval`, a `from_user`
+message with `approval: <request id>`, `slack_user` the approver's label
+and body `approved: <text>`; the bridge reacts ✅. Its reply record points
+where the request was. Any other reaction, or a 👍 from anyone else
+(logged at debug), does nothing. `/send` can't set `approval`; loading
+drops it from anything but an allowed user's message. The note and the
+mod frame it as "Approval from <label> via Slack for your request <id>",
+"the go-ahead from an allowed user"; guest framings add the `confirm:`
+rule. `Outbound.ID` carries the bus id of what a session sent.
+
+**Ask an agent.** The message shortcut (`ask_agent`) and `/clanker` reach
+agents from anywhere, including 1:1 DMs between people the bot can't read.
+Both come over Socket Mode (`interactive`, `slash_commands`) and are acked
+at once: the handlers only touch memory and queue jobs. Only allowed users
+may use them; anyone else gets "You're not allowed to use this." (the
+shortcut: an ephemeral in their DM with the bot; `/clanker`: the ack).
+
+- Shortcut: `views.open` with a modal: a static_select of online agents
+  (for owners `name or address · machine`, for others named agents only)
+  whose values are indexes into a list the bridge keeps, and an optional
+  note. The message text (cut to 4000 characters), its author and the
+  agent list stay in memory (an hour, at most 200) under
+  {user, channel, ts}; `private_metadata` is {channel, ts, hash of the
+  text}. A submit that matches (same user, hash, a listed option) is
+  delivered as from that user with `via: shortcut`: the note (or "Please
+  look at this message.") then "Quoted message from <author label or
+  someone> in <a DM | a group DM | #channel>:" and the text quoted line by
+  line. Otherwise the ack shows an error in the modal. The reply record is
+  the user's DM with the bot, top level; the bot posts "Sent to <agent> —
+  they'll answer here." and the quote there. Nothing is posted where the
+  message was.
+- `/clanker name: message` (or `@name message`) is delivered with
+  `via: slash`, answered in the user's DM; the ack is "Sent to <agent> —
+  answer arrives in your DM with @<bot>." Empty or `help` lists agents as
+  help does for that user's DM. `!commands` follow the owner rule.
+
+Agent names in these replies follow `agentLabel` (public names for
+non-owners). The note and the mod frame `shortcut`/`slash` as DMs.
+
+**Broadcasts.** An owner's `all: message` (or `@all message`), anywhere an
+owner can address agents (also in threads and `/clanker all: …`), goes to
+every session that isn't offline, as an ordinary instruction with the
+usual `via`. Non-owners get "Only owners can message all agents." Each
+delivery is recorded like any other (answers in the broadcast's thread, or
+at a DM's top level), without adopting a thread or changing `dm_last`. The
+bot replies once: "→ sent to N agents: <at most 15 names>, +M more" (or "No
+agents are online right now."). The records share a group: the message
+shows 📥 (⚙️ for a command), 📨 once any recipient received it and 👀 once
+all read it, where a dismissal counts as read. `all: !cmd` goes to every
+session that can run commands ("skipped: N without plugin 0.3.3+"); shell
+commands are refused ("Run shell commands per agent."). `all` is reserved
+like `slack`: no session can take the name and it never resolves. The note
+says Slack messages may be broadcasts, to dismiss when not relevant.
+
+**DM fallback.** In a DM with the bot, a top-level `name: …` or `@name …`
+whose name is no agent's goes, whole, to `dm_last` (or the DM's link), with
+"→ sent to <agent>"; without either it gets the not-found help. A `!cmd`
+never falls back. Thread replies already went to the thread's agent; the
+main channel is unchanged.
