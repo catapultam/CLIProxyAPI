@@ -172,7 +172,7 @@ func TestLinksListing(t *testing.T) {
 	b.handleEvent("EvLS8", foreignMsg("UALEX", "<@UBOT> links", "1700006200.000008", ""))
 	b.handleEvent("EvLS9", foreignMsg("UALEX", "<@UBOT> unlink <@UBOB>", "1700006200.000009", ""))
 	drainJobs(t, b)
-	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["text"] != manageLinksWhere {
+	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["text"] != b.withBot(manageLinksWhere) || !strings.Contains(got["text"], "`@clanker-bro links`") {
 		t.Fatalf("group reply = %+v", got)
 	}
 	for _, channel := range []string{"DUBOB", "GMPIM1"} {

@@ -129,7 +129,7 @@ func TestTopLevelUnknownOrUnaddressedGetsHelp(t *testing.T) {
 	}
 	b.handleEvent("Ev5", msg("UALEX", "https://example.com", "2.2", ""))
 	drainJobs(t, b)
-	if got := lastPostText(f); !strings.Contains(got, "name: message") {
+	if got := lastPostText(f); !strings.HasPrefix(got, "*Agents you can message:*") || !strings.HasSuffix(got, helpHow) {
 		t.Fatalf("reply = %q", got)
 	}
 	if bus.Pending(sidA) || bus.Pending(sidB) {
@@ -141,7 +141,7 @@ func TestReplyInUnlinkedThreadGetsHelp(t *testing.T) {
 	b, f, _ := newTestBridge(t)
 	b.handleEvent("Ev6", msg("UALEX", "hm", "3.2", "3.1"))
 	drainJobs(t, b)
-	if got := lastPostText(f); !strings.Contains(got, "isn't linked to an agent") {
+	if got := lastPostText(f); !strings.HasPrefix(got, "*Agents you can message:*") || !strings.Contains(got, "`flyer`") {
 		t.Fatalf("reply = %q", got)
 	}
 }
@@ -176,7 +176,7 @@ func TestAllowAndRemoveFromSlack(t *testing.T) {
 	if _, ok = b.state.user("UEVE"); ok || !strings.Contains(lastPostText(f), "Only people set in config.yaml") {
 		t.Fatal("a runtime-added user allowed someone")
 	}
-	if len(f.callsTo("users.info")) != 1 {
+	if len(userLookups(f)) != 1 {
 		t.Fatal("refused allow still looked the user up")
 	}
 

@@ -20,13 +20,13 @@ import (
 const (
 	mainNotLinkable = "The main channel can't be linked or unlinked: it reaches every agent already."
 	notLinked       = "This conversation isn't linked to an agent."
-	needSomeone     = "Name at least one other person: `@agents chat @person with <agent>`."
+	needSomeone     = "Name at least one other person: `{bot} chat @person with <agent>`."
 	tooLarge        = "That message is over the 16 KiB agentbus limit and was not delivered."
 	// noLongerLinked is posted in a conversation an owner unlinked from
 	// elsewhere.
 	noLongerLinked = "This conversation is no longer linked to an agent."
 	// manageLinksWhere answers links and unlink-from-afar posted elsewhere.
-	manageLinksWhere = "Run `@agents links` and `@agents unlink @person` or `@agents unlink <conversation id>` in the main channel or your DM with the bot."
+	manageLinksWhere = "Run `{bot} links` and `{bot} unlink @person` or `{bot} unlink <conversation id>` in the main channel or your DM with the bot."
 )
 
 // conversationLink returns channel's link while its session hasn't been
@@ -75,9 +75,10 @@ func conversationKind(ev messageEvent) string {
 	return "channel"
 }
 
-// notFoundAgent is the reply when agent doesn't resolve to a session.
-func (b *Bridge) notFoundAgent(agent string) string {
-	return fmt.Sprintf("No agent called `%s`. %s", escape(agent), b.onlineHint())
+// notFoundAgent is the reply in ev's conversation when agent doesn't
+// resolve to a session.
+func (b *Bridge) notFoundAgent(ev messageEvent, agent string) string {
+	return b.notFoundReply(ev, agent)
 }
 
 // openLinked runs "chat @a [@b …] with <agent>" (a group DM of the owner
@@ -88,7 +89,7 @@ func (b *Bridge) notFoundAgent(agent string) string {
 func (b *Bridge) openLinked(ev messageEvent, owner allowedUser, cmd botCommand) {
 	sid, found := b.bus.Resolve(cmd.agent)
 	if !found {
-		b.replyCommand(ev, b.notFoundAgent(cmd.agent))
+		b.replyCommand(ev, b.notFoundAgent(ev, cmd.agent))
 		return
 	}
 	var members []string
@@ -101,7 +102,7 @@ func (b *Bridge) openLinked(ev messageEvent, owner allowedUser, cmd botCommand) 
 		}
 	}
 	if (cmd.verb == "chat" && len(members) < 2) || len(members) == 0 {
-		b.replyCommand(ev, needSomeone)
+		b.replyCommand(ev, b.withBot(needSomeone))
 		return
 	}
 	var confirm string
@@ -172,7 +173,7 @@ func (b *Bridge) linkHere(ev messageEvent, owner allowedUser, agent string) {
 	}
 	sid, found := b.bus.Resolve(agent)
 	if !found {
-		b.replyCommand(ev, b.notFoundAgent(agent))
+		b.replyCommand(ev, b.notFoundAgent(ev, agent))
 		return
 	}
 	prev, errSave := b.state.linkConversation(ev.Channel, sid, owner.ID, linkKindOf(ev), []string{ev.User})
@@ -220,7 +221,7 @@ func (b *Bridge) managesFromAfar(ev messageEvent) bool {
 	if isDM(ev) || ev.Channel == b.channelID {
 		return true
 	}
-	b.replyCommand(ev, manageLinksWhere)
+	b.replyCommand(ev, b.withBot(manageLinksWhere))
 	return false
 }
 

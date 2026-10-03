@@ -126,6 +126,11 @@ type Bridge struct {
 	guestNames  map[string]string
 	guestQueued map[string]int
 
+	// botName is the bot's display name from Slack (see BotName);
+	// botNameMu guards it and is never held across a Slack call.
+	botNameMu sync.Mutex
+	botName   string
+
 	// floods holds each linked conversation's guest rate-limit bucket.
 	// floodMu guards it and is never held across a Slack or Store call.
 	floodMu sync.Mutex
@@ -669,6 +674,7 @@ func (b *Bridge) resolve(ctx context.Context) error {
 		b.rememberDM(ownerID, homeChannelID)
 	}
 	b.botUserID, b.channelID, b.homeChannelID, b.ownerID = botID, channelID, homeChannelID, ownerID
+	b.refreshBotName(ctx)
 	b.state.seed(users)
 	if channelID != "" {
 		// Threads from an old state file are all in the channel.

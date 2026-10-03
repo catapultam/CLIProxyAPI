@@ -411,7 +411,7 @@ func TestUnlinkedForeignConversationDeliversNothingFromGuests(t *testing.T) {
 		b.handleEvent("EvUF"+string(rune('a'+i)), foreignMsg("UBOB", text, "1700004700.00000"+string(rune('1'+i)), ""))
 	}
 	nothingSent(t, b, f, bus)
-	if n := len(f.callsTo("users.info")); n != 0 {
+	if n := len(userLookups(f)); n != 0 {
 		t.Fatalf("looked up a stranger %d times", n)
 	}
 }

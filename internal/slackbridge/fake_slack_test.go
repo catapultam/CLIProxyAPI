@@ -105,6 +105,8 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 			// Guests: no email, so never allowed from config. UFAKE's display
 			// name is an allowed user's label.
 			{ID: "UBOB", Name: "bob", Display: "Bob"}, {ID: "UCAROL", Name: "carol", Display: "Carol"}, {ID: "UFAKE", Name: "alexfake", Display: "Alex"},
+			// The bridge's own bot user (auth.test answers UBOT).
+			{ID: "UBOT", Name: "agents", Display: "clanker-bro", Bot: true},
 		},
 		channels:  []fakeChannel{{ID: "CGEN", Name: "general"}, {ID: "CAGENTS", Name: "agents"}},
 		fail:      map[string]string{},
@@ -124,12 +126,35 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 
 func (f *fakeSlack) apiBase() string { return f.URL + "/api/" }
 
+// setUser changes fake user id (under the lock, so -race is clean).
+func (f *fakeSlack) setUser(id string, change func(*fakeUser)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.users {
+		if f.users[i].ID == id {
+			change(&f.users[i])
+		}
+	}
+}
+
 func (f *fakeSlack) callsTo(method string) []fakeCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []fakeCall
 	for _, c := range f.calls {
 		if c.Method == method {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// userLookups lists the users.info calls for anyone but the bot itself
+// (resolve and the maintenance pass look the bot up for its name).
+func userLookups(f *fakeSlack) []fakeCall {
+	var out []fakeCall
+	for _, c := range f.callsTo("users.info") {
+		if c.Form.Get("user") != "UBOT" {
 			out = append(out, c)
 		}
 	}
@@ -238,7 +263,10 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"ok": false, "error": "users_not_found"})
 	case "users.info":
-		for _, u := range f.users {
+		f.mu.Lock()
+		known := append([]fakeUser(nil), f.users...)
+		f.mu.Unlock()
+		for _, u := range known {
 			if u.ID == r.PostForm.Get("user") {
 				writeJSON(w, map[string]any{"ok": true, "user": map[string]any{"id": u.ID, "name": u.Name, "is_bot": u.Bot, "profile": map[string]any{"display_name": u.Display, "real_name": u.Real}}})
 				return

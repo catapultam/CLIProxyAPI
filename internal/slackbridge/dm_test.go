@@ -229,7 +229,7 @@ func TestDMPlainMessageGoesToDMLastUntilItExpires(t *testing.T) {
 		t.Fatal("a plain DM with no dmLast was delivered")
 	}
 	help := lastPost(t, f)
-	if help["channel"] != "DUALEX" || help["thread_ts"] != "" || !strings.Contains(help["text"], "name: message") || !strings.Contains(help["text"], "flyer") {
+	if help["channel"] != "DUALEX" || help["thread_ts"] != "" || !strings.HasSuffix(help["text"], helpHow) || !strings.Contains(help["text"], "flyer") {
 		t.Fatalf("help = %+v", help)
 	}
 
@@ -259,7 +259,7 @@ func TestDMPlainMessageGoesToDMLastUntilItExpires(t *testing.T) {
 	if bus.Pending(sidA) || bus.Pending(sidB) {
 		t.Fatal("a plain DM went to an expired dmLast")
 	}
-	if len(f.callsTo("chat.postMessage")) != before+1 || !strings.Contains(lastPost(t, f)["text"], "name: message") {
+	if len(f.callsTo("chat.postMessage")) != before+1 || !strings.HasSuffix(lastPost(t, f)["text"], helpHow) {
 		t.Fatalf("no help after expiry: %+v", lastPost(t, f))
 	}
 }

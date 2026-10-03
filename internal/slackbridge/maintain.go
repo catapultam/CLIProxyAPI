@@ -35,6 +35,7 @@ func (b *Bridge) runMaintenance(ctx context.Context) {
 			}
 		case <-housekeeping.C:
 			b.maintain()
+			b.refreshBotName(ctx)
 		}
 	}
 }

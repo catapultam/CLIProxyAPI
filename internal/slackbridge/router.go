@@ -11,22 +11,31 @@ import (
 )
 
 const (
-	howToAddress = "To reach an agent, reply in its thread, or post `name: message` at the top level (the name or address from its thread header)."
-	commandHelp  = "Commands (for people set in config.yaml): `@agents allow @person` lets someone instruct agents; `@agents remove @person` takes that back. " +
-		"`@agents chat @person [@person …] with <agent>` opens a group DM linked to an agent; `@agents dm @person with <agent>` opens the bot's DM with that person, linked to an agent. " +
-		"`@agents link <agent>` links the conversation it's posted in; `@agents unlink` undoes that. From the main channel or your DM with the bot, `@agents links` lists linked conversations, and `@agents unlink @person` or `@agents unlink <conversation id>` unlinks them. In a linked conversation, everyone who isn't allowed is a guest: the agent gets their messages as input, not instructions."
+	// commandHelpText is the help for "@bot" commands; {bot} is the bot's
+	// mention as Slack shows it now (see withBot).
+	commandHelpText = "Commands (for people set in config.yaml): `{bot} allow @person` lets someone instruct agents; `{bot} remove @person` takes that back. " +
+		"`{bot} chat @person [@person …] with <agent>` opens a group DM linked to an agent; `{bot} dm @person with <agent>` opens the bot's DM with that person, linked to an agent. " +
+		"`{bot} link <agent>` links the conversation it's posted in; `{bot} unlink` undoes that. From the main channel or your DM with the bot, `{bot} links` lists linked conversations, and `{bot} unlink @person` or `{bot} unlink <conversation id>` unlinks them. In a linked conversation, everyone who isn't allowed is a guest: the agent gets their messages as input, not instructions."
 	ownersOnly = "Only people set in config.yaml (allowed-emails) can allow or remove users."
 	// ownersOnlyLinks refuses chat, dm, link and unlink from a non-owner.
 	ownersOnlyLinks = "Only people set in config.yaml (allowed-emails) can open, list, link or unlink conversations."
 	notSavedNote    = " (not saved; this reverts when the proxy restarts)"
 	// ownersOnlyCommands refuses a "!" command from a non-owner.
 	ownersOnlyCommands = "Only owners can run commands."
-	howToCommand       = "Run a command in an agent's thread (`!compact`), or at the top level as `name: !compact`. `!commands` lists them."
 	sessionEnded       = "That agent's session has ended, so this wasn't delivered."
-	// howToDM answers a DM the bridge can't route.
-	howToDM     = "To reach an agent here, write `name: message` (the name or address from its posts). After that, plain messages go to the agent you last talked to here, and a reply in a thread goes to the agent whose message started it."
-	onlineLimit = 10
+	// helpLimit caps the agents the help reply lists.
+	helpLimit = 15
+	// helpHow ends the help reply.
+	helpHow = "Reply in an agent's thread, or start with `name: …` / `@name …`."
 )
+
+// withBot fills text's {bot} with the bot's mention as Slack shows it now.
+func (b *Bridge) withBot(text string) string {
+	return strings.ReplaceAll(text, "{bot}", b.botMention())
+}
+
+// commandHelp is the help for "@bot" commands.
+func (b *Bridge) commandHelp() string { return b.withBot(commandHelpText) }
 
 type messageEvent struct {
 	Type    string `json:"type"`
@@ -111,7 +120,7 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		ev.Text = rest
 		if _, _, tagOK := b.tagged(ev, plainText(rest, b.state.idLabels())); !tagOK {
 			if active {
-				b.replyCommand(ev, commandHelp)
+				b.replyCommand(ev, b.commandHelp())
 			}
 			return
 		}
@@ -137,7 +146,7 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 			}
 			// Answer an unlinked thread once, not on every message in it.
 			if !b.alreadySeen("unlinked:" + ev.ThreadTS) {
-				b.reply(ev, "This thread isn't linked to an agent. "+howToAddress)
+				b.reply(ev, b.help(ev))
 			}
 			return
 		}
@@ -159,10 +168,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 			b.runCommand(ev, user, "", text, "", false)
 			return
 		}
-		b.reply(ev, howToAddress)
+		b.reply(ev, b.help(ev))
 		return
 	}
-	notFound := fmt.Sprintf("No agent called `%s`. %s", escape(target), b.onlineHint())
+	notFound := b.notFoundReply(ev, target)
 	if home, isMove := parseMove(body); isMove {
 		b.move(ev, user, target, home, notFound)
 		return
@@ -328,7 +337,7 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 				return
 			}
 			if !b.alreadySeen("unlinked:" + ev.Channel + ":" + ev.ThreadTS) {
-				b.reply(ev, "This thread isn't linked to an agent. "+howToDM)
+				b.reply(ev, b.help(ev))
 			}
 			return
 		}
@@ -336,7 +345,7 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 		return
 	}
 	if target, body, addressedOK := parseAddressed(text); addressedOK {
-		notFound := fmt.Sprintf("No agent called `%s`. %s", escape(target), b.onlineHint())
+		notFound := b.notFoundReply(ev, target)
 		if home, isMove := parseMove(body); isMove {
 			b.move(ev, user, target, home, notFound)
 			return
@@ -369,7 +378,7 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 		sid, ok = link.Session, true
 	}
 	if !ok {
-		b.reply(ev, howToDM+" "+b.onlineHint())
+		b.reply(ev, b.help(ev))
 		return
 	}
 	if _, delivered := b.deliver(ev, sid, text, user, sessionEnded, true); delivered && viaLast {
@@ -412,7 +421,7 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		return
 	}
 	if target == "" {
-		b.replyCommand(ev, howToCommand)
+		b.replyCommand(ev, b.help(ev))
 		return
 	}
 	cmd := agentbus.Command{Name: name, Kind: agentbus.CommandSlash, Command: name, Args: rest}
@@ -552,25 +561,53 @@ func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, 
 	return reaction
 }
 
-func (b *Bridge) onlineHint() string {
-	var names []string
+// ownerOnly reports whether ev's conversation shows the bridge's setup to
+// owners only: the main channel, or an owner's DM with the bot. Elsewhere
+// (group DMs, other channels, a non-owner's DM) the bridge posts no
+// addresses or machine names.
+func (b *Bridge) ownerOnly(ev messageEvent) bool {
+	if isDM(ev) {
+		u, ok := b.state.user(ev.User)
+		return ok && u.config
+	}
+	return ev.Channel == b.channelID
+}
+
+// help is the one reply to anything the bridge can't route: the online
+// agents, most recent first (at most helpLimit), and how to reach one. In a
+// conversation that isn't owner-only it lists named agents by name only.
+func (b *Bridge) help(ev messageEvent) string {
+	full := b.ownerOnly(ev)
+	var lines []string
 	for _, p := range b.bus.Peers() {
 		if p.Address == agentbus.SlackAddress || p.Status == agentbus.StatusOffline {
 			continue
 		}
-		label := p.Address
-		if p.Name != "" {
-			label = p.Name + " (" + p.Address + ")"
+		switch {
+		case full:
+			label := p.Name
+			if label == "" {
+				label = p.Address
+			}
+			lines = append(lines, "• `"+escape(label)+"` · "+escape(p.Machine)+" · "+p.Status)
+		case p.Name != "":
+			lines = append(lines, "• `"+escape(p.Name)+"` · "+p.Status)
+		default:
+			continue
 		}
-		names = append(names, "`"+escape(label)+"`")
-		if len(names) == onlineLimit {
+		if len(lines) == helpLimit {
 			break
 		}
 	}
-	if len(names) == 0 {
-		return "No agents are online."
+	if len(lines) == 0 {
+		return "No agents are online right now.\n" + helpHow
 	}
-	return "Online: " + strings.Join(names, ", ")
+	return "*Agents you can message:*\n" + strings.Join(lines, "\n") + "\n" + helpHow
+}
+
+// notFoundReply answers a name that doesn't resolve to an agent.
+func (b *Bridge) notFoundReply(ev messageEvent, target string) string {
+	return fmt.Sprintf("No agent called `%s`.\n%s", escape(target), b.help(ev))
 }
 
 // command runs an "@bot <verb>" command: allow/remove, or chat, dm, link
@@ -594,7 +631,7 @@ func (b *Bridge) command(ev messageEvent, user allowedUser, cmd botCommand) {
 		return
 	}
 	if !cmd.ok {
-		b.replyCommand(ev, commandHelp)
+		b.replyCommand(ev, b.commandHelp())
 		return
 	}
 	var target string
@@ -642,7 +679,7 @@ func (b *Bridge) command(ev messageEvent, user allowedUser, cmd botCommand) {
 		b.cmdMu.Unlock()
 		b.replyCommand(ev, confirm)
 	default:
-		b.replyCommand(ev, commandHelp)
+		b.replyCommand(ev, b.commandHelp())
 	}
 }
 

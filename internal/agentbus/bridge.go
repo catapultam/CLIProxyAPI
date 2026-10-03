@@ -58,6 +58,13 @@ type Bridge interface {
 	Users() []string
 }
 
+// BotNamer is implemented by bridges that know their Slack bot's display
+// name, so the note can name it as people see it in Slack. Store calls it
+// without holding its lock.
+type BotNamer interface {
+	BotName() string
+}
+
 // ImagePoster is implemented by bridges that can post images.
 type ImagePoster interface {
 	// PostImage posts data into the thread Post would pick for o, with o.Body
