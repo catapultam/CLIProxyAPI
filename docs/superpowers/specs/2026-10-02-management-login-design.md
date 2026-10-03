@@ -39,7 +39,17 @@ Replace the "paste the management key" prompt in the management panel with a nor
 
 ### Storage
 
-The account lives in a sidecar file, `management-login.json`, in the same directory as the active config file. The file has mode 0600 and is written atomically (temp file plus rename).
+The account lives in a sidecar file, `management-login.dat`. The content is JSON, but the name is deliberately not `*.json`, so the auth-file endpoints and watcher never treat it as a credential. The file has mode 0600 and is written atomically (temp file plus rename).
+
+Its location is resolved in this order:
+1. The full path in env `MANAGEMENT_LOGIN_FILE`.
+2. `WRITABLE_PATH`.
+3. The auth dir, which is persistent in the default docker-compose.
+4. The config file's directory.
+
+On cakebox this resolves to `/data/management-login.dat`.
+
+A corrupt or unreadable file puts the store into a "broken" state. Login is unavailable and writes are refused (503) so the file is never overwritten, while the key keeps working.
 
 **Revised after review.** The first version stored the account in `config.yaml`, which caused these problems:
 - The v8 config endpoints build their responses from the raw YAML, so the session secret and password hash leaked.
@@ -94,7 +104,7 @@ With the sidecar, only the `/account` API reads or writes the account. Config en
 1. If there is a `cpa_mgmt_session` cookie or an `Authorization: Bearer cpas_...` header that verifies, the request is authenticated (subject to the CSRF guard).
 2. Otherwise fall through to the existing management-key logic, unchanged.
 
-Session auth bypasses the `allow-remote` check, because the session itself is the proof. Key-based access, rate limiting and `/v0` handler code stay as they are.
+Session auth obeys the same remote predicate as key auth (`local || allow-remote`, including the `MANAGEMENT_PASSWORD` override), so `allow-remote: false` keeps its meaning. A stale session credential sent alongside a valid management key falls through to key auth without counting a failure. `GET /session/status` never counts key failures. Key-based access, rate limiting and `/v0` handler code stay as they are.
 
 ### Routes
 
@@ -116,8 +126,8 @@ Authenticated (key or session), under `/v8/management/account`:
 |---|---|---|
 | `GET /account` | none | `200 {"configured": bool, "username": "", "passkeys": [{"id", "name", "created_at"}], "passkey_rp_id": "", "passkey_origins": []}` |
 | `PUT /account` | `{"username", "password", "current_password"?}` | `200` session response for the caller. On first setup it generates `session-secret` and `user-handle`, and the password is required. On an existing account an empty `password` keeps the current one, so a username-only change is valid. Over a session, any change to an existing account requires the correct `current_password` (`403` otherwise); over the management key it is never required. `session-secret` rotates only when the password changes. `400` for policy failures (password < 12 chars, empty username) |
-| `PUT /account/passkey-settings` | `{"rp_id", "origins": []}` | `200` updated account view. Lets the panel configure passkeys; the panel pre-fills from `window.location` |
-| `POST /account/passkeys/begin` | none | `200 {"ceremony_id", "options": <protocol.CredentialCreation JSON>}`. Uses resident key = required, user verification = preferred, and excludeCredentials = existing passkeys. `409` when rp-id is not set or no account exists |
+| `PUT /account/passkey-settings` | `{"rp_id", "origins": [], "current_password"?}` | `200` updated account view. Lets the panel configure passkeys; the panel pre-fills from `window.location`. Over a session `current_password` is required (`403` otherwise) |
+| `POST /account/passkeys/begin` | `{"current_password"?}` | `200 {"ceremony_id", "options": <protocol.CredentialCreation JSON>}`. Uses resident key = required, user verification = required, and excludeCredentials = existing passkeys. Over a session `current_password` is required (`403` otherwise), so a stolen session cannot plant a persistent passkey. `409` when rp-id is not set or no account exists |
 | `POST /account/passkeys/finish` | `{"ceremony_id", "name", "credential": <toJSON() output>}` | `200 {"id", "name", "created_at"}` |
 | `PATCH /account/passkeys/:id` | `{"name"}` | `200` the passkey |
 | `DELETE /account/passkeys/:id` | none | `204` |
