@@ -36,9 +36,19 @@ have to go through agentbus to wake an idle session.
 - **An allowed user posting top-level** must start with a session name or
   address (`flyer: do X`). Anything else gets a short bot reply in thread
   explaining how to address an agent.
-- **Mentions.** Allowed users have a short name in config. When an agent writes
-  `@<name>` in a message, the bridge turns it into a real Slack mention
-  (`<@U…>`), so the agent can ping a specific person.
+- **Managing allowed users, in Slack.** Nobody looks up Slack IDs. The config
+  seeds the allowlist by email. After that, any allowed user posts top-level
+  `@agents allow @jane` or `@agents remove @jane` in the channel. A Slack
+  mention carries the user ID in the raw text (`<@U…>`), so the bridge gets the
+  ID from the mention itself. The bot confirms in thread. Users seeded from
+  config can't be removed from Slack (edit config instead), so nobody can lock
+  Alex out.
+- **Labels.** Each allowed user has a short label: the email's local part for
+  config users, and for Slack-added users their Slack display name *as of when
+  they were allowed*, frozen and made unique (`jane`, `jane2`). Labels are only
+  for display and mentions, never for matching.
+- **Mentions.** When an agent writes `@<label>` in a message, the bridge turns it
+  into a real Slack mention (`<@U…>`), so the agent can ping a specific person.
 - Delivery feedback: the bot adds an `:inbox_tray:` reaction once a message is
   queued on the bus, and replies in thread if the target session is unknown.
 
@@ -58,6 +68,10 @@ oauth_config:
       - channels:history
       - groups:history
       - reactions:write
+      - channels:read
+      - groups:read
+      - users:read
+      - users:read.email
 settings:
   event_subscriptions:
     bot_events:
@@ -81,13 +95,16 @@ Slack user". Rules:
    the API key can call `/send`, so a client-settable flag would let one
    prompt-injected session impersonate a user to every agent.
 2. The bridge relays only message events from the configured channel whose
-   Slack user ID is in `allowed-users`, and that are not from a bot or an
+   Slack user ID is on the allowlist, and that are not from a bot or an
    edit/delete subtype. Everything else is dropped, so nothing from a
-   non-allowed user ever reaches an agent.
-3. The message also carries `slack_user` (the allowed user's configured name),
-   so the agent knows who is instructing it. The allowlist is matched on the
-   Slack user ID only; Slack display names are never read or trusted, since
-   their owners can change them.
+   non-allowed user ever reaches an agent. The same check gates the
+   `allow`/`remove` commands.
+3. The message also carries `slack_user` (the allowed user's label), so the
+   agent knows who is instructing it. The allowlist is matched on the Slack
+   user ID only. Emails are resolved to IDs once, at startup
+   (`users.lookupByEmail`; email addresses are workspace-verified). Display
+   names are read only once, to make a frozen label when someone is allowed,
+   and are never used for matching, since their owners can change them.
 4. The framing always says the message arrived over agentbus via Slack, even
    when it is from an allowed user.
 
@@ -99,17 +116,19 @@ Config block in `config.yaml`:
 slack:
   bot-token: xoxb-...
   app-token: xapp-...
-  channel: C0123456789
-  allowed-users:
-    - id: U0123456789
-      name: alex
-    - id: U0987654321
-      name: jane
+  channel: agents
+  allowed-emails:
+    - alex@example.com
 ```
 
 The bridge is off unless all of `bot-token`, `app-token`, `channel`, and at
-least one `allowed-users` entry are set. Read at startup; changing it needs a
-restart. Tokens live only in cakebox's `config.yaml` and are never logged.
+least one `allowed-emails` entry are set. Read at startup; changing it needs a
+restart. At startup the bridge resolves the channel name to its ID
+(`conversations.list`), its own bot user ID (`auth.test`), and each email to a
+user ID (`users.lookupByEmail`). An email that doesn't resolve is logged and
+skipped. If the channel doesn't resolve or no user resolves, the bridge stays
+off and logs why. Tokens live only in cakebox's `config.yaml` and are never
+logged. Users allowed from Slack persist in `slack-state.json`.
 
 New package `internal/slackbridge`:
 
@@ -121,9 +140,10 @@ New package `internal/slackbridge`:
   token. Outgoing posts go through a bounded queue drained by one goroutine, so
   an agentbus `Send` never blocks on Slack. When the queue is full the oldest
   post is dropped with a warning.
-- **Thread map** — session id ↔ thread `ts`, persisted to `slack-state.json`
-  next to `agentbus-state.json` (same save cadence and shutdown save), so
-  threads survive restarts.
+- **State** — session id ↔ thread `ts` and the Slack-added allowed users
+  (ID + frozen label), persisted to `slack-state.json` next to
+  `agentbus-state.json` (same save cadence and shutdown save), so threads and
+  allowlist changes survive restarts.
 
 Changes in `internal/agentbus`, behind an optional `Bridge` interface so the bus
 works unchanged without Slack:
@@ -172,9 +192,12 @@ Comms owns the marketplace. This edit goes in
 
 - `slackbridge`: unit tests with an `httptest` server for the Web API and a
   websocket test server for Socket Mode: envelope ack, reconnect on
-  `disconnect`, thread routing, top-level `name:` routing, `@name` → mention,
-  bot/edit filtering, other-channel filtering, and **a message from a
-  non-allowed user is not delivered**.
+  `disconnect`, startup resolution (channel name, emails; unresolvable email
+  skipped; nothing resolvable → bridge off), thread routing, top-level `name:`
+  routing, `@label` → mention, `allow`/`remove` (label freezing and
+  uniqueness, config users not removable, a non-allowed user's `allow` is
+  ignored), bot/edit filtering, other-channel filtering, and **a message from
+  a non-allowed user is not delivered**.
 - `agentbus`: `slack` resolution and peer listing, `Deliver`, the note lines,
   and **a client `/send` with `from_user: true` is delivered without it**. Uses
   the existing fake clock; no sleeps.
@@ -185,9 +208,10 @@ Comms owns the marketplace. This edit goes in
 
 1. Implement on `slack-bridge`, tests and `go build` green, adversarial review.
 2. Alex creates the Slack app from the manifest, installs it, creates the
-   channel, invites the bot, and hands over the tokens plus the Slack user IDs
-   to allow. The tokens go in cakebox `config.yaml` (back up first, keep the
-   `oauth-request-scoped-errors` rule).
+   channel, invites the bot, and hands over the two tokens and his Slack
+   email. These go in cakebox `config.yaml` (back up first, keep the
+   `oauth-request-scoped-errors` rule). Others are added later in Slack with
+   `@agents allow @name`.
 3. Merge to `next-reset`, push to the fork only, and ask comms for a rebuild
    slot.
 4. Mod change in comms' marketplace, with a version bump.
