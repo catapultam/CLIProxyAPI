@@ -6,25 +6,10 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/mgmtauth"
 )
-
-// keyOnlyHandler builds a Handler with a management key but no login
-// account yet, for first-setup PUT /account tests.
-func keyOnlyHandler(t *testing.T) *Handler {
-	t.Helper()
-	return &Handler{
-		cfg:               &config.Config{},
-		configFilePath:    writeTestConfigFile(t),
-		failedAttempts:    make(map[string]*attemptInfo),
-		envSecret:         "test-secret",
-		loginThrottle:     mgmtauth.NewThrottle(mgmtauth.SystemClock{}),
-		passkeyCeremonies: mgmtauth.NewCeremonyCache(mgmtauth.SystemClock{}),
-		clock:             mgmtauth.SystemClock{},
-	}
-}
 
 func putAccountBody(username, password, currentPassword string) string {
 	b, _ := json.Marshal(map[string]string{
@@ -46,13 +31,11 @@ func TestPutAccountFirstSetupOverKeyNeedsNoCurrentPassword(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 
-	h.mu.Lock()
-	login := h.cfg.RemoteManagement.Login
-	h.mu.Unlock()
-	if login.Username != "admin" || login.PasswordHash == "" {
-		t.Fatalf("account not persisted in memory: %+v", login)
+	account := h.loginStore.Get()
+	if account == nil || account.Username != "admin" || account.PasswordHash == "" {
+		t.Fatalf("account not persisted: %+v", account)
 	}
-	if login.SessionSecret == "" || login.UserHandle == "" {
+	if account.SessionSecret == "" || account.UserHandle == "" {
 		t.Fatal("expected session-secret and user-handle to be generated on first setup")
 	}
 
@@ -96,6 +79,7 @@ func TestPutAccountFirstSetupRequiresPassword(t *testing.T) {
 func TestPutAccountUsernameOnlyChangeKeepsPassword(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
 	h.envSecret = "test-secret"
+	h.allowRemoteOverride = true
 	engine := newTestEngine(h)
 
 	rec := doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("renamed-admin", "", ""), map[string]string{
@@ -105,18 +89,18 @@ func TestPutAccountUsernameOnlyChangeKeepsPassword(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 
-	login := h.currentLoginConfig()
-	if login.Username != "renamed-admin" {
-		t.Fatalf("username = %q, want renamed-admin", login.Username)
+	account := h.loginStore.Get()
+	if account.Username != "renamed-admin" {
+		t.Fatalf("username = %q, want renamed-admin", account.Username)
 	}
-	ok, err := mgmtauth.VerifyPassword(login.PasswordHash, testAccountPassword)
+	ok, err := mgmtauth.VerifyPassword(account.PasswordHash, testAccountPassword)
 	if err != nil || !ok {
 		t.Fatalf("expected the original password to still verify, ok=%v err=%v", ok, err)
 	}
 }
 
 // TestPutAccountUsernameOnlyChangeOverSessionRequiresCurrentPassword covers
-// the updated rule that current_password is required for ANY change over a
+// the rule that current_password is required for ANY change over a
 // session, not just a password change.
 func TestPutAccountUsernameOnlyChangeOverSessionRequiresCurrentPassword(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
@@ -135,8 +119,8 @@ func TestPutAccountUsernameOnlyChangeOverSessionRequiresCurrentPassword(t *testi
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if h.currentLoginConfig().Username != "renamed-admin" {
-		t.Fatalf("username = %q, want renamed-admin", h.currentLoginConfig().Username)
+	if h.loginStore.Get().Username != "renamed-admin" {
+		t.Fatalf("username = %q, want renamed-admin", h.loginStore.Get().Username)
 	}
 }
 
@@ -156,7 +140,6 @@ func TestPutAccountUsernameOnlyChangeDoesNotRotateSession(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 
-	// The token issued before the username-only change must still work.
 	rec = doRequest(engine, http.MethodGet, "/v8/management/account", "", headers)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("pre-change token status = %d, want 200 (session-secret should not rotate); body=%s", rec.Code, rec.Body.String())
@@ -171,13 +154,11 @@ func TestPutAccountOverSessionRequiresCurrentPassword(t *testing.T) {
 	cookieHeader, _ := sessionCookieFrom(loginRec)
 	headers := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
 
-	// Missing current_password.
 	rec := doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("admin", "a-new-strong-password", ""), headers)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("missing current_password status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
 
-	// Wrong current_password.
 	rec = doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("admin", "a-new-strong-password", "nope-not-it"), headers)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("wrong current_password status = %d, want 403; body=%s", rec.Code, rec.Body.String())
@@ -187,6 +168,7 @@ func TestPutAccountOverSessionRequiresCurrentPassword(t *testing.T) {
 func TestPutAccountOverKeyDoesNotRequireCurrentPassword(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
 	h.envSecret = "test-secret"
+	h.allowRemoteOverride = true
 	engine := newTestEngine(h)
 
 	rec := doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("admin", "a-new-strong-password", ""), map[string]string{
@@ -220,23 +202,152 @@ func TestPasswordChangeRotatesSessionAndOldTokenFails(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 	newCookieHeader := SessionCookieName + "=" + resp.Token
 
-	// The old token must now fail: no management key is configured here, so
-	// Middleware() falls through to the key check, which reports "key not set".
+	// The old token must now be rejected outright (401 "session expired"),
+	// since it is a presented-but-invalid cpas_ credential, not a missing one.
 	rec = doRequest(engine, http.MethodGet, "/v8/management/account", "", map[string]string{
 		"Cookie":         oldCookieHeader,
 		"Sec-Fetch-Site": "same-origin",
 	})
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("old token status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("old token status = %d, want 401; body=%s", rec.Code, rec.Body.String())
 	}
 
-	// The fresh token from the password-change response works.
 	rec = doRequest(engine, http.MethodGet, "/v8/management/account", "", map[string]string{
 		"Cookie":         newCookieHeader,
 		"Sec-Fetch-Site": "same-origin",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("new token status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPutAccountResponseKeepsPasskeyMethodLabel verifies a caller who is
+// authenticated via a passkey session keeps that method label on the fresh
+// session PUT /account issues, rather than resetting it to password.
+func TestPutAccountResponseKeepsPasskeyMethodLabel(t *testing.T) {
+	const rpID = "mgmt.example.com"
+	const origin = "https://mgmt.example.com"
+
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = rpID
+		acct.PasskeyOrigins = []string{origin}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed passkey settings: %v", err)
+	}
+	engine := newTestEngine(h)
+
+	// Register a passkey over a password session first.
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	cookieHeader, _ := sessionCookieFrom(loginRec)
+	authedHeaders := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
+
+	beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", "", authedHeaders)
+	var beginResp struct {
+		CeremonyID string `json:"ceremony_id"`
+		Options    struct {
+			PublicKey struct {
+				Challenge string `json:"challenge"`
+			} `json:"publicKey"`
+		} `json:"options"`
+	}
+	_ = json.Unmarshal(beginRec.Body.Bytes(), &beginResp)
+
+	authenticator := newSoftAuthenticator(t, []byte("method-label-credential"))
+	regJSON := authenticator.registrationResponseJSON(t, rpID, origin, decodeB64URLForTest(t, beginResp.Options.PublicKey.Challenge))
+	finishBody, _ := json.Marshal(map[string]interface{}{
+		"ceremony_id": beginResp.CeremonyID,
+		"name":        "Test Key",
+		"credential":  json.RawMessage(regJSON),
+	})
+	doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/finish", string(finishBody), authedHeaders)
+
+	// Log in again, this time via the passkey.
+	loginBeginRec := doRequest(engine, http.MethodPost, "/v8/management/session/passkey/begin", "", nil)
+	var loginBeginResp struct {
+		CeremonyID string `json:"ceremony_id"`
+		Options    struct {
+			PublicKey struct {
+				Challenge string `json:"challenge"`
+			} `json:"publicKey"`
+		} `json:"options"`
+	}
+	_ = json.Unmarshal(loginBeginRec.Body.Bytes(), &loginBeginResp)
+	userHandle := decodeB64URLForTest(t, h.loginStore.Get().UserHandle)
+	assertionJSON := authenticator.assertionResponseJSON(t, rpID, origin, decodeB64URLForTest(t, loginBeginResp.Options.PublicKey.Challenge), userHandle)
+	loginFinishBody, _ := json.Marshal(map[string]interface{}{
+		"ceremony_id": loginBeginResp.CeremonyID,
+		"credential":  json.RawMessage(assertionJSON),
+	})
+	passkeyLoginRec := doRequest(engine, http.MethodPost, "/v8/management/session/passkey/finish", string(loginFinishBody), nil)
+	passkeyCookieHeader, _ := sessionCookieFrom(passkeyLoginRec)
+
+	// Confirm this session's method is passkey before doing a username-only PUT.
+	statusRec := doRequest(engine, http.MethodGet, "/v8/management/session/status", "", map[string]string{"Cookie": passkeyCookieHeader})
+	var status struct {
+		Method string `json:"method"`
+	}
+	_ = json.Unmarshal(statusRec.Body.Bytes(), &status)
+	if status.Method != "passkey" {
+		t.Fatalf("precondition: session method = %q, want passkey", status.Method)
+	}
+
+	putHeaders := map[string]string{"Cookie": passkeyCookieHeader, "Sec-Fetch-Site": "same-origin"}
+	putRec := doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("renamed-admin", "", testAccountPassword), putHeaders)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", putRec.Code, putRec.Body.String())
+	}
+	var putResp struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(putRec.Body.Bytes(), &putResp)
+
+	finalStatusRec := doRequest(engine, http.MethodGet, "/v8/management/session/status", "", map[string]string{
+		"Authorization": "Bearer " + putResp.Token,
+	})
+	_ = json.Unmarshal(finalStatusRec.Body.Bytes(), &status)
+	if status.Method != "passkey" {
+		t.Fatalf("session method after PUT = %q, want passkey (caller's method label should be kept)", status.Method)
+	}
+}
+
+// TestPutAccountBearerDoesNotEmitStaleRefreshHeader covers: a password
+// change over bearer must not also carry an X-CPA-Session-Refresh header
+// signed with the old (now-rotated) secret.
+func TestPutAccountBearerDoesNotEmitStaleRefreshHeader(t *testing.T) {
+	clock := newMockClock(time.Now())
+	h := newAccountHandler(t, clock)
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	var loginResp struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(loginRec.Body.Bytes(), &loginResp)
+
+	// Advance past the halfway point so Middleware() would normally slide
+	// the bearer token forward with the OLD secret on this very request.
+	clock.Advance(mgmtauth.DefaultLifetime/2 + time.Minute)
+
+	rec := doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("admin", "a-new-strong-password", testAccountPassword), map[string]string{
+		"Authorization": "Bearer " + loginResp.Token,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var putResp struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &putResp)
+
+	refreshHeader := rec.Header().Get("X-CPA-Session-Refresh")
+	if refreshHeader != "" {
+		t.Fatalf("X-CPA-Session-Refresh = %q, want empty (no stale refresh alongside the fresh token)", refreshHeader)
+	}
+	if putResp.Token == "" {
+		t.Fatal("expected a fresh token in the response body")
 	}
 }
 
@@ -254,8 +365,8 @@ func TestSignOutAllInvalidatesTokens(t *testing.T) {
 	}
 
 	rec = doRequest(engine, http.MethodGet, "/v8/management/account", "", headers)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("post-sign-out-all status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("post-sign-out-all status = %d, want 401; body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -286,9 +397,12 @@ func TestGetAccountView(t *testing.T) {
 // behavior: GET /account must also report the effective origin list.
 func TestGetAccountEffectivePasskeyOrigins(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
-	h.mu.Lock()
-	h.cfg.RemoteManagement.Login.PasskeyRPID = "mgmt.example.com"
-	h.mu.Unlock()
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "mgmt.example.com"
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed rp-id: %v", err)
+	}
 	engine := newTestEngine(h)
 
 	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
@@ -318,10 +432,13 @@ func TestPasskeyRegistrationAndLoginOverHTTP(t *testing.T) {
 	const origin = "https://mgmt.example.com"
 
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
-	h.mu.Lock()
-	h.cfg.RemoteManagement.Login.PasskeyRPID = rpID
-	h.cfg.RemoteManagement.Login.PasskeyOrigins = []string{origin}
-	h.mu.Unlock()
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = rpID
+		acct.PasskeyOrigins = []string{origin}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed passkey settings: %v", err)
+	}
 	engine := newTestEngine(h)
 
 	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
@@ -358,7 +475,17 @@ func TestPasskeyRegistrationAndLoginOverHTTP(t *testing.T) {
 		t.Fatalf("passkeys/finish status = %d, want 200; body=%s", finishRec.Code, finishRec.Body.String())
 	}
 
-	// Now log in with the passkey via the public session routes.
+	// passkeys_available must now be true, and the stored passkey must carry
+	// the current rp-id.
+	statusRec := doRequest(engine, http.MethodGet, "/v8/management/session/status", "", nil)
+	var status struct {
+		PasskeysAvailable bool `json:"passkeys_available"`
+	}
+	_ = json.Unmarshal(statusRec.Body.Bytes(), &status)
+	if !status.PasskeysAvailable {
+		t.Fatal("expected passkeys_available = true after registering a passkey")
+	}
+
 	loginBeginRec := doRequest(engine, http.MethodPost, "/v8/management/session/passkey/begin", "", nil)
 	if loginBeginRec.Code != http.StatusOK {
 		t.Fatalf("session passkey/begin status = %d, want 200; body=%s", loginBeginRec.Code, loginBeginRec.Body.String())
@@ -376,7 +503,7 @@ func TestPasskeyRegistrationAndLoginOverHTTP(t *testing.T) {
 	}
 
 	loginChallenge := decodeB64URLForTest(t, loginBeginResp.Options.PublicKey.Challenge)
-	userHandle := decodeB64URLForTest(t, h.currentLoginConfig().UserHandle)
+	userHandle := decodeB64URLForTest(t, h.loginStore.Get().UserHandle)
 	assertionJSON := authenticator.assertionResponseJSON(t, rpID, origin, loginChallenge, userHandle)
 
 	loginFinishBody, _ := json.Marshal(map[string]interface{}{
@@ -405,10 +532,13 @@ func TestPasskeyLoginRejectsOriginOutsidePasskeyOrigins(t *testing.T) {
 	const disallowedOrigin = "https://not-allowed.example.com"
 
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
-	h.mu.Lock()
-	h.cfg.RemoteManagement.Login.PasskeyRPID = rpID
-	h.cfg.RemoteManagement.Login.PasskeyOrigins = []string{allowedOrigin}
-	h.mu.Unlock()
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = rpID
+		acct.PasskeyOrigins = []string{allowedOrigin}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed passkey settings: %v", err)
+	}
 	engine := newTestEngine(h)
 
 	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
@@ -446,9 +576,8 @@ func TestPasskeyLoginRejectsOriginOutsidePasskeyOrigins(t *testing.T) {
 	}
 	_ = json.Unmarshal(loginBeginRec.Body.Bytes(), &loginBeginResp)
 
-	userHandle := decodeB64URLForTest(t, h.currentLoginConfig().UserHandle)
+	userHandle := decodeB64URLForTest(t, h.loginStore.Get().UserHandle)
 	loginChallenge := decodeB64URLForTest(t, loginBeginResp.Options.PublicKey.Challenge)
-	// Assert from a disallowed origin.
 	assertionJSON := authenticator.assertionResponseJSON(t, rpID, disallowedOrigin, loginChallenge, userHandle)
 	loginFinishBody, _ := json.Marshal(map[string]interface{}{
 		"ceremony_id": loginBeginResp.CeremonyID,
@@ -457,6 +586,67 @@ func TestPasskeyLoginRejectsOriginOutsidePasskeyOrigins(t *testing.T) {
 	loginFinishRec := doRequest(engine, http.MethodPost, "/v8/management/session/passkey/finish", string(loginFinishBody), nil)
 	if loginFinishRec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 for a disallowed origin; body=%s", loginFinishRec.Code, loginFinishRec.Body.String())
+	}
+}
+
+// TestPasskeysAvailableOnlyCountsCurrentRPID covers: changing rp-id must
+// make an old passkey registered under the previous rp-id no longer count
+// toward passkeys_available.
+func TestPasskeysAvailableOnlyCountsCurrentRPID(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "old.example.com"
+		acct.Passkeys = []mgmtauth.PasskeyRecord{{ID: "old-cred", PublicKey: "pub", RPID: "old.example.com"}}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	engine := newTestEngine(h)
+
+	rec := doRequest(engine, http.MethodGet, "/v8/management/session/status", "", nil)
+	var status struct {
+		PasskeysAvailable bool `json:"passkeys_available"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &status)
+	if !status.PasskeysAvailable {
+		t.Fatal("expected passkeys_available = true while rp-id matches the stored passkey")
+	}
+
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "new.example.com"
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("change rp-id: %v", err)
+	}
+
+	rec = doRequest(engine, http.MethodGet, "/v8/management/session/status", "", nil)
+	_ = json.Unmarshal(rec.Body.Bytes(), &status)
+	if status.PasskeysAvailable {
+		t.Fatal("expected passkeys_available = false once rp-id no longer matches the stored passkey")
+	}
+}
+
+// TestPasskeyCeremonyBeginReturns429WhenCacheFull covers the ceremony cap.
+func TestPasskeyCeremonyBeginReturns429WhenCacheFull(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "mgmt.example.com"
+		acct.Passkeys = []mgmtauth.PasskeyRecord{{ID: "cred", PublicKey: "pub", RPID: "mgmt.example.com"}}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	engine := newTestEngine(h)
+
+	for i := 0; i < mgmtauth.MaxPendingCeremonies; i++ {
+		rec := doRequest(engine, http.MethodPost, "/v8/management/session/passkey/begin", "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("begin #%d: status = %d, want 200; body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+	rec := doRequest(engine, http.MethodPost, "/v8/management/session/passkey/begin", "", nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("begin at capacity: status = %d, want 429; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

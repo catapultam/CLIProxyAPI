@@ -63,8 +63,15 @@ type Handler struct {
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
 
-	// loginThrottle enforces the global password-login backoff. It survives
-	// config hot-reloads: only session-secret rotation invalidates tokens.
+	// loginStore holds the management panel login account (username,
+	// password hash, session-secret, passkeys) in a sidecar JSON file next
+	// to configFilePath. It is intentionally independent of cfg/h.mu: see
+	// internal/mgmtauth.Store.
+	loginStore *mgmtauth.Store
+	// loginThrottle enforces the global password-verification backoff
+	// (login and PUT /account's current_password check share it). It
+	// survives config hot-reloads: only session-secret rotation
+	// invalidates tokens.
 	loginThrottle *mgmtauth.Throttle
 	// passkeyCeremonies holds in-memory, single-use WebAuthn ceremony state.
 	// It also survives hot-reloads; ceremonies are keyed by a random id, not
@@ -86,6 +93,8 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	clock := mgmtauth.Clock(mgmtauth.SystemClock{})
+	loginStore := mgmtauth.NewStore(configFilePath)
+	loginStore.Load()
 	h := &Handler{
 		cfg:                 cfg,
 		configFilePath:      configFilePath,
@@ -94,6 +103,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		loginStore:          loginStore,
 		loginThrottle:       mgmtauth.NewThrottle(clock),
 		passkeyCeremonies:   mgmtauth.NewCeremonyCache(clock),
 		clock:               clock,
@@ -294,8 +304,16 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		case sessionAuthCSRFBlocked:
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "cross-site request blocked"})
 			return
+		case sessionAuthInvalid:
+			// A cpas_ credential was presented (cookie and/or bearer) but did
+			// not verify: reject outright. This must never fall through to
+			// key auth (a stale session token is not a management key guess)
+			// and must never count against the key's failure bookkeeping.
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "session expired"})
+			return
 		case sessionAuthNone:
-			// Fall through to the unchanged management-key logic below.
+			// No session credential was presented at all; fall through to
+			// the unchanged management-key logic below.
 		}
 
 		clientIP := c.ClientIP()
@@ -424,6 +442,29 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	reset()
 
 	return true, 0, ""
+}
+
+// remoteAllowed reports whether a request from c's client is allowed under
+// the same local-or-allow-remote predicate key auth uses (including the
+// MANAGEMENT_PASSWORD override). It does not consult any credential; it is
+// the remote-access gate that public session endpoints which accept a
+// password or passkey (login, passkey/finish) must still honor, since they
+// are not themselves protected by Middleware()'s key check.
+func (h *Handler) remoteAllowed(c *gin.Context) bool {
+	if h == nil {
+		return false
+	}
+	clientIP := c.ClientIP()
+	if clientIP == "127.0.0.1" || clientIP == "::1" {
+		return true
+	}
+	if h.allowRemoteOverride {
+		return true
+	}
+	h.mu.Lock()
+	allowRemote := h.cfg != nil && h.cfg.RemoteManagement.AllowRemote
+	h.mu.Unlock()
+	return allowRemote
 }
 
 // persist saves the current in-memory config to disk.

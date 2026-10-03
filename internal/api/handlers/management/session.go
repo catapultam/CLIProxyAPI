@@ -11,17 +11,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/webauthn"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/mgmtauth"
 )
-
-// errUnknownUser is returned by the discoverable-login lookup when the
-// assertion's user handle does not match the single configured account.
-var errUnknownUser = errors.New("management: unknown passkey user")
 
 // SessionCookieName is the HttpOnly cookie carrying a signed session token
 // for same-origin panel clients.
 const SessionCookieName = "cpa_mgmt_session"
+
+// sessionCookiePath scopes the cookie to the v8 management API the panel
+// actually uses, rather than the whole site.
+const sessionCookiePath = "/v8/management"
 
 // AuthMethodContextKey records how the current request authenticated, for
 // handlers (notably PUT /account) that must behave differently for a session
@@ -43,81 +42,110 @@ const (
 // browser/OS passkey UI.
 const sessionRPDisplayName = "CLIProxyAPI"
 
+// errUnknownUser is returned by the discoverable-login lookup when the
+// assertion's user handle does not match the single configured account.
+var errUnknownUser = errors.New("management: unknown passkey user")
+
 // sessionAuthStatus is the outcome of trying to authenticate a request via
 // the session cookie/bearer token, before falling back to the management key.
 type sessionAuthStatus int
 
 const (
-	// sessionAuthNone means no session credential was presented, or the one
-	// presented did not verify; the caller should fall through to the
-	// management-key check.
+	// sessionAuthNone means no cpas_ credential was presented at all; the
+	// caller should fall through to the management-key check.
 	sessionAuthNone sessionAuthStatus = iota
 	// sessionAuthOK means the request is authenticated via session.
 	sessionAuthOK
 	// sessionAuthCSRFBlocked means a valid cookie session was presented but
 	// the CSRF guard rejected the request outright.
 	sessionAuthCSRFBlocked
+	// sessionAuthInvalid means a cpas_ credential (cookie and/or bearer) was
+	// presented but none of them verified. This must not fall through to
+	// key auth and must not count against the key's failure bookkeeping.
+	sessionAuthInvalid
 )
 
 // tryAuthenticateSession implements the first step of Middleware(): verify a
-// cpa_mgmt_session cookie or an Authorization: Bearer cpas_... token, apply
-// the CSRF guard for cookie-authenticated unsafe methods, and slide the
-// session forward when it is past its halfway point.
+// cpa_mgmt_session cookie and/or an Authorization: Bearer cpas_... token
+// (accepting whichever one is valid when both are present), apply the CSRF
+// guard for cookie-authenticated requests, and slide the session forward
+// when it is past its halfway point.
 func (h *Handler) tryAuthenticateSession(c *gin.Context) sessionAuthStatus {
 	if h == nil {
 		return sessionAuthNone
 	}
 
-	token, viaCookie := sessionTokenFromRequest(c)
-	if token == "" {
+	type candidate struct {
+		token     string
+		viaCookie bool
+	}
+	var candidates []candidate
+	if cookie, ok := sessionCookieToken(c); ok {
+		candidates = append(candidates, candidate{cookie, true})
+	}
+	if bearer, ok := sessionBearerToken(c); ok {
+		candidates = append(candidates, candidate{bearer, false})
+	}
+	if len(candidates) == 0 {
 		return sessionAuthNone
 	}
 
-	login := h.currentLoginConfig()
-	secret, err := decodeLoginSecret(login.SessionSecret)
-	if err != nil || len(secret) == 0 {
-		return sessionAuthNone
-	}
-
+	account := h.loginStore.Get()
+	secret, _ := decodeLoginSecret(accountSessionSecret(account))
+	origins := effectivePasskeyOrigins(account)
 	now := h.now()
-	claims, err := mgmtauth.VerifyToken(secret, token, now)
-	if err != nil {
-		return sessionAuthNone
-	}
 
-	if viaCookie && isUnsafeMethod(c.Request.Method) && !csrfAllowed(c, login.PasskeyOrigins) {
-		return sessionAuthCSRFBlocked
-	}
+	for _, cand := range candidates {
+		if len(secret) == 0 {
+			continue
+		}
+		claims, err := mgmtauth.VerifyToken(secret, cand.token, now)
+		if err != nil {
+			continue
+		}
+		if cand.viaCookie && !csrfAllowed(c, origins) {
+			return sessionAuthCSRFBlocked
+		}
 
-	c.Set(LoginMethodContextKey, string(claims.Method))
-
-	if mgmtauth.ShouldRefresh(claims, now, mgmtauth.DefaultLifetime) {
-		if refreshed, expiresAt, errIssue := mgmtauth.IssueToken(secret, claims.Method, now, mgmtauth.DefaultLifetime); errIssue == nil {
-			if viaCookie {
-				setSessionCookie(c, refreshed, expiresAt, login.PasskeyOrigins)
-			} else {
-				c.Header("X-CPA-Session-Refresh", refreshed)
+		c.Set(LoginMethodContextKey, string(claims.Method))
+		if mgmtauth.ShouldRefresh(claims, now, mgmtauth.DefaultLifetime) {
+			if refreshed, expiresAt, errIssue := mgmtauth.IssueToken(secret, claims.Method, now, mgmtauth.DefaultLifetime); errIssue == nil {
+				if cand.viaCookie {
+					h.setSessionCookie(c, refreshed, expiresAt, origins)
+				} else {
+					c.Header("X-CPA-Session-Refresh", refreshed)
+				}
 			}
 		}
+		return sessionAuthOK
 	}
 
-	return sessionAuthOK
+	// Every presented cpas_ credential failed to verify.
+	return sessionAuthInvalid
 }
 
-// sessionTokenFromRequest extracts a session token from the cookie or an
-// Authorization: Bearer cpas_... header. The second return value reports
-// whether the token came from the cookie (relevant to the CSRF guard).
-func sessionTokenFromRequest(c *gin.Context) (token string, viaCookie bool) {
-	if cookie, err := c.Cookie(SessionCookieName); err == nil && strings.HasPrefix(cookie, mgmtauth.TokenPrefix) {
-		return cookie, true
+// sessionCookieToken extracts a cpas_-prefixed token from the session
+// cookie, if present.
+func sessionCookieToken(c *gin.Context) (string, bool) {
+	cookie, err := c.Cookie(SessionCookieName)
+	if err != nil || !strings.HasPrefix(cookie, mgmtauth.TokenPrefix) {
+		return "", false
 	}
-	if ah := c.GetHeader("Authorization"); ah != "" {
-		parts := strings.SplitN(ah, " ", 2)
-		if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") && strings.HasPrefix(parts[1], mgmtauth.TokenPrefix) {
-			return parts[1], false
-		}
+	return cookie, true
+}
+
+// sessionBearerToken extracts a cpas_-prefixed token from an
+// Authorization: Bearer header, if present.
+func sessionBearerToken(c *gin.Context) (string, bool) {
+	ah := c.GetHeader("Authorization")
+	if ah == "" {
+		return "", false
 	}
-	return "", false
+	parts := strings.SplitN(ah, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") || !strings.HasPrefix(parts[1], mgmtauth.TokenPrefix) {
+		return "", false
+	}
+	return parts[1], true
 }
 
 func isUnsafeMethod(method string) bool {
@@ -129,23 +157,29 @@ func isUnsafeMethod(method string) bool {
 	}
 }
 
-// csrfAllowed implements the CSRF guard for cookie-authenticated unsafe
-// requests: Sec-Fetch-Site: same-origin is trusted if present; otherwise the
-// Origin host must equal the request Host, or Origin must be one of the
-// configured passkey origins. A request with neither header is rejected.
-func csrfAllowed(c *gin.Context, passkeyOrigins []string) bool {
+// csrfAllowed implements the CSRF guard for cookie-authenticated requests.
+// Sec-Fetch-Site, when present, governs regardless of method: only
+// same-origin and none are allowed, and same-site/cross-site are rejected
+// even for a safe method like GET. When Sec-Fetch-Site is absent, safe
+// methods are allowed outright; unsafe methods fall back to the Origin
+// header, which must equal the request Host or be one of the configured
+// passkey origins -- an absent or "null" Origin is a mismatch.
+func csrfAllowed(c *gin.Context, originsAllowed []string) bool {
 	if sfs := c.GetHeader("Sec-Fetch-Site"); sfs != "" {
-		return sfs == "same-origin"
+		return sfs == "same-origin" || sfs == "none"
+	}
+	if !isUnsafeMethod(c.Request.Method) {
+		return true
 	}
 	origin := strings.TrimSpace(c.GetHeader("Origin"))
-	if origin == "" {
+	if origin == "" || strings.EqualFold(origin, "null") {
 		return false
 	}
 	if u, err := url.Parse(origin); err == nil && strings.EqualFold(u.Host, c.Request.Host) {
 		return true
 	}
 	trimmed := strings.TrimRight(origin, "/")
-	for _, allowed := range passkeyOrigins {
+	for _, allowed := range originsAllowed {
 		if strings.EqualFold(strings.TrimRight(strings.TrimSpace(allowed), "/"), trimmed) {
 			return true
 		}
@@ -154,10 +188,13 @@ func csrfAllowed(c *gin.Context, passkeyOrigins []string) bool {
 }
 
 // isHTTPSRequest reports whether the current request should be treated as
-// HTTPS for the purposes of the session cookie's Secure attribute: direct
-// TLS, X-Forwarded-Proto: https, or an https Origin header (the case that
-// matters when a TLS-terminating proxy forwards X-Forwarded-Proto: http).
-func isHTTPSRequest(c *gin.Context) bool {
+// HTTPS for the session cookie's Secure attribute: direct TLS,
+// X-Forwarded-Proto: https, an https Origin or Referer, or a request Host
+// that equals the host:port of one of the configured (https) passkey
+// origins -- the last case keeps Secure set on a sliding-refresh GET made
+// directly against an HTTPS origin like cakebox's :8443 tailscale serve,
+// which carries neither Origin nor Referer.
+func isHTTPSRequest(c *gin.Context, allowedOrigins []string) bool {
 	if c.Request.TLS != nil {
 		return true
 	}
@@ -169,24 +206,36 @@ func isHTTPSRequest(c *gin.Context) bool {
 			return true
 		}
 	}
+	if referer := c.GetHeader("Referer"); referer != "" {
+		if u, err := url.Parse(referer); err == nil && strings.EqualFold(u.Scheme, "https") {
+			return true
+		}
+	}
+	host := c.Request.Host
+	for _, o := range allowedOrigins {
+		if u, err := url.Parse(strings.TrimSpace(o)); err == nil && strings.EqualFold(u.Scheme, "https") && strings.EqualFold(u.Host, host) {
+			return true
+		}
+	}
 	return false
 }
 
 // setSessionCookie sets the HttpOnly session cookie with Max-Age matching
-// the token's remaining lifetime.
-func setSessionCookie(c *gin.Context, token string, expiresAt time.Time, passkeyOrigins []string) {
-	maxAge := int(time.Until(expiresAt).Seconds())
+// the token's remaining lifetime, computed from h.now() rather than wall
+// time so it is testable with a mock clock.
+func (h *Handler) setSessionCookie(c *gin.Context, token string, expiresAt time.Time, allowedOrigins []string) {
+	maxAge := int(expiresAt.Sub(h.now()).Seconds())
 	if maxAge < 0 {
 		maxAge = 0
 	}
 	c.SetSameSite(http.SameSiteStrictMode)
-	c.SetCookie(SessionCookieName, token, maxAge, "/", "", isHTTPSRequest(c), true)
+	c.SetCookie(SessionCookieName, token, maxAge, sessionCookiePath, "", isHTTPSRequest(c, allowedOrigins), true)
 }
 
 // clearSessionCookie removes the session cookie (Max-Age=0).
-func clearSessionCookie(c *gin.Context) {
+func (h *Handler) clearSessionCookie(c *gin.Context, allowedOrigins []string) {
 	c.SetSameSite(http.SameSiteStrictMode)
-	c.SetCookie(SessionCookieName, "", -1, "/", "", isHTTPSRequest(c), true)
+	c.SetCookie(SessionCookieName, "", -1, sessionCookiePath, "", isHTTPSRequest(c, allowedOrigins), true)
 }
 
 // now returns the handler's current time, via its injectable clock.
@@ -197,16 +246,6 @@ func (h *Handler) now() time.Time {
 	return h.clock.Now()
 }
 
-// currentLoginConfig returns a snapshot of the current login account config.
-func (h *Handler) currentLoginConfig() config.LoginConfig {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		return config.LoginConfig{}
-	}
-	return h.cfg.RemoteManagement.Login
-}
-
 // decodeLoginSecret base64url-decodes a stored session-secret/user-handle value.
 func decodeLoginSecret(value string) ([]byte, error) {
 	if value == "" {
@@ -215,42 +254,80 @@ func decodeLoginSecret(value string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(value)
 }
 
-// hasAccount reports whether a username/password account is configured.
-func hasAccount(login config.LoginConfig) bool {
-	return login.Username != "" && login.PasswordHash != ""
+func accountSessionSecret(account *mgmtauth.Account) string {
+	if account == nil {
+		return ""
+	}
+	return account.SessionSecret
+}
+
+// effectivePasskeyOrigins returns the origins WebAuthn ceremonies are
+// actually accepted from: the configured list, or ["https://<rp-id>"] when
+// that list is empty and an rp-id is set (matching mgmtauth.NewWebAuthn's
+// own default), or an empty list when passkeys are not configured at all.
+func effectivePasskeyOrigins(account *mgmtauth.Account) []string {
+	if account == nil {
+		return []string{}
+	}
+	if len(account.PasskeyOrigins) > 0 {
+		return account.PasskeyOrigins
+	}
+	if account.PasskeyRPID == "" {
+		return []string{}
+	}
+	return []string{"https://" + account.PasskeyRPID}
 }
 
 // passkeysAvailable reports whether passkey login is usable: an rp-id is
-// configured and at least one passkey is registered.
-func passkeysAvailable(login config.LoginConfig) bool {
-	return login.PasskeyRPID != "" && len(login.Passkeys) > 0
+// configured and at least one passkey registered under that SAME rp-id
+// exists. A passkey registered under a since-changed rp-id does not count.
+func passkeysAvailable(account *mgmtauth.Account) bool {
+	if account == nil || account.PasskeyRPID == "" {
+		return false
+	}
+	for _, p := range account.Passkeys {
+		if p.RPID == account.PasskeyRPID {
+			return true
+		}
+	}
+	return false
 }
 
-// buildWebAuthn constructs a *webauthn.WebAuthn from the current login
-// config's passkey settings.
-func buildWebAuthn(login config.LoginConfig) (*webauthn.WebAuthn, error) {
-	return mgmtauth.NewWebAuthn(login.PasskeyRPID, sessionRPDisplayName, login.PasskeyOrigins)
+// buildWebAuthn constructs a *webauthn.WebAuthn from the account's current
+// passkey settings.
+func buildWebAuthn(account *mgmtauth.Account) (*webauthn.WebAuthn, error) {
+	if account == nil {
+		return nil, mgmtauth.ErrPasskeysDisabled
+	}
+	return mgmtauth.NewWebAuthn(account.PasskeyRPID, sessionRPDisplayName, account.PasskeyOrigins)
 }
 
-// mgmtUser decodes the stored account into a mgmtauth.User usable with the
-// WebAuthn ceremonies.
-func mgmtUser(login config.LoginConfig) (mgmtauth.User, error) {
-	handle, err := decodeLoginSecret(login.UserHandle)
+// mgmtUser decodes the account into a mgmtauth.User usable with the
+// WebAuthn ceremonies, including only passkeys registered under the
+// account's CURRENT rp-id.
+func mgmtUser(account *mgmtauth.Account) (mgmtauth.User, error) {
+	if account == nil {
+		return mgmtauth.User{}, errors.New("management: no account configured")
+	}
+	handle, err := decodeLoginSecret(account.UserHandle)
 	if err != nil {
 		return mgmtauth.User{}, err
 	}
-	creds := make([]mgmtauth.Credential, 0, len(login.Passkeys))
-	for _, p := range login.Passkeys {
-		cred, errDecode := decodePasskeyCredential(p)
+	creds := make([]mgmtauth.Credential, 0, len(account.Passkeys))
+	for _, p := range account.Passkeys {
+		if p.RPID != account.PasskeyRPID {
+			continue
+		}
+		cred, errDecode := decodePasskeyRecord(p)
 		if errDecode != nil {
 			return mgmtauth.User{}, errDecode
 		}
 		creds = append(creds, cred)
 	}
-	return mgmtauth.User{Handle: handle, Username: login.Username, Credentials: creds}, nil
+	return mgmtauth.User{Handle: handle, Username: account.Username, Credentials: creds}, nil
 }
 
-func decodePasskeyCredential(p config.PasskeyCredential) (mgmtauth.Credential, error) {
+func decodePasskeyRecord(p mgmtauth.PasskeyRecord) (mgmtauth.Credential, error) {
 	id, err := base64.RawURLEncoding.DecodeString(p.ID)
 	if err != nil {
 		return mgmtauth.Credential{}, err
@@ -277,8 +354,8 @@ func decodePasskeyCredential(p config.PasskeyCredential) (mgmtauth.Credential, e
 	}, nil
 }
 
-func encodePasskeyCredential(c mgmtauth.Credential, name string, created time.Time) config.PasskeyCredential {
-	return config.PasskeyCredential{
+func encodePasskeyRecord(c mgmtauth.Credential, rpID, name string, created time.Time) mgmtauth.PasskeyRecord {
+	return mgmtauth.PasskeyRecord{
 		ID:              base64.RawURLEncoding.EncodeToString(c.ID),
 		PublicKey:       base64.RawURLEncoding.EncodeToString(c.PublicKey),
 		AttestationType: c.AttestationType,
@@ -286,21 +363,39 @@ func encodePasskeyCredential(c mgmtauth.Credential, name string, created time.Ti
 		AAGUID:          base64.RawURLEncoding.EncodeToString(c.AAGUID),
 		BackupEligible:  c.BackupEligible,
 		BackupState:     c.BackupState,
+		RPID:            rpID,
 		Name:            name,
 		Created:         created,
 	}
 }
 
+// ceilSecondsAtLeastOne rounds d up to a whole number of seconds, never
+// returning less than 1: a caller told to retry in "0 seconds" would just
+// retry immediately and get throttled again.
+func ceilSecondsAtLeastOne(d time.Duration) int {
+	secs := int((d + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return secs
+}
+
 // issueSessionResponse issues a fresh session token, sets the cookie, and
 // writes the standard "session response" body described by the management
-// login design: {"token": "cpas_...", "expires_at": "<RFC3339>"}.
+// login design: {"token": "cpas_...", "expires_at": "<RFC3339>"}. It always
+// clears any X-CPA-Session-Refresh header a prior Middleware() step may
+// have set (signed with a secret that could be stale, e.g. just before a
+// password change rotates it): the body/cookie issued here are always the
+// authoritative, freshest credential, so a leftover refresh header must not
+// also be sent.
 func (h *Handler) issueSessionResponse(c *gin.Context, status int, secret []byte, method mgmtauth.Method, passkeyOrigins []string) {
 	token, expiresAt, err := mgmtauth.IssueToken(secret, method, h.now(), mgmtauth.DefaultLifetime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to issue session: " + err.Error()})
 		return
 	}
-	setSessionCookie(c, token, expiresAt, passkeyOrigins)
+	c.Header("X-CPA-Session-Refresh", "")
+	h.setSessionCookie(c, token, expiresAt, passkeyOrigins)
 	c.JSON(status, gin.H{"token": token, "expires_at": expiresAt.UTC().Format(time.RFC3339)})
 }
 
@@ -309,16 +404,23 @@ func (h *Handler) issueSessionResponse(c *gin.Context, status int, secret []byte
 // token or a valid management key, but a missing key is never counted
 // against the login-key failure bookkeeping.
 func (h *Handler) GetSessionStatus(c *gin.Context) {
-	login := h.currentLoginConfig()
+	account := h.loginStore.Get()
 
 	authenticated := false
 	method := ""
 
-	if token, _ := sessionTokenFromRequest(c); token != "" {
-		if secret, err := decodeLoginSecret(login.SessionSecret); err == nil && len(secret) > 0 {
-			if claims, errVerify := mgmtauth.VerifyToken(secret, token, h.now()); errVerify == nil {
-				authenticated = true
-				method = string(claims.Method)
+	secret, _ := decodeLoginSecret(accountSessionSecret(account))
+	if len(secret) > 0 {
+		if token, ok := sessionCookieToken(c); ok {
+			if claims, err := mgmtauth.VerifyToken(secret, token, h.now()); err == nil {
+				authenticated, method = true, string(claims.Method)
+			}
+		}
+		if !authenticated {
+			if token, ok := sessionBearerToken(c); ok {
+				if claims, err := mgmtauth.VerifyToken(secret, token, h.now()); err == nil {
+					authenticated, method = true, string(claims.Method)
+				}
 			}
 		}
 	}
@@ -336,24 +438,20 @@ func (h *Handler) GetSessionStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"account":            hasAccount(login),
+		"account":            mgmtauth.HasAccount(account),
 		"authenticated":      authenticated,
 		"method":             method,
-		"passkeys_available": passkeysAvailable(login),
-		"passkey_rp_id":      login.PasskeyRPID,
-		"passkey_origins":    effectivePasskeyOrigins(login),
+		"passkeys_available": passkeysAvailable(account),
+		"passkey_rp_id":      passkeyRPID(account),
+		"passkey_origins":    effectivePasskeyOrigins(account),
 	})
 }
 
-// ceilSecondsAtLeastOne rounds d up to a whole number of seconds, never
-// returning less than 1: a caller told to retry in "0 seconds" would just
-// retry immediately and get throttled again.
-func ceilSecondsAtLeastOne(d time.Duration) int {
-	secs := int((d + time.Second - 1) / time.Second)
-	if secs < 1 {
-		secs = 1
+func passkeyRPID(account *mgmtauth.Account) string {
+	if account == nil {
+		return ""
 	}
-	return secs
+	return account.PasskeyRPID
 }
 
 // managementKeyFromRequest extracts a management key the same way
@@ -374,23 +472,15 @@ func managementKeyFromRequest(c *gin.Context) string {
 	return provided
 }
 
-// effectivePasskeyOrigins returns the origins WebAuthn ceremonies are
-// actually accepted from: the configured list, or ["https://<rp-id>"] when
-// that list is empty and an rp-id is set (matching mgmtauth.NewWebAuthn's
-// own default), or an empty list when passkeys are not configured at all.
-func effectivePasskeyOrigins(login config.LoginConfig) []string {
-	if len(login.PasskeyOrigins) > 0 {
-		return login.PasskeyOrigins
-	}
-	if login.PasskeyRPID == "" {
-		return []string{}
-	}
-	return []string{"https://" + login.PasskeyRPID}
-}
-
 // PostSessionLogin verifies username/password and, on success, returns a
-// session response.
+// session response. It is a public endpoint not covered by Middleware(), so
+// it must independently honor the local-or-allow-remote gate key auth uses.
 func (h *Handler) PostSessionLogin(c *gin.Context) {
+	if !h.remoteAllowed(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
+		return
+	}
+
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -400,41 +490,41 @@ func (h *Handler) PostSessionLogin(c *gin.Context) {
 		return
 	}
 
-	login := h.currentLoginConfig()
-	if !hasAccount(login) {
+	account := h.loginStore.Get()
+	if !mgmtauth.HasAccount(account) {
 		c.JSON(http.StatusConflict, gin.H{"error": "no account configured"})
 		return
 	}
 
-	if ok, retryAfter := h.loginThrottle.Allow(); !ok {
+	release, ok, retryAfter := h.loginThrottle.Reserve()
+	if !ok {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many attempts", "retry_after": ceilSecondsAtLeastOne(retryAfter)})
 		return
 	}
-
-	match, err := mgmtauth.VerifyPassword(login.PasswordHash, body.Password)
-	if err != nil || !match || body.Username != login.Username {
-		h.loginThrottle.RecordFailure()
+	match, verifyErr := mgmtauth.VerifyPassword(account.PasswordHash, body.Password)
+	success := verifyErr == nil && match && body.Username == account.Username
+	release(success)
+	if !success {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
 	}
-	h.loginThrottle.Reset()
 
-	secret, err := decodeLoginSecret(login.SessionSecret)
+	secret, err := decodeLoginSecret(account.SessionSecret)
 	if err != nil || len(secret) == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "session secret is not configured"})
 		return
 	}
-	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPassword, login.PasskeyOrigins)
+	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPassword, effectivePasskeyOrigins(account))
 }
 
 // PostSessionPasskeyBegin starts a discoverable passkey login ceremony.
 func (h *Handler) PostSessionPasskeyBegin(c *gin.Context) {
-	login := h.currentLoginConfig()
-	if !passkeysAvailable(login) {
+	account := h.loginStore.Get()
+	if !passkeysAvailable(account) {
 		c.JSON(http.StatusConflict, gin.H{"error": "passkeys are not available"})
 		return
 	}
-	w, err := buildWebAuthn(login)
+	w, err := buildWebAuthn(account)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -446,6 +536,10 @@ func (h *Handler) PostSessionPasskeyBegin(c *gin.Context) {
 	}
 	ceremonyID, err := h.passkeyCeremonies.Begin(*session)
 	if err != nil {
+		if errors.Is(err, mgmtauth.ErrTooManyCeremonies) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -453,7 +547,14 @@ func (h *Handler) PostSessionPasskeyBegin(c *gin.Context) {
 }
 
 // PostSessionPasskeyFinish completes a discoverable passkey login ceremony.
+// Like PostSessionLogin, it is public and must independently honor the
+// local-or-allow-remote gate.
 func (h *Handler) PostSessionPasskeyFinish(c *gin.Context) {
+	if !h.remoteAllowed(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
+		return
+	}
+
 	var body struct {
 		CeremonyID string          `json:"ceremony_id"`
 		Credential json.RawMessage `json:"credential"`
@@ -469,23 +570,23 @@ func (h *Handler) PostSessionPasskeyFinish(c *gin.Context) {
 		return
 	}
 
-	login := h.currentLoginConfig()
-	if !passkeysAvailable(login) {
+	account := h.loginStore.Get()
+	if !passkeysAvailable(account) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "passkeys are not available"})
 		return
 	}
-	w, err := buildWebAuthn(login)
+	w, err := buildWebAuthn(account)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	user, err := mgmtUser(login)
+	user, err := mgmtUser(account)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	lookup := func(rawID, userHandle []byte) (webauthn.User, error) {
-		if base64.RawURLEncoding.EncodeToString(userHandle) != login.UserHandle {
+		if base64.RawURLEncoding.EncodeToString(userHandle) != account.UserHandle {
 			return nil, errUnknownUser
 		}
 		return user, nil
@@ -496,16 +597,17 @@ func (h *Handler) PostSessionPasskeyFinish(c *gin.Context) {
 		return
 	}
 
-	secret, err := decodeLoginSecret(login.SessionSecret)
+	secret, err := decodeLoginSecret(account.SessionSecret)
 	if err != nil || len(secret) == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "session secret is not configured"})
 		return
 	}
-	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPasskey, login.PasskeyOrigins)
+	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPasskey, effectivePasskeyOrigins(account))
 }
 
 // PostSessionLogout clears the session cookie.
 func (h *Handler) PostSessionLogout(c *gin.Context) {
-	clearSessionCookie(c)
+	account := h.loginStore.Get()
+	h.clearSessionCookie(c, effectivePasskeyOrigins(account))
 	c.Status(http.StatusNoContent)
 }

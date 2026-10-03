@@ -1,56 +1,20 @@
 package management
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/mgmtauth"
 )
 
-// minPasswordLength is the policy floor enforced by PUT /account.
-const minPasswordLength = 12
-
-// applyLoginMutation holds h.mu for the full validate+mutate+save sequence
-// used by every account-mutating endpoint: mutate runs under the lock and
-// may reject the request by returning a non-zero status and message. On
-// success the config is saved and the post-save reload hook is scheduled
-// asynchronously, matching the pattern other management handlers use via
-// saveConfigAndSnapshotLocked/reloadConfigAfterManagementSaveAsync.
-func (h *Handler) applyLoginMutation(c *gin.Context, mutate func(login *config.LoginConfig) (status int, errMsg string)) (config.LoginConfig, bool) {
-	h.mu.Lock()
-	if h.cfg == nil {
-		h.mu.Unlock()
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "config unavailable"})
-		return config.LoginConfig{}, false
-	}
-	if status, errMsg := mutate(&h.cfg.RemoteManagement.Login); errMsg != "" {
-		h.mu.Unlock()
-		c.JSON(status, gin.H{"error": errMsg})
-		return config.LoginConfig{}, false
-	}
-	snapshot, ok := h.saveConfigAndSnapshotLocked(c)
-	login := h.cfg.RemoteManagement.Login
-	h.mu.Unlock()
-	if !ok {
-		return config.LoginConfig{}, false
-	}
-	var reqCtx context.Context
-	if c != nil && c.Request != nil {
-		reqCtx = c.Request.Context()
-	}
-	h.reloadConfigAfterManagementSaveAsync(reqCtx, snapshot)
-	return login, true
-}
-
-// generateAccountSecret returns 32 random bytes, base64url-encoded, used for
-// both session-secret and user-handle.
+// generateAccountSecret returns 32 random bytes, base64url-encoded, used
+// for both session-secret and user-handle.
 func generateAccountSecret() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -59,40 +23,76 @@ func generateAccountSecret() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
+// minPasswordLength is the policy floor enforced by PUT /account.
+const minPasswordLength = 12
+
 // accountView builds the GET /account response body.
-func accountView(login config.LoginConfig) gin.H {
-	passkeys := make([]gin.H, 0, len(login.Passkeys))
-	for _, p := range login.Passkeys {
-		passkeys = append(passkeys, passkeyView(p))
+func accountView(account *mgmtauth.Account) gin.H {
+	var passkeys []gin.H
+	if account != nil {
+		passkeys = make([]gin.H, 0, len(account.Passkeys))
+		for _, p := range account.Passkeys {
+			passkeys = append(passkeys, passkeyView(p))
+		}
+	} else {
+		passkeys = []gin.H{}
+	}
+	username := ""
+	if account != nil {
+		username = account.Username
 	}
 	return gin.H{
-		"configured":      hasAccount(login),
-		"username":        login.Username,
+		"configured":      mgmtauth.HasAccount(account),
+		"username":        username,
 		"passkeys":        passkeys,
-		"passkey_rp_id":   login.PasskeyRPID,
-		"passkey_origins": effectivePasskeyOrigins(login),
+		"passkey_rp_id":   passkeyRPID(account),
+		"passkey_origins": effectivePasskeyOrigins(account),
 	}
 }
 
-func passkeyView(p config.PasskeyCredential) gin.H {
+func passkeyView(p mgmtauth.PasskeyRecord) gin.H {
 	return gin.H{"id": p.ID, "name": p.Name, "created_at": p.Created.UTC().Format(time.RFC3339)}
+}
+
+// mutationErrorResponse writes the appropriate status/body for a
+// Store.Mutate error: a *mgmtauth.MutationError carries its own status,
+// anything else is an unexpected internal failure (500).
+func mutationErrorResponse(c *gin.Context, err error) {
+	var mutErr *mgmtauth.MutationError
+	if errors.As(err, &mutErr) {
+		c.JSON(mutErr.Status, gin.H{"error": mutErr.Message})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+}
+
+// resolvedSessionMethod picks the method label a freshly issued session
+// should carry: a passkey-authenticated session stays passkey, anything
+// else (a password session, or a management key) defaults to password,
+// since a token can only ever carry password or passkey.
+func resolvedSessionMethod(c *gin.Context) mgmtauth.Method {
+	if c.GetString(LoginMethodContextKey) == string(mgmtauth.MethodPasskey) {
+		return mgmtauth.MethodPasskey
+	}
+	return mgmtauth.MethodPassword
 }
 
 // GetAccount returns the current account configuration.
 func (h *Handler) GetAccount(c *gin.Context) {
-	c.JSON(http.StatusOK, accountView(h.currentLoginConfig()))
+	c.JSON(http.StatusOK, accountView(h.loginStore.Get()))
 }
 
 // PutAccount creates or updates the single management-login account.
 //
-// On first setup, password is required (minimum 12 characters). For an
-// existing account, an empty password means "keep the current password", so
-// a username-only change is valid; a non-empty password must still meet the
-// minimum length. Over a session, current_password is required for ANY
-// change to an existing account (username or password); over the management
-// key it is never required. session-secret is rotated only when the
-// password actually changes, but the caller always gets a fresh session
-// response regardless.
+// On first setup, password is required (minimum 12 characters) and a fresh
+// session-secret/user-handle are always generated. For an existing account,
+// an empty password means "keep the current password", so a username-only
+// change is valid; a non-empty password must still meet the minimum
+// length. Over a session, current_password is required for ANY change to
+// an existing account (username or password); over the management key it is
+// never required. session-secret is rotated only when the password
+// actually changes, but the caller always gets a fresh session response
+// regardless, carrying its own authentication method forward.
 func (h *Handler) PutAccount(c *gin.Context) {
 	var body struct {
 		Username        string `json:"username"`
@@ -113,71 +113,86 @@ func (h *Handler) PutAccount(c *gin.Context) {
 		return
 	}
 
+	current := h.loginStore.Get()
+	firstSetup := !mgmtauth.HasAccount(current)
+	if firstSetup && body.Password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
+		return
+	}
+
 	authViaSession := c.GetString(AuthMethodContextKey) == AuthMethodSession
-
-	login, ok := h.applyLoginMutation(c, func(l *config.LoginConfig) (int, string) {
-		firstSetup := !hasAccount(*l)
-		if firstSetup && body.Password == "" {
-			return http.StatusBadRequest, "password is required"
+	if !firstSetup && authViaSession {
+		if body.CurrentPassword == "" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "current_password is required"})
+			return
 		}
-		if !firstSetup && authViaSession {
-			if body.CurrentPassword == "" {
-				return http.StatusForbidden, "current_password is required"
-			}
-			match, errVerify := mgmtauth.VerifyPassword(l.PasswordHash, body.CurrentPassword)
-			if errVerify != nil || !match {
-				return http.StatusForbidden, "current_password is incorrect"
-			}
+		// current_password verification goes through the same single-flight
+		// throttle as login, since a held session/key is not proof of the
+		// current password and must not let an attacker brute-force it.
+		release, ok, retryAfter := h.loginThrottle.Reserve()
+		if !ok {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many attempts", "retry_after": ceilSecondsAtLeastOne(retryAfter)})
+			return
 		}
+		match, verifyErr := mgmtauth.VerifyPassword(current.PasswordHash, body.CurrentPassword)
+		success := verifyErr == nil && match
+		release(success)
+		if !success {
+			c.JSON(http.StatusForbidden, gin.H{"error": "current_password is incorrect"})
+			return
+		}
+	}
 
-		l.Username = username
+	next, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		out := acct
+		stillFirstSetup := !mgmtauth.HasAccount(out)
+		if out == nil {
+			out = &mgmtauth.Account{}
+		}
+		out.Username = username
 
 		passwordChanged := false
 		if body.Password != "" {
 			hashed, errHash := mgmtauth.HashPassword(body.Password)
 			if errHash != nil {
-				return http.StatusInternalServerError, errHash.Error()
+				return nil, errHash
 			}
-			l.PasswordHash = hashed
-			l.Password = ""
+			out.PasswordHash = hashed
 			passwordChanged = true
 		}
 
-		if firstSetup {
-			if l.SessionSecret == "" {
-				secret, errGen := generateAccountSecret()
-				if errGen != nil {
-					return http.StatusInternalServerError, errGen.Error()
-				}
-				l.SessionSecret = secret
+		if stillFirstSetup {
+			secret, errGen := generateAccountSecret()
+			if errGen != nil {
+				return nil, errGen
 			}
-			if l.UserHandle == "" {
-				handle, errGen := generateAccountSecret()
-				if errGen != nil {
-					return http.StatusInternalServerError, errGen.Error()
-				}
-				l.UserHandle = handle
+			out.SessionSecret = secret
+			handle, errGen2 := generateAccountSecret()
+			if errGen2 != nil {
+				return nil, errGen2
 			}
+			out.UserHandle = handle
 		} else if passwordChanged {
 			// A password change invalidates every existing session.
 			secret, errGen := generateAccountSecret()
 			if errGen != nil {
-				return http.StatusInternalServerError, errGen.Error()
+				return nil, errGen
 			}
-			l.SessionSecret = secret
+			out.SessionSecret = secret
 		}
-		return 0, ""
+		return out, nil
 	})
-	if !ok {
+	if err != nil {
+		mutationErrorResponse(c, err)
 		return
 	}
 
-	secret, err := decodeLoginSecret(login.SessionSecret)
-	if err != nil || len(secret) == 0 {
+	secret, errDecode := decodeLoginSecret(next.SessionSecret)
+	if errDecode != nil || len(secret) == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "session secret is not configured"})
 		return
 	}
-	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPassword, login.PasskeyOrigins)
+	h.issueSessionResponse(c, http.StatusOK, secret, resolvedSessionMethod(c), effectivePasskeyOrigins(next))
 }
 
 // PutAccountPasskeySettings updates the WebAuthn relying party id/origins.
@@ -190,30 +205,35 @@ func (h *Handler) PutAccountPasskeySettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	login, ok := h.applyLoginMutation(c, func(l *config.LoginConfig) (int, string) {
-		l.PasskeyRPID = strings.TrimSpace(body.RPID)
-		l.PasskeyOrigins = body.Origins
-		return 0, ""
+	next, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		out := acct
+		if out == nil {
+			out = &mgmtauth.Account{}
+		}
+		out.PasskeyRPID = strings.TrimSpace(body.RPID)
+		out.PasskeyOrigins = body.Origins
+		return out, nil
 	})
-	if !ok {
+	if err != nil {
+		mutationErrorResponse(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, accountView(login))
+	c.JSON(http.StatusOK, accountView(next))
 }
 
 // PostAccountPasskeysBegin starts a ceremony to register a new passkey.
 func (h *Handler) PostAccountPasskeysBegin(c *gin.Context) {
-	login := h.currentLoginConfig()
-	if login.PasskeyRPID == "" || !hasAccount(login) {
+	account := h.loginStore.Get()
+	if account == nil || account.PasskeyRPID == "" || !mgmtauth.HasAccount(account) {
 		c.JSON(http.StatusConflict, gin.H{"error": "passkeys are not configured"})
 		return
 	}
-	w, err := buildWebAuthn(login)
+	w, err := buildWebAuthn(account)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-	user, err := mgmtUser(login)
+	user, err := mgmtUser(account)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -225,6 +245,10 @@ func (h *Handler) PostAccountPasskeysBegin(c *gin.Context) {
 	}
 	ceremonyID, err := h.passkeyCeremonies.Begin(*session)
 	if err != nil {
+		if errors.Is(err, mgmtauth.ErrTooManyCeremonies) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -232,7 +256,7 @@ func (h *Handler) PostAccountPasskeysBegin(c *gin.Context) {
 }
 
 // PostAccountPasskeysFinish completes a passkey registration ceremony and
-// persists the new credential.
+// persists the new credential, tagged with the account's current rp-id.
 func (h *Handler) PostAccountPasskeysFinish(c *gin.Context) {
 	var body struct {
 		CeremonyID string          `json:"ceremony_id"`
@@ -250,13 +274,13 @@ func (h *Handler) PostAccountPasskeysFinish(c *gin.Context) {
 		return
 	}
 
-	login := h.currentLoginConfig()
-	w, err := buildWebAuthn(login)
+	account := h.loginStore.Get()
+	w, err := buildWebAuthn(account)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-	user, err := mgmtUser(login)
+	user, err := mgmtUser(account)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -266,12 +290,17 @@ func (h *Handler) PostAccountPasskeysFinish(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "passkey registration failed"})
 		return
 	}
-	stored := encodePasskeyCredential(mgmtauth.FromWebAuthnCredential(cred), strings.TrimSpace(body.Name), h.now())
+	rpID := account.PasskeyRPID
+	stored := encodePasskeyRecord(mgmtauth.FromWebAuthnCredential(cred), rpID, strings.TrimSpace(body.Name), h.now())
 
-	if _, ok := h.applyLoginMutation(c, func(l *config.LoginConfig) (int, string) {
-		l.Passkeys = append(l.Passkeys, stored)
-		return 0, ""
-	}); !ok {
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		if acct == nil {
+			return nil, &mgmtauth.MutationError{Status: http.StatusConflict, Message: "no account configured"}
+		}
+		acct.Passkeys = append(acct.Passkeys, stored)
+		return acct, nil
+	}); err != nil {
+		mutationErrorResponse(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, passkeyView(stored))
@@ -288,17 +317,22 @@ func (h *Handler) PatchAccountPasskey(c *gin.Context) {
 		return
 	}
 
-	var updated config.PasskeyCredential
-	if _, ok := h.applyLoginMutation(c, func(l *config.LoginConfig) (int, string) {
-		for i := range l.Passkeys {
-			if l.Passkeys[i].ID == id {
-				l.Passkeys[i].Name = body.Name
-				updated = l.Passkeys[i]
-				return 0, ""
+	var updated mgmtauth.PasskeyRecord
+	_, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		if acct == nil {
+			return nil, &mgmtauth.MutationError{Status: http.StatusNotFound, Message: "passkey not found"}
+		}
+		for i := range acct.Passkeys {
+			if acct.Passkeys[i].ID == id {
+				acct.Passkeys[i].Name = body.Name
+				updated = acct.Passkeys[i]
+				return acct, nil
 			}
 		}
-		return http.StatusNotFound, "passkey not found"
-	}); !ok {
+		return nil, &mgmtauth.MutationError{Status: http.StatusNotFound, Message: "passkey not found"}
+	})
+	if err != nil {
+		mutationErrorResponse(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, passkeyView(updated))
@@ -307,10 +341,13 @@ func (h *Handler) PatchAccountPasskey(c *gin.Context) {
 // DeleteAccountPasskey removes a registered passkey.
 func (h *Handler) DeleteAccountPasskey(c *gin.Context) {
 	id := c.Param("id")
-	if _, ok := h.applyLoginMutation(c, func(l *config.LoginConfig) (int, string) {
-		out := make([]config.PasskeyCredential, 0, len(l.Passkeys))
+	_, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		if acct == nil {
+			return nil, &mgmtauth.MutationError{Status: http.StatusNotFound, Message: "passkey not found"}
+		}
+		out := make([]mgmtauth.PasskeyRecord, 0, len(acct.Passkeys))
 		found := false
-		for _, p := range l.Passkeys {
+		for _, p := range acct.Passkeys {
 			if p.ID == id {
 				found = true
 				continue
@@ -318,11 +355,13 @@ func (h *Handler) DeleteAccountPasskey(c *gin.Context) {
 			out = append(out, p)
 		}
 		if !found {
-			return http.StatusNotFound, "passkey not found"
+			return nil, &mgmtauth.MutationError{Status: http.StatusNotFound, Message: "passkey not found"}
 		}
-		l.Passkeys = out
-		return 0, ""
-	}); !ok {
+		acct.Passkeys = out
+		return acct, nil
+	})
+	if err != nil {
+		mutationErrorResponse(c, err)
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -331,16 +370,21 @@ func (h *Handler) DeleteAccountPasskey(c *gin.Context) {
 // PostAccountSignOutAll rotates session-secret, invalidating every existing
 // session, and clears the caller's own cookie.
 func (h *Handler) PostAccountSignOutAll(c *gin.Context) {
-	if _, ok := h.applyLoginMutation(c, func(l *config.LoginConfig) (int, string) {
-		secret, err := generateAccountSecret()
-		if err != nil {
-			return http.StatusInternalServerError, err.Error()
+	next, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		if acct == nil {
+			return nil, &mgmtauth.MutationError{Status: http.StatusConflict, Message: "no account configured"}
 		}
-		l.SessionSecret = secret
-		return 0, ""
-	}); !ok {
+		secret, errGen := generateAccountSecret()
+		if errGen != nil {
+			return nil, errGen
+		}
+		acct.SessionSecret = secret
+		return acct, nil
+	})
+	if err != nil {
+		mutationErrorResponse(c, err)
 		return
 	}
-	clearSessionCookie(c)
+	h.clearSessionCookie(c, effectivePasskeyOrigins(next))
 	c.Status(http.StatusNoContent)
 }

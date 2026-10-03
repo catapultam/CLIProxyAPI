@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,16 +47,33 @@ func newTestEngine(h *Handler) *gin.Engine {
 	v8 := engine.Group("/v8/management")
 	v8.Use(h.Middleware())
 	v8.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
+	v8.GET("/config", h.ConfigV8)
+	v8.GET("/config.yaml", h.ConfigV8)
 
 	return engine
 }
 
 const testAccountPassword = "correct-horse-battery-staple"
 
+func newTestHandlerBase(t *testing.T, clock mgmtauth.Clock) *Handler {
+	t.Helper()
+	path := writeTestConfigFile(t)
+	return &Handler{
+		cfg:               &config.Config{},
+		configFilePath:    path,
+		failedAttempts:    make(map[string]*attemptInfo),
+		loginStore:        mgmtauth.NewStore(path),
+		loginThrottle:     mgmtauth.NewThrottle(clock),
+		passkeyCeremonies: mgmtauth.NewCeremonyCache(clock),
+		clock:             clock,
+	}
+}
+
 // newAccountHandler builds a Handler with a pre-configured username/password
 // account (no passkeys), driven by clock for deterministic tests.
 func newAccountHandler(t *testing.T, clock mgmtauth.Clock) *Handler {
 	t.Helper()
+	h := newTestHandlerBase(t, clock)
 	hash, err := mgmtauth.HashPassword(testAccountPassword)
 	if err != nil {
 		t.Fatalf("HashPassword: %v", err)
@@ -67,33 +86,37 @@ func newAccountHandler(t *testing.T, clock mgmtauth.Clock) *Handler {
 	if err != nil {
 		t.Fatalf("generateAccountSecret: %v", err)
 	}
-	cfg := &config.Config{}
-	cfg.RemoteManagement.Login = config.LoginConfig{
-		Username:      "admin",
-		PasswordHash:  hash,
-		SessionSecret: secret,
-		UserHandle:    handle,
+	if _, err := h.loginStore.Mutate(func(*mgmtauth.Account) (*mgmtauth.Account, error) {
+		return &mgmtauth.Account{
+			Username:      "admin",
+			PasswordHash:  hash,
+			SessionSecret: secret,
+			UserHandle:    handle,
+		}, nil
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
 	}
-	return &Handler{
-		cfg:               cfg,
-		configFilePath:    writeTestConfigFile(t),
-		failedAttempts:    make(map[string]*attemptInfo),
-		loginThrottle:     mgmtauth.NewThrottle(clock),
-		passkeyCeremonies: mgmtauth.NewCeremonyCache(clock),
-		clock:             clock,
-	}
+	return h
+}
+
+// keyOnlyHandler builds a Handler with a management key but no login
+// account yet, for first-setup PUT /account tests.
+func keyOnlyHandler(t *testing.T) *Handler {
+	t.Helper()
+	h := newTestHandlerBase(t, mgmtauth.SystemClock{})
+	h.envSecret = "test-secret"
+	h.allowRemoteOverride = true
+	return h
 }
 
 func doRequest(engine *gin.Engine, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	return doRequestFrom(engine, method, path, body, headers, "127.0.0.1:12345")
+}
+
+func doRequestFrom(engine *gin.Engine, method, path, body string, headers map[string]string, remoteAddr string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	var reader *strings.Reader
-	if body != "" {
-		reader = strings.NewReader(body)
-	} else {
-		reader = strings.NewReader("")
-	}
-	req := httptest.NewRequest(method, path, reader)
-	req.RemoteAddr = "127.0.0.1:12345"
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.RemoteAddr = remoteAddr
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -144,7 +167,7 @@ func TestPostSessionLoginSuccess(t *testing.T) {
 		t.Fatal("expected a session cookie to be set")
 	}
 	setCookie := rec.Header().Get("Set-Cookie")
-	if !strings.Contains(setCookie, "HttpOnly") || !strings.Contains(setCookie, "SameSite=Strict") || !strings.Contains(setCookie, "Path=/") {
+	if !strings.Contains(setCookie, "HttpOnly") || !strings.Contains(setCookie, "SameSite=Strict") || !strings.Contains(setCookie, "Path=/v8/management") {
 		t.Fatalf("Set-Cookie = %q, missing expected attributes", setCookie)
 	}
 	if strings.Contains(setCookie, "Secure") {
@@ -157,7 +180,7 @@ func TestPostSessionLoginSecureCookieOverHTTPSOrigin(t *testing.T) {
 	engine := newTestEngine(h)
 
 	rec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), map[string]string{
-		"Origin": "https://cakebox.wyrm-cat.ts.net",
+		"Origin": "https://cakebox.example.com",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
@@ -165,6 +188,61 @@ func TestPostSessionLoginSecureCookieOverHTTPSOrigin(t *testing.T) {
 	setCookie := rec.Header().Get("Set-Cookie")
 	if !strings.Contains(setCookie, "Secure") {
 		t.Fatalf("Set-Cookie = %q, expected Secure when Origin is https", setCookie)
+	}
+}
+
+func TestPostSessionLoginSecureCookieOverHTTPSReferer(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	engine := newTestEngine(h)
+
+	rec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), map[string]string{
+		"Referer": "https://cakebox.example.com/login",
+	})
+	setCookie := rec.Header().Get("Set-Cookie")
+	if !strings.Contains(setCookie, "Secure") {
+		t.Fatalf("Set-Cookie = %q, expected Secure when Referer is https", setCookie)
+	}
+}
+
+// TestSlidingRefreshKeepsSecureOnHTTPSPasskeyOrigin covers a GET that
+// carries neither Origin nor Referer (as a direct navigation would) against
+// an https passkey origin whose host:port matches the request Host: the
+// sliding refresh it triggers must still set Secure.
+func TestSlidingRefreshKeepsSecureOnHTTPSPasskeyOrigin(t *testing.T) {
+	clock := newMockClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	h := newAccountHandler(t, clock)
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyOrigins = []string{"https://cakebox.example.com:8443"}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed passkey origins: %v", err)
+	}
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	cookieHeader, _ := sessionCookieFrom(loginRec)
+
+	// Advance past the halfway point of the lifetime so Middleware() slides
+	// the session forward on the next request.
+	clock.Advance(mgmtauth.DefaultLifetime/2 + time.Minute)
+
+	req := httptest.NewRequest(http.MethodGet, "/v8/management/account", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Host = "cakebox.example.com:8443"
+	req.Header.Set("Cookie", cookieHeader)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	setCookie := rec.Header().Get("Set-Cookie")
+	if setCookie == "" {
+		t.Fatal("expected a refreshed Set-Cookie")
+	}
+	if !strings.Contains(setCookie, "Secure") {
+		t.Fatalf("Set-Cookie = %q, expected Secure because Host matches an https passkey origin", setCookie)
 	}
 }
 
@@ -179,14 +257,7 @@ func TestPostSessionLoginWrongPassword(t *testing.T) {
 }
 
 func TestPostSessionLoginNoAccount(t *testing.T) {
-	h := &Handler{
-		cfg:               &config.Config{},
-		configFilePath:    writeTestConfigFile(t),
-		failedAttempts:    make(map[string]*attemptInfo),
-		loginThrottle:     mgmtauth.NewThrottle(mgmtauth.SystemClock{}),
-		passkeyCeremonies: mgmtauth.NewCeremonyCache(mgmtauth.SystemClock{}),
-		clock:             mgmtauth.SystemClock{},
-	}
+	h := newTestHandlerBase(t, mgmtauth.SystemClock{})
 	engine := newTestEngine(h)
 
 	rec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", "whatever12345"), nil)
@@ -200,13 +271,11 @@ func TestPostSessionLoginThrottled(t *testing.T) {
 	h := newAccountHandler(t, clock)
 	engine := newTestEngine(h)
 
-	// First attempt fails and opens a 1s backoff window.
 	rec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", "wrong"), nil)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("first attempt status = %d, want 401", rec.Code)
 	}
 
-	// A second attempt inside the window is throttled, even with the right password.
 	rec = doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("second attempt status = %d, want 429; body=%s", rec.Code, rec.Body.String())
@@ -221,11 +290,50 @@ func TestPostSessionLoginThrottled(t *testing.T) {
 		t.Fatalf("retry_after = %d, want 1", body.RetryAfter)
 	}
 
-	// Advancing past the window allows the next (correct) attempt through.
 	clock.Advance(time.Second)
 	rec = doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("third attempt status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostSessionLoginConcurrentAttemptsSingleFlight drives 16 concurrent
+// login requests at a real HTTP handler (argon2 and all) and asserts at
+// most one of them was actually evaluated; the rest must observe 429.
+func TestPostSessionLoginConcurrentAttemptsSingleFlight(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	engine := newTestEngine(h)
+
+	const n = 16
+	var wg sync.WaitGroup
+	var evaluated atomic.Int32 // 200 or 401: the throttle let the attempt through
+	var throttled atomic.Int32 // 429: blocked before verification
+	start := make(chan struct{})
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			rec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", "wrong-password"), nil)
+			switch rec.Code {
+			case http.StatusTooManyRequests:
+				throttled.Add(1)
+			case http.StatusUnauthorized, http.StatusOK:
+				evaluated.Add(1)
+			default:
+				t.Errorf("unexpected status %d; body=%s", rec.Code, rec.Body.String())
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := evaluated.Load(); got != 1 {
+		t.Fatalf("evaluated = %d concurrent login attempts, want exactly 1", got)
+	}
+	if got := throttled.Load(); got != n-1 {
+		t.Fatalf("throttled = %d, want %d", got, n-1)
 	}
 }
 
@@ -234,19 +342,70 @@ func TestCSRFRejectsCrossSiteCookiePost(t *testing.T) {
 	engine := newTestEngine(h)
 
 	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
-	if loginRec.Code != http.StatusOK {
-		t.Fatalf("login status = %d, want 200", loginRec.Code)
-	}
 	cookieHeader, _ := sessionCookieFrom(loginRec)
 
-	// A cross-site POST that carries the cookie but neither a same-origin
-	// Sec-Fetch-Site nor a matching/allowed Origin must be rejected.
 	rec := doRequest(engine, http.MethodPost, "/v8/management/account/sign-out-all", "", map[string]string{
 		"Cookie": cookieHeader,
 		"Origin": "https://evil.example.com",
 	})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCSRFSecFetchSiteBranches exercises every Sec-Fetch-Site branch,
+// including the "same-site" value (treated as a mismatch, even for GET) and
+// the absent case, for both safe and unsafe methods.
+func TestCSRFSecFetchSiteBranches(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	cookieHeader, _ := sessionCookieFrom(loginRec)
+
+	cases := []struct {
+		name       string
+		method     string
+		secFetch   string
+		origin     string
+		wantStatus int
+	}{
+		{"same-origin GET", http.MethodGet, "same-origin", "", http.StatusOK},
+		{"none GET", http.MethodGet, "none", "", http.StatusOK},
+		{"same-site GET rejected", http.MethodGet, "same-site", "", http.StatusForbidden},
+		{"cross-site GET rejected", http.MethodGet, "cross-site", "", http.StatusForbidden},
+		{"same-origin POST", http.MethodPost, "same-origin", "", http.StatusNoContent},
+		{"same-site POST rejected", http.MethodPost, "same-site", "", http.StatusForbidden},
+		{"cross-site POST rejected", http.MethodPost, "cross-site", "", http.StatusForbidden},
+		{"absent GET allowed", http.MethodGet, "", "", http.StatusOK},
+		{"absent POST with no origin rejected", http.MethodPost, "", "", http.StatusForbidden},
+		{"absent POST with origin null rejected", http.MethodPost, "", "null", http.StatusForbidden},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := "/v8/management/account"
+			if tc.method == http.MethodPost {
+				path = "/v8/management/account/sign-out-all"
+			}
+			headers := map[string]string{"Cookie": cookieHeader}
+			if tc.secFetch != "" {
+				headers["Sec-Fetch-Site"] = tc.secFetch
+			}
+			if tc.origin != "" {
+				headers["Origin"] = tc.origin
+			}
+			rec := doRequest(engine, tc.method, path, "", headers)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			// sign-out-all mutates the account (rotates session-secret), so
+			// re-login for the next sub-test if it actually succeeded.
+			if tc.method == http.MethodPost && rec.Code == http.StatusNoContent {
+				loginRec = doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+				cookieHeader, _ = sessionCookieFrom(loginRec)
+			}
+		})
 	}
 }
 
@@ -284,7 +443,6 @@ func TestBearerTokenWorksCrossOrigin(t *testing.T) {
 	}
 	_ = json.Unmarshal(loginRec.Body.Bytes(), &resp)
 
-	// Bearer auth is not cookie-driven, so an unsafe method needs no CSRF headers.
 	rec := doRequest(engine, http.MethodGet, "/v8/management/account", "", map[string]string{
 		"Authorization": "Bearer " + resp.Token,
 	})
@@ -301,16 +459,59 @@ func TestBearerTokenWorksCrossOrigin(t *testing.T) {
 	}
 }
 
-func TestKeyAuthStillReachesV0AndV8Routes(t *testing.T) {
-	h := &Handler{
-		cfg:               &config.Config{},
-		configFilePath:    writeTestConfigFile(t),
-		failedAttempts:    make(map[string]*attemptInfo),
-		envSecret:         "test-secret",
-		loginThrottle:     mgmtauth.NewThrottle(mgmtauth.SystemClock{}),
-		passkeyCeremonies: mgmtauth.NewCeremonyCache(mgmtauth.SystemClock{}),
-		clock:             mgmtauth.SystemClock{},
+// TestStaleCookieDoesNotFallThroughOrBanTheIP covers: a presented cpas_
+// cookie that fails verification is rejected outright (401 "session
+// expired"), never falls through to key auth, and never counts against the
+// key's IP-ban bookkeeping -- five stale attempts must not block a
+// subsequent correct key.
+func TestStaleCookieDoesNotFallThroughOrBanTheIP(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	h.envSecret = "test-secret"
+	engine := newTestEngine(h)
+
+	staleCookie := SessionCookieName + "=" + mgmtauth.TokenPrefix + "not-a-real-token"
+	for i := 0; i < 5; i++ {
+		rec := doRequest(engine, http.MethodGet, "/v8/management/account", "", map[string]string{
+			"Cookie":         staleCookie,
+			"Sec-Fetch-Site": "same-origin",
+		})
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status = %d, want 401", i, rec.Code)
+		}
+		var body struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &body)
+		if body.Error != "session expired" {
+			t.Fatalf("attempt %d: error = %q, want \"session expired\"", i, body.Error)
+		}
 	}
+
+	// The key must still work: a stale session credential must never have
+	// counted against its failure bookkeeping.
+	rec := doRequest(engine, http.MethodGet, "/v8/management/account", "", map[string]string{"X-Management-Key": "test-secret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("key auth after stale cookies: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestInvalidSessionBearerAlsoDoesNotFallThrough mirrors
+// TestStaleCookieDoesNotFallThroughOrBanTheIP for the bearer path.
+func TestInvalidSessionBearerAlsoDoesNotFallThrough(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	engine := newTestEngine(h)
+
+	rec := doRequest(engine, http.MethodGet, "/v8/management/account", "", map[string]string{
+		"Authorization": "Bearer " + mgmtauth.TokenPrefix + "garbage",
+	})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestKeyAuthStillReachesV0AndV8Routes(t *testing.T) {
+	h := newTestHandlerBase(t, mgmtauth.SystemClock{})
+	h.envSecret = "test-secret"
 	engine := newTestEngine(h)
 
 	rec := doRequest(engine, http.MethodGet, "/v0/management/config", "", map[string]string{"X-Management-Key": "test-secret"})
@@ -328,6 +529,9 @@ func TestKeyAuthStillReachesV0AndV8Routes(t *testing.T) {
 	}
 }
 
+// TestSessionReachesV0Route proves a session bypasses allow-remote for a
+// genuinely remote (non-loopback) client, not merely a loopback request
+// that would pass other checks for unrelated reasons.
 func TestSessionReachesV0Route(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
 	engine := newTestEngine(h)
@@ -335,14 +539,51 @@ func TestSessionReachesV0Route(t *testing.T) {
 	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
 	cookieHeader, _ := sessionCookieFrom(loginRec)
 
-	// The session bypasses allow-remote entirely: no key, no local client, no
-	// override configured, yet the request must still succeed.
-	rec := doRequest(engine, http.MethodGet, "/v0/management/config", "", map[string]string{
+	const remoteAddr = "203.0.113.5:54321"
+
+	// Sanity check: without a session, this remote, key-less client is
+	// rejected (no allow-remote override, no key configured).
+	sanity := doRequestFrom(engine, http.MethodGet, "/v0/management/config", "", nil, remoteAddr)
+	if sanity.Code == http.StatusOK {
+		t.Fatal("expected a remote request with no credential to be rejected")
+	}
+
+	rec := doRequestFrom(engine, http.MethodGet, "/v0/management/config", "", map[string]string{
 		"Cookie":         cookieHeader,
 		"Sec-Fetch-Site": "same-origin",
-	})
+	}, remoteAddr)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSessionLoginRemoteGate verifies /session/login and
+// /session/passkey/finish honor the same local-or-allow-remote predicate as
+// key auth, for a non-loopback client with no override.
+func TestSessionLoginRemoteGate(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	engine := newTestEngine(h)
+
+	rec := doRequestFrom(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil, "203.0.113.5:1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// A local client is unaffected.
+	rec = doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("local status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSessionPasskeyFinishRemoteGate(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	engine := newTestEngine(h)
+
+	body, _ := json.Marshal(map[string]interface{}{"ceremony_id": "whatever", "credential": json.RawMessage(`{}`)})
+	rec := doRequestFrom(engine, http.MethodPost, "/v8/management/session/passkey/finish", string(body), nil, "203.0.113.5:1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -350,7 +591,6 @@ func TestGetSessionStatus(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
 	engine := newTestEngine(h)
 
-	// No credential at all: authenticated=false, and no failure recorded.
 	rec := doRequest(engine, http.MethodGet, "/v8/management/session/status", "", nil)
 	var status struct {
 		Account       bool   `json:"account"`
@@ -381,9 +621,12 @@ func TestGetSessionStatus(t *testing.T) {
 // ["https://<rp-id>"] when unset), not the raw stored config value.
 func TestGetSessionStatusEffectivePasskeyOrigins(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
-	h.mu.Lock()
-	h.cfg.RemoteManagement.Login.PasskeyRPID = "mgmt.example.com"
-	h.mu.Unlock()
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "mgmt.example.com"
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed rp-id: %v", err)
+	}
 	engine := newTestEngine(h)
 
 	var status struct {
@@ -402,9 +645,12 @@ func TestGetSessionStatusEffectivePasskeyOrigins(t *testing.T) {
 		t.Fatalf("passkey_origins = %v, want [https://mgmt.example.com] (defaulted)", status.PasskeyOrigins)
 	}
 
-	h.mu.Lock()
-	h.cfg.RemoteManagement.Login.PasskeyOrigins = []string{"https://mgmt.example.com:8443"}
-	h.mu.Unlock()
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyOrigins = []string{"https://mgmt.example.com:8443"}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed origins: %v", err)
+	}
 
 	rec = doRequest(engine, http.MethodGet, "/v8/management/session/status", "", nil)
 	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
@@ -435,6 +681,8 @@ func TestCeilSecondsAtLeastOne(t *testing.T) {
 	}
 }
 
+// TestPostSessionLogoutClearsCookie checks both the cleared value and
+// Max-Age=0 explicitly (an OR of the two would pass if only one held).
 func TestPostSessionLogoutClearsCookie(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
 	engine := newTestEngine(h)
@@ -444,7 +692,48 @@ func TestPostSessionLogoutClearsCookie(t *testing.T) {
 		t.Fatalf("status = %d, want 204", rec.Code)
 	}
 	setCookie := rec.Header().Get("Set-Cookie")
-	if !strings.Contains(setCookie, SessionCookieName+"=;") && !strings.Contains(setCookie, "Max-Age=0") {
-		t.Fatalf("Set-Cookie = %q, expected it to clear the cookie", setCookie)
+	if !strings.Contains(setCookie, SessionCookieName+"=;") {
+		t.Fatalf("Set-Cookie = %q, missing cleared value", setCookie)
+	}
+	if !strings.Contains(setCookie, "Max-Age=0") {
+		t.Fatalf("Set-Cookie = %q, missing Max-Age=0", setCookie)
+	}
+}
+
+// TestGetConfigV8ContainsNoLoginData locks in the core design change: the
+// login account lives outside config.yaml entirely, so neither the JSON nor
+// the YAML view of /v8/management/config can ever contain it.
+func TestGetConfigV8ContainsNoLoginData(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "mgmt.example.com"
+		acct.Passkeys = []mgmtauth.PasskeyRecord{{ID: "cred-1", PublicKey: "pub-1", RPID: "mgmt.example.com", Name: "Key"}}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	h.envSecret = "test-secret"
+	engine := newTestEngine(h)
+
+	forbidden := []string{testAccountPassword, h.loginStore.Get().PasswordHash, h.loginStore.Get().SessionSecret, h.loginStore.Get().UserHandle, "cred-1", "pub-1", "mgmt.example.com"}
+
+	rec := doRequest(engine, http.MethodGet, "/v8/management/config", "", map[string]string{"X-Management-Key": "test-secret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET config status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	for _, leak := range forbidden {
+		if leak != "" && strings.Contains(rec.Body.String(), leak) {
+			t.Fatalf("GET /v8/management/config leaked %q: %s", leak, rec.Body.String())
+		}
+	}
+
+	rec = doRequest(engine, http.MethodGet, "/v8/management/config.yaml", "", map[string]string{"X-Management-Key": "test-secret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET config.yaml status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	for _, leak := range forbidden {
+		if leak != "" && strings.Contains(rec.Body.String(), leak) {
+			t.Fatalf("GET /v8/management/config.yaml leaked %q: %s", leak, rec.Body.String())
+		}
 	}
 }
