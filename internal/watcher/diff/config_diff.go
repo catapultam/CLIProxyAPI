@@ -185,6 +185,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	if !reflect.DeepEqual(oldCfg.Routing.ModelRewrite, newCfg.Routing.ModelRewrite) {
+		changes = append(changes, fmt.Sprintf("routing.model-rewrite: updated (%d -> %d rules)", len(oldCfg.Routing.ModelRewrite), len(newCfg.Routing.ModelRewrite)))
+	}
 	if !reflect.DeepEqual(oldCfg.Payload, newCfg.Payload) {
 		changes = appendPayloadConfigChanges(changes, oldCfg.Payload, newCfg.Payload)
 	}
