@@ -269,9 +269,12 @@ func (s *Store) Resolve(target string) (string, bool) {
 	return s.resolveLocked(target)
 }
 
+// resolveLocked finds a session by friendly name or address. The reserved
+// "slack" address never resolves to a session, even a legacy one still
+// carrying that name from before nameFree rejected it.
 func (s *Store) resolveLocked(target string) (string, bool) {
 	target = strings.TrimSpace(target)
-	if target == "" {
+	if target == "" || isSlackAddress(target) {
 		return "", false
 	}
 	lower := strings.ToLower(target)

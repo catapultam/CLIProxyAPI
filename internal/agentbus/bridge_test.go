@@ -146,3 +146,57 @@ func TestHTTPSendCannotSetFromUser(t *testing.T) {
 		t.Fatalf("client set from_user: %s", w.Body)
 	}
 }
+
+// TestDeliverPrefersLiveSessionWhenNameIsReused proves Deliver inherits
+// resolveLocked's (and so bestMatchLocked's) preference for a live session
+// over the offline one that used to hold the same name.
+func TestDeliverPrefersLiveSessionWhenNameIsReused(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "flyer", true)
+	s.Bye(sidA)
+	s.Hello(sidB, "pc", "/b", "flyer", true)
+
+	if sid, err := s.Deliver("flyer", "do X", "alex"); err != nil || sid != sidB {
+		t.Fatalf("Deliver(flyer) = %q, %v, want %s", sid, err, sidB)
+	}
+	if s.Pending(sidA) {
+		t.Fatal("Deliver landed on the offline session")
+	}
+	if !s.Pending(sidB) {
+		t.Fatal("Deliver did not reach the live session")
+	}
+}
+
+// TestResolveNeverResolvesReservedSlackName guards the controller ruling:
+// resolveLocked must never match the reserved "slack" address to a
+// session, even a legacy one that carries that name (predating the
+// reserved-name check in nameFree). Deliver("slack") must fail, and with a
+// bridge attached, Send to "slack" must go to the bridge rather than to
+// that session's inbox.
+func TestResolveNeverResolvesReservedSlackName(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.mu.Lock()
+	s.byID[sidA].Name = "slack" // simulate state persisted before nameFree rejected this
+	s.mu.Unlock()
+
+	if _, err := s.Deliver("slack", "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
+		t.Fatalf("Deliver(slack) = %v, want ErrUnknownTarget", err)
+	}
+
+	fb := &fakeBridge{users: []string{"alex"}}
+	s.SetBridge(fb)
+	msg, err := s.Send(sidA, "slack", "hi", "")
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if msg.To != SlackAddress {
+		t.Fatalf("msg = %+v, want To=%s", msg, SlackAddress)
+	}
+	if len(fb.posts) != 1 {
+		t.Fatalf("posts = %+v", fb.posts)
+	}
+	if s.Pending(sidA) {
+		t.Fatal("slack message landed in the legacy session's inbox")
+	}
+}
