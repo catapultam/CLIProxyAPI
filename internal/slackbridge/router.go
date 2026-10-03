@@ -47,13 +47,18 @@ func isDM(ev messageEvent) bool {
 	return ev.ChannelType == "im" || strings.HasPrefix(ev.Channel, "D")
 }
 
-// handleEvent routes one Slack message, from the channel or a DM with the
-// bot. It only touches memory, the state file and the job queues, never the
-// network, so the socket loop can ack as soon as it returns.
+// handleEvent routes one Slack message: from the channel, a DM with the bot,
+// or another conversation the bot is in (see routeForeign). It only touches
+// memory, the state file and the job queues, never the network, so the
+// socket loop can ack as soon as it returns.
+//
+// Anywhere, a message that tags an agent ("name: message" or "@name
+// message", where name resolves to a session) reaches that agent, and its
+// answer lands where the message was (see sendTagged).
 func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	dm := isDM(ev)
 	if ev.Type != "message" || !relayedSubtypes[ev.Subtype] || ev.BotID != "" ||
-		ev.Channel == "" || (ev.Channel != b.channelID && !dm) || ev.User == "" || ev.User == b.botUserID {
+		ev.Channel == "" || ev.User == "" || ev.User == b.botUserID {
 		return
 	}
 	user, ok := b.state.user(ev.User)
@@ -69,6 +74,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	if b.alreadySeen(key) {
 		return
 	}
+	if !dm && ev.Channel != b.channelID {
+		b.routeForeign(ev, user)
+		return
+	}
 	if verb, target, isCommand := parseCommand(ev.Text, b.botUserID); isCommand {
 		b.command(ev, user, verb, target)
 		return
@@ -80,6 +89,9 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	}
 	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
 		sid, linked := b.state.session(ev.ThreadTS)
+		if b.sendTagged(ev, user, text, sid) {
+			return
+		}
 		if !linked {
 			// Answer an unlinked thread once, not on every message in it.
 			if !b.alreadySeen("unlinked:" + ev.ThreadTS) {
@@ -87,15 +99,15 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 			}
 			return
 		}
-		if isBang(text) {
-			b.runCommand(ev, user, sid, text, sessionEnded, false)
-			return
-		}
-		b.deliver(ev, sid, text, user, sessionEnded, false)
+		b.send(ev, user, sid, text, false)
 		return
 	}
 	target, body, addressedOK := parseAddressed(text)
 	if !addressedOK {
+		if sid, tagBody, tagOK := b.tagged(ev, text); tagOK {
+			b.send(ev, user, sid, tagBody, true)
+			return
+		}
 		if isBang(text) {
 			// Only !commands needs no target; runCommand explains the rest.
 			b.runCommand(ev, user, "", text, "", false)
@@ -112,10 +124,63 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	b.deliver(ev, target, body, user, notFound, true)
 }
 
+// routeForeign handles a message from an allowed user in a conversation
+// that is neither the channel nor their DM with the bot: a group DM or
+// another channel the bot was added to. Only a message that tags an agent
+// is delivered, with the usual "!" command rule; the answer lands in that
+// conversation and thread. Anything else, a bot mention included, is
+// ignored without a reply, so the bot stays quiet where it was only added.
+func (b *Bridge) routeForeign(ev messageEvent, user allowedUser) {
+	b.sendTagged(ev, user, plainText(ev.Text, b.state.idLabels()), "")
+}
+
+// tagged finds the agent text tags: "name: message" or "@name message" (see
+// parseAtTagged), where name resolves to a bus session (never "slack"). It
+// returns that session's id and the message.
+func (b *Bridge) tagged(ev messageEvent, text string) (string, string, bool) {
+	name, body, ok := parseAddressed(text)
+	if !ok {
+		name, body, ok = parseAtTagged(ev.Text, text)
+	}
+	if !ok {
+		return "", "", false
+	}
+	sid, found := b.bus.Resolve(name)
+	if !found {
+		return "", "", false
+	}
+	return sid, body, true
+}
+
+// sendTagged sends the message in text to the agent it tags, unless that is
+// own (the session this conversation or thread already goes to; empty for
+// none), and reports whether it did. The delivery adopts nothing: the reply
+// map sends the agent's answer back to this conversation and thread, which
+// stay own's. A name that doesn't resolve is no tag ("note: …"), and a tag
+// of own itself leaves text whole for own.
+func (b *Bridge) sendTagged(ev messageEvent, user allowedUser, text, own string) bool {
+	sid, body, ok := b.tagged(ev, text)
+	if !ok || sid == own {
+		return false
+	}
+	b.send(ev, user, sid, body, false)
+	return true
+}
+
+// send delivers text to the session sid, or runs it there when it is a "!"
+// command. adopt is as for deliver.
+func (b *Bridge) send(ev messageEvent, user allowedUser, sid, text string, adopt bool) {
+	if isBang(text) {
+		b.runCommand(ev, user, sid, text, sessionEnded, adopt)
+		return
+	}
+	b.deliver(ev, sid, text, user, sessionEnded, adopt)
+}
+
 // routeDM routes a message from an allowed user in their DM with the bot:
 //   - a reply in a thread goes to the agent the thread's first message is
-//     tied to;
-//   - a top-level "name: …" goes to that agent;
+//     tied to, unless it tags another agent;
+//   - a top-level "name: …" or "@name …" goes to that agent;
 //   - any other top-level message goes to the agent the user last talked to
 //     in the DM (dmLast, while it hasn't expired), or gets a help reply.
 //
@@ -125,17 +190,16 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string) {
 	b.rememberDM(ev.User, ev.Channel)
 	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
 		sid, linked := b.dmThreadSession(ev)
+		if b.sendTagged(ev, user, text, sid) {
+			return
+		}
 		if !linked {
 			if !b.alreadySeen("unlinked:" + ev.Channel + ":" + ev.ThreadTS) {
 				b.reply(ev, "This thread isn't linked to an agent. "+howToDM)
 			}
 			return
 		}
-		if isBang(text) {
-			b.runCommand(ev, user, sid, text, sessionEnded, false)
-			return
-		}
-		b.deliver(ev, sid, text, user, sessionEnded, false)
+		b.send(ev, user, sid, text, false)
 		return
 	}
 	if target, body, addressedOK := parseAddressed(text); addressedOK {
@@ -145,6 +209,10 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string) {
 			return
 		}
 		b.deliver(ev, target, body, user, notFound, true)
+		return
+	}
+	if sid, body, ok := b.tagged(ev, text); ok {
+		b.send(ev, user, sid, body, true)
 		return
 	}
 	sid, ok := b.state.dmLast(ev.User)

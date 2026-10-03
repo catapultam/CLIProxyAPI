@@ -199,8 +199,9 @@ func TestInboundDMDetectedByChannelPrefix(t *testing.T) {
 	other.Channel = "CGEN"
 	other.ChannelType = "channel"
 	b.handleEvent("EvDQ", other)
-	if bus.Pending(sidA) {
-		t.Fatal("a message in another channel was delivered")
+	// Another channel is no DM: a tag there is delivered without via.
+	if msgs := bus.Claim(sidA); len(msgs) != 1 || msgs[0].Via != "" {
+		t.Fatalf("msgs = %+v", msgs)
 	}
 }
 

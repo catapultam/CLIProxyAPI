@@ -74,6 +74,7 @@ oauth_config:
       - groups:history
       - im:history
       - im:write
+      - mpim:history
       - reactions:write
       - channels:read
       - groups:read
@@ -85,6 +86,7 @@ settings:
       - message.channels
       - message.groups
       - message.im
+      - message.mpim
   socket_mode_enabled: true
   org_deploy_enabled: false
   token_rotation_enabled: false
@@ -500,3 +502,47 @@ make them possible.
 - *One-shot hint.* An injection into a session without the mod that carries
   a Slack user's message adds the line "This message is shown to you once.
   If you can't act on it now, write it into your task list."
+
+**Tagging another agent (Task 5b).** An allowed user can tag a different
+agent from inside any conversation the bot can read: the main channel (top
+level and threads), their DM with the bot (top level and threads), and any
+group DM (mpim) or other channel the bot is a member of, linked or not.
+
+- *Forms.* `name: message`, as at the top level, or `@name message` (also
+  `@name: message`): a leading `@word` typed as text. A real Slack mention
+  (`<@U…>` in the raw event) is never a tag, even though it renders as
+  `@label`. Either form is a tag only when `name` resolves to a session
+  (`Store.Resolve`: name or address, live or known; never `slack` or
+  `slack@…`). A name that doesn't resolve is no tag, so `note: …` or
+  `TODO: …` in a thread stay plain text, and the bridge never answers "no
+  agent called" for them.
+- *In a thread* (channel or DM) whose session is X, a tag of another session
+  Y delivers only the message to Y; a tag of X itself (or no tag) delivers
+  the whole text to X, as before. An unlinked thread delivers a tag and
+  answers anything else with its usual one-time help. `name: !command`
+  runs the command on Y, with the owner rule.
+- *At the top level* of the channel or a DM, `name: …` works as before
+  (unknown names get "No agent called"); `@name …` that resolves is the same
+  delivery (the channel post becomes Y's thread; the DM post is linked to
+  Y). An `@word` that doesn't resolve falls through to the old behavior (the
+  channel's help reply, the DM's `dm_last`).
+- *Elsewhere* (a group DM or another channel the bot is in, not linked):
+  only allowed users (the same allowlist, by user ID, after the same
+  filters and dedup) can tag. A message that doesn't tag a resolvable agent,
+  a bot mention or `!commands` included, is ignored with no reply, so the
+  bot stays quiet where it was only added. A delivery there carries no
+  `via` (it isn't the user's DM with the bot).
+- A tagged delivery adopts nothing: Y's own thread, the thread's owner X and
+  `dm_last` rules are unchanged (except that, as for every DM delivery, Y
+  becomes the user's `dm_last` in a DM). It records a reply-map entry with
+  this conversation's channel and thread (`thread_ts` = the event's thread,
+  or the message itself at a non-DM top level), gets the same receipt
+  reactions (`inbox_tray` or `gear`, then received, then read), and Y's
+  `reply_to` answer lands in this conversation and thread. Y sees a normal
+  `from_user` message; the framing doesn't change.
+- *Slack limitation.* The bot can't read 1:1 DMs between two people. To
+  bring an agent into such a conversation, start a group DM that includes
+  `@agents`. Receiving group DMs needs the `mpim:history` scope and the
+  `message.mpim` event (added to the manifest above; an installed app must
+  be reinstalled to get them); other channels the bot is in use
+  `message.channels` / `message.groups`, already subscribed.

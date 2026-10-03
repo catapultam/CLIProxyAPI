@@ -12,6 +12,7 @@ var (
 	slackLink      = regexp.MustCompile(`<((?:https?|mailto):[^|>]+)(?:\|[^>]*)?>`)
 	labelMention   = regexp.MustCompile(`(?i)(^|[\s(\[{"'])@([a-z0-9][a-z0-9._-]*)`)
 	addressed      = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]*):[ \t]*(\S[\s\S]*)$`)
+	atTagged       = regexp.MustCompile(`^@([A-Za-z0-9][A-Za-z0-9._/-]*):?\s+(\S[\s\S]*)$`)
 	labelUnsafe    = regexp.MustCompile(`[^a-z0-9._-]+`)
 	filenameUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
@@ -52,10 +53,24 @@ func plainText(text string, labels map[string]string) string {
 	return slackUnescaper.Replace(text)
 }
 
-// parseAddressed splits a top-level "name: message" post.
+// parseAddressed splits a "name: message" post.
 func parseAddressed(text string) (string, string, bool) {
 	m := addressed.FindStringSubmatch(strings.TrimSpace(text))
 	if m == nil || strings.HasPrefix(m[2], "//") {
+		return "", "", false
+	}
+	return m[1], strings.TrimSpace(m[2]), true
+}
+
+// parseAtTagged splits "@name message" (or "@name: message"). raw is the
+// event's text before plainText: a real Slack mention (<@U…>) renders as
+// "@label" too, but it names a person, so it never counts.
+func parseAtTagged(raw, text string) (string, string, bool) {
+	if !strings.HasPrefix(strings.TrimSpace(raw), "@") {
+		return "", "", false
+	}
+	m := atTagged.FindStringSubmatch(strings.TrimSpace(text))
+	if m == nil {
 		return "", "", false
 	}
 	return m[1], strings.TrimSpace(m[2]), true

@@ -50,6 +50,29 @@ func TestParseAddressed(t *testing.T) {
 	}
 }
 
+func TestParseAtTagged(t *testing.T) {
+	cases := []struct {
+		raw, text, name, body string
+		ok                    bool
+	}{
+		{"@flyer2 look here", "@flyer2 look here", "flyer2", "look here", true},
+		{"  @flyer2: look", "@flyer2: look", "flyer2", "look", true},
+		{"@pc/work-aaaa1111 hi\nthere", "@pc/work-aaaa1111 hi\nthere", "pc/work-aaaa1111", "hi\nthere", true},
+		{"@flyer2", "@flyer2", "", "", false},
+		{"@flyer2   ", "@flyer2   ", "", "", false},
+		{"@flyer2:look", "@flyer2:look", "", "", false},
+		{"<@UALEX> look", "@alex look", "", "", false},
+		{"hi @flyer2 look", "hi @flyer2 look", "", "", false},
+		{"@ look", "@ look", "", "", false},
+	}
+	for _, c := range cases {
+		name, body, ok := parseAtTagged(c.raw, c.text)
+		if name != c.name || body != c.body || ok != c.ok {
+			t.Errorf("parseAtTagged(%q) = %q, %q, %v", c.raw, name, body, ok)
+		}
+	}
+}
+
 func TestParseCommand(t *testing.T) {
 	cases := []struct {
 		in, verb, user string
