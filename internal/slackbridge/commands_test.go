@@ -78,17 +78,104 @@ func TestRegistryLoadsEachKind(t *testing.T) {
 	if want := []string{"screencapture", "-x", "{out}"}; !reflect.DeepEqual(e.spec.Argv["darwin"], want) {
 		t.Fatalf("argv = %v", e.spec.Argv)
 	}
-	for _, missing := range []string{"notes", "sub", "compact"} {
+	for _, missing := range []string{"notes", "compact"} {
 		if _, found := r.lookup(missing); found {
 			t.Fatalf("%s should not be a registry command", missing)
 		}
+	}
+	// A .yaml entry that isn't a regular file is misconfigured, so !sub
+	// never falls through to a harness command.
+	if e, found := r.lookup("sub"); !found || e.err == nil {
+		t.Fatalf("sub.yaml directory = %+v %v", e, found)
 	}
 	var names []string
 	for _, entry := range r.list() {
 		names = append(names, entry.name)
 	}
-	if !reflect.DeepEqual(names, []string{"focus", "review", "screenshot"}) {
+	if !reflect.DeepEqual(names, []string{"focus", "review", "screenshot", "sub"}) {
 		t.Fatalf("list = %v", names)
+	}
+}
+
+func TestRegistryUnreadableEntriesAreMisconfigured(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	dir := t.TempDir()
+	writeCommand(t, dir, "focus.yaml", slashYAML, mtime0)
+	writeCommand(t, dir, "locked.yaml", slashYAML, mtime0)
+	r := newRegistry(dir)
+	r.stat = func(path string) (os.FileInfo, error) {
+		if filepath.Base(path) == "locked.yaml" {
+			return nil, os.ErrPermission
+		}
+		return os.Stat(path)
+	}
+	if e, found := r.lookup("locked"); !found || e.err == nil {
+		t.Fatalf("unstat-able file = %+v %v", e, found)
+	}
+	warned := false
+	for _, e := range hook.AllEntries() {
+		warned = warned || (e.Level == log.WarnLevel && strings.Contains(e.Message, "locked.yaml"))
+	}
+	if !warned {
+		t.Fatal("no warning for the unreadable file")
+	}
+	if e, found := r.lookup("focus"); !found || e.err != nil {
+		t.Fatalf("focus = %+v %v", e, found)
+	}
+}
+
+func TestRegistryKeepsEntriesOnDirReadError(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+	dir := t.TempDir()
+	writeCommand(t, dir, "focus.yaml", slashYAML, mtime0)
+	r := newRegistry(dir)
+	if _, found := r.lookup("focus"); !found {
+		t.Fatal("focus not loaded")
+	}
+	r.readDir = func(string) ([]os.DirEntry, error) { return nil, os.ErrPermission }
+	if e, found := r.lookup("focus"); !found || e.err != nil || e.spec.Command != "compact" {
+		t.Fatalf("after a read error = %+v %v", e, found)
+	}
+	r.lookup("focus")
+	warned := 0
+	for _, e := range hook.AllEntries() {
+		if e.Level == log.WarnLevel && strings.Contains(e.Message, "agent commands") {
+			warned++
+		}
+	}
+	if warned != 1 {
+		t.Fatalf("warned %d times, want 1", warned)
+	}
+	// The directory going away (ENOENT) still empties the registry.
+	r.readDir = func(string) ([]os.DirEntry, error) { return nil, os.ErrNotExist }
+	if _, found := r.lookup("focus"); found {
+		t.Fatal("a removed dir kept its commands")
+	}
+}
+
+func TestCommandRepliesUseCommandQueue(t *testing.T) {
+	b, _, bus, dir := newCommandBridge(t)
+	writeCommand(t, dir, "broken.yaml", "kind: nope\n", mtime0)
+	root := threadOf(t, b, bus)
+	if _, _, err := b.state.allow("UJANE", "jane"); err != nil {
+		t.Fatal(err)
+	}
+	for i, ev := range []messageEvent{
+		msg("UJANE", "!compact", "18.1", root),
+		msg("UALEX", "!commands", "18.2", root),
+		msg("UALEX", "!broken", "18.3", root),
+		msg("UALEX", "!!!", "18.4", root),
+		msg("UALEX", "!compact", "18.5", ""),
+		msg("UALEX", "pc/other-bbbbbb: !compact", "18.6", ""),
+		msg("UALEX", "ghost: !compact", "18.7", ""),
+	} {
+		b.handleEvent("EvQ"+string(rune('0'+i)), ev)
+		if len(b.commands) != 1 || len(b.jobs) != 0 {
+			t.Fatalf("event %d: commands=%d jobs=%d, want the reply on the command queue", i, len(b.commands), len(b.jobs))
+		}
+		drainJobs(t, b)
 	}
 }
 
@@ -135,6 +222,8 @@ func TestRegistryRejectsInvalidFiles(t *testing.T) {
 		"emptyfile":    "",
 		"notyaml":      "kind: [slash\n",
 		"twodocs":      "kind: slash\ncommand: compact\n---\nkind: slash\ncommand: clear\n",
+		// Wrapped as ^(?:a)|(.*)$ this would be an unanchored alternation.
+		"patternescape": "kind: shell\nargv:\n  linux: [ls, \"{args}\"]\nargs_pattern: \"a)|(.*\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -247,6 +336,10 @@ func TestShellArgsRules(t *testing.T) {
 	writeCommand(t, dir, "branch.yaml", branchYAML, mtime0)
 	writeCommand(t, dir, "screenshot.yaml", shellYAML, mtime0)
 	writeCommand(t, dir, "review.yaml", promptYAML, mtime0)
+	writeCommand(t, dir, "anytext.yaml", "kind: shell\nargv:\n  linux: [echo, \"{args}\"]\nargs_pattern: \"(?s).{1,20}\"\n", mtime0)
+	writeCommand(t, dir, "focus.yaml", slashYAML, mtime0)
+	writeCommand(t, dir, "opus.yaml", "kind: slash\ncommand: model\nargs: opus\n", mtime0)
+	writeCommand(t, dir, "raw.yaml", "kind: slash\ncommand: model\n", mtime0)
 	r := newRegistry(dir)
 	spec := func(name string) *commandSpec {
 		e, _ := r.lookup(name)
@@ -267,6 +360,15 @@ func TestShellArgsRules(t *testing.T) {
 		{"branch", "main dev", false},
 		{"branch", "", false},
 		{"review", "anything at all; $(x)", true},
+		// A shell argument never spans lines, whatever the pattern allows.
+		{"anytext", "a b", true},
+		{"anytext", "a\nb", false},
+		{"anytext", "a\rb", false},
+		// A slash template without {args} takes no arguments.
+		{"opus", "", true},
+		{"opus", "haiku", false},
+		{"focus", "tests", true},
+		{"raw", "anything", true},
 	} {
 		if err := spec(tc.name).checkArgs(tc.rest); (err == nil) != tc.ok {
 			t.Fatalf("%s %q: err = %v, want ok=%v", tc.name, tc.rest, err, tc.ok)
@@ -277,6 +379,9 @@ func TestShellArgsRules(t *testing.T) {
 	}
 	if err := spec("gitlog").checkArgs("x"); err == nil || !strings.Contains(err.Error(), "invalid arguments for `!gitlog`") {
 		t.Fatalf("pattern refusal = %v", err)
+	}
+	if err := spec("opus").checkArgs("haiku"); err == nil || !strings.Contains(err.Error(), "`!opus` takes no arguments") {
+		t.Fatalf("slash template refusal = %v", err)
 	}
 }
 

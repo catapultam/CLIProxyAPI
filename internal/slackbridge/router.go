@@ -105,35 +105,36 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 // registry (falling through to the Claude Code slash command of that name)
 // and is delivered as a command message the target's mod runs. adopt makes
 // the post's thread one of the target's threads, as for a top-level
-// "name: message". notFound is the reply when target is unknown.
+// "name: message". notFound is the reply when target is unknown. Replies go
+// on the command queue, so a flood of agent posts can't drop them.
 func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, notFound string, adopt bool) {
 	if !user.config {
 		log.Infof("slack: refused a command from non-owner %s", user.ID)
-		b.reply(ev, ownersOnlyCommands)
+		b.replyCommand(ev, ownersOnlyCommands)
 		return
 	}
 	name, rest, errParse := parseBang(text)
 	if errParse != nil {
-		b.reply(ev, errParse.Error())
+		b.replyCommand(ev, errParse.Error())
 		return
 	}
 	if name == listCommandsName {
-		b.reply(ev, b.commandList())
+		b.replyCommand(ev, b.commandList())
 		return
 	}
 	if target == "" {
-		b.reply(ev, howToCommand)
+		b.replyCommand(ev, howToCommand)
 		return
 	}
 	cmd := agentbus.Command{Name: name, Kind: agentbus.CommandSlash, Command: name, Args: rest}
 	if entry, found := b.cmdRegistry.lookup(name); found {
 		if entry.err != nil {
-			b.reply(ev, fmt.Sprintf("`!%s` is misconfigured.", name))
+			b.replyCommand(ev, fmt.Sprintf("`!%s` is misconfigured.", name))
 			return
 		}
 		if errArgs := entry.spec.checkArgs(rest); errArgs != nil {
 			log.Infof("slack: refused !%s from %s: arguments not accepted", name, user.ID)
-			b.reply(ev, errArgs.Error())
+			b.replyCommand(ev, errArgs.Error())
 			return
 		}
 		cmd = entry.spec.command(rest)
@@ -156,13 +157,13 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 	switch {
 	case errCapable == nil:
 	case errors.Is(errCapable, agentbus.ErrUnknownTarget):
-		b.reply(ev, notFound)
+		b.replyCommand(ev, notFound)
 		return
 	case errors.Is(errCapable, agentbus.ErrCommandUnsupported):
-		b.reply(ev, fmt.Sprintf("`%s` can't run commands (agentbus plugin %s+ required)", display, agentbus.MinCommandModVersion))
+		b.replyCommand(ev, fmt.Sprintf("`%s` can't run commands (agentbus plugin %s+ required)", display, agentbus.MinCommandModVersion))
 		return
 	default:
-		b.reply(ev, "Not delivered: "+escape(errCapable.Error()))
+		b.replyCommand(ev, "Not delivered: "+escape(errCapable.Error()))
 		return
 	}
 	b.state.recordReply(msgID, ev.Channel, replyThread(ev), sid)

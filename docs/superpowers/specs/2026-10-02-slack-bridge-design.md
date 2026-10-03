@@ -285,13 +285,18 @@ built in). Fields: `description`; `kind` (`slash`, `prompt` or `shell`);
 `linux` → list of strings, where `{args}` and `{out}` may only be whole
 elements and never the program), `output` (`text` default, or `image`, which
 needs an `{out}` element), `timeout_seconds` (1-120, default 30), and at most
-one of `args_pattern` (a regex, anchored as `^(?:…)$`) and `args_enum` (a
-list). A shell command with neither takes no arguments. Files are decoded
+one of `args_pattern` (a regex that must compile on its own, then anchored as
+`^(?:…)$`) and `args_enum` (a list). A shell command with neither takes no
+arguments, and a shell argument never contains a line break. A slash `args`
+template without `{args}` takes no arguments either. Files are decoded
 strictly (unknown keys, a second document or an empty file disable it). The
 directory is re-read on lookup when its listing or a file's size or mtime
-changes. A broken file is logged at Warn once per change and answers
-"`!name` is misconfigured"; it never falls through to the harness command of
-the same name. A registry name shadows a harness command.
+changes. A broken file, or a `.yaml` entry that can't be stat'ed or isn't a
+regular file, is logged at Warn once per change and answers "`!name` is
+misconfigured"; it never falls through to the harness command of the same
+name. A directory read error other than "not found" keeps the last good
+list. A registry name shadows a harness command. Command replies and
+refusals use the bridge's command queue.
 
 **Parsing and checks**, after the allowlist and dedup: `!name rest`, name
 `^[a-z0-9][a-z0-9:_-]{0,63}$` (lowercased), rest trimmed and at most 2000
@@ -303,8 +308,9 @@ arguments" or "invalid arguments for `!name`"), otherwise
 `{args}` is filled by the proxy; prompt and shell templates are sent as they
 are with `args` = rest, and the mod substitutes. The target must be
 `CommandCapable`: the session runs the mod (`mod`) and reported a mod version
-(`ModVersion`, from `/hello`) of 0.3.3 or later, compared numerically per
-segment; otherwise "`name` can't run commands (agentbus plugin 0.3.3+
+(`ModVersion`, from `/hello`'s `version` or `/wait`'s `v`) of 0.3.3 or later,
+compared numerically per segment. A mod-marked `/hello` or `/wait` without a
+valid version clears `ModVersion`. Otherwise: "`name` can't run commands (agentbus plugin 0.3.3+
 required)". A delivered command gets a :gear: reaction, its reply-map entry
 (so the mod's result lands in the asking thread), and an Info log with the
 owner's user ID, command name, kind and target address (never arguments or
@@ -315,7 +321,12 @@ output).
 by `Store.DeliverCommand`, which only the bridge calls; a client `/send`
 can't set either. A command message is never injected into a request (the
 model might obey it as text) and `/inbox` leaves it queued: it leaves the
-store only through `/wait`. There, after the claim and outside the store
-lock, the store asks the bridge (`OwnerChecker.IsOwner`) whether
+store only through `/wait`, and only to a waiter that itself reports
+`mod=1&v=` 0.3.3 or later (an older mod would show it to the model as an
+instruction); for other waiters it stays queued. After the claim and outside
+the store lock, the store asks the bridge (`OwnerChecker.IsOwner`) whether
 `slack_user_id` is still an owner; if not, or if no bridge can tell, the
-command is dropped, logged, and refused in its Slack thread.
+command is dropped, logged, and refused in its Slack thread. A command
+message expires 10 minutes after it was sent (`commandTTL`), checked
+wherever the inbox is read and again at hand-out; its thread is told
+"`!name` expired before the agent picked it up".

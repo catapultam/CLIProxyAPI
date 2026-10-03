@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -123,13 +124,14 @@ func TestCommandCapable(t *testing.T) {
 			t.Fatalf("version %s: CommandCapable = %q, %v, %v; want ok=%v", tc.version, sid, ok, err, tc.want)
 		}
 	}
-	// An invalid version is ignored, so the last valid one stands.
-	s.SetModVersion(sidA, "1.0.0")
+	// A missing or invalid version clears the recorded one: an older mod
+	// took over the session, so it fails closed.
 	for _, bad := range []string{"", "abc", "1.0.0; rm", "1..0", strings.Repeat("1.", 20) + "1"} {
+		s.SetModVersion(sidA, "1.0.0")
 		s.SetModVersion(sidA, bad)
-	}
-	if _, ok, _ := s.CommandCapable(sidA); !ok {
-		t.Fatal("an invalid version replaced a valid one")
+		if _, ok, _ := s.CommandCapable(sidA); ok {
+			t.Fatalf("version %q left the session capable", bad)
+		}
 	}
 
 	// A session with a version but no mod marker is not capable.
@@ -203,7 +205,7 @@ func TestInjectNeverInjectsCommandMessages(t *testing.T) {
 	if strings.Contains(got.body, "!model") {
 		t.Fatal("command message injected on a later request")
 	}
-	w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA+"&mod=1", "")
+	w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA+"&mod=1&v=0.3.3", "")
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"kind":"slash"`) || !strings.Contains(w.Body.String(), "opus-secret") {
 		t.Fatalf("wait = %d %s", w.Code, w.Body)
 	}
@@ -223,7 +225,7 @@ func TestHTTPInboxLeavesCommandMessagesForWait(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "plain") || strings.Contains(w.Body.String(), "compact") {
 		t.Fatalf("inbox = %s", w.Body)
 	}
-	w = do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA+"&mod=1", "")
+	w = do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA+"&mod=1&v=0.3.3", "")
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"command":"compact"`) {
 		t.Fatalf("wait = %d %s", w.Code, w.Body)
 	}
@@ -238,7 +240,7 @@ func TestHTTPSendCannotSetCommand(t *testing.T) {
 	if w := do(r, http.MethodPost, "/v1/agentbus/send", body); w.Code != http.StatusOK {
 		t.Fatalf("send = %d %s", w.Code, w.Body)
 	}
-	w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidB+"&mod=1", "")
+	w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidB+"&mod=1&v=0.3.3", "")
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "obey me") {
 		t.Fatalf("wait = %d %s", w.Code, w.Body)
 	}
@@ -251,7 +253,7 @@ func TestHTTPSendCannotSetCommand(t *testing.T) {
 
 func waitMessages(t *testing.T, r *gin.Engine, sid string) []Message {
 	t.Helper()
-	w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sid+"&mod=1", "")
+	w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sid+"&mod=1&v=0.3.3", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("wait = %d %s", w.Code, w.Body)
 	}
@@ -324,5 +326,115 @@ func TestWaitDropsCommandsWithoutAnOwnerChecker(t *testing.T) {
 	msgs = waitMessages(t, r, sidA)
 	if len(msgs) != 1 || msgs[0].Command != nil {
 		t.Fatalf("wait returned %+v", msgs)
+	}
+}
+
+func TestWaitReleasesCommandsOnlyToCapableWaiters(t *testing.T) {
+	s, r := newTestServer(t)
+	s.SetBridge(&fakeOwnerBridge{owners: map[string]bool{"UALEX": true}})
+	capableSession(s, sidA, "/a", "")
+	if _, _, err := s.DeliverCommand(sidA, compactCmd, "alex", "UALEX"); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{"&mod=1", "&mod=1&v=0.3.2", "&mod=1&v=junk", "&v=0.3.3"} {
+		capableSession(s, sidA, "/a", "")
+		if _, _, err := s.Deliver(sidA, "plain", "alex"); err != nil {
+			t.Fatal(err)
+		}
+		w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA+query, "")
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "plain") || strings.Contains(w.Body.String(), "compact") {
+			t.Fatalf("wait%s = %d %s", query, w.Code, w.Body)
+		}
+	}
+	// The command is still queued for a capable waiter.
+	capableSession(s, sidA, "/a", "")
+	msgs := waitMessages(t, r, sidA)
+	if len(msgs) != 1 || msgs[0].Command == nil {
+		t.Fatalf("wait v=0.3.3 = %+v", msgs)
+	}
+}
+
+func TestWaitWithoutVersionClearsCapability(t *testing.T) {
+	s, r := newTestServer(t)
+	capableSession(s, sidA, "/a", "")
+	if _, _, err := s.Deliver(sidA, "plain", "alex"); err != nil {
+		t.Fatal(err)
+	}
+	do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA+"&mod=1", "")
+	if _, ok, _ := s.CommandCapable(sidA); ok {
+		t.Fatal("an unversioned mod waiter left the session capable")
+	}
+}
+
+func TestHTTPHelloRecordsModVersion(t *testing.T) {
+	s, r := newTestServer(t)
+	hello := func(body string) {
+		t.Helper()
+		if w := do(r, http.MethodPost, "/v1/agentbus/hello", body); w.Code != http.StatusOK {
+			t.Fatalf("hello = %d %s", w.Code, w.Body)
+		}
+	}
+	hello(`{"session":"` + sidA + `","machine":"pc","mod":true,"version":"0.3.3"}`)
+	if _, ok, _ := s.CommandCapable(sidA); !ok {
+		t.Fatal("hello with version 0.3.3 not capable")
+	}
+	// A hello without the mod marker (curl, legacy hook) leaves it alone.
+	hello(`{"session":"` + sidA + `","machine":"pc"}`)
+	if _, ok, _ := s.CommandCapable(sidA); !ok {
+		t.Fatal("a non-mod hello cleared the version")
+	}
+	// A mod hello without a version is an older mod: not capable.
+	hello(`{"session":"` + sidA + `","machine":"pc","mod":true}`)
+	if _, ok, _ := s.CommandCapable(sidA); ok {
+		t.Fatal("an unversioned mod hello left the session capable")
+	}
+}
+
+func TestCommandsExpire(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	clock := &fakeClock{now: t0}
+	s := NewStore("", clock.Now)
+	r := gin.New()
+	s.Register(r.Group("/v1/agentbus"))
+	fb := &fakeOwnerBridge{owners: map[string]bool{"UALEX": true}}
+	s.SetBridge(fb)
+	capableSession(s, sidA, "/a", "flyer")
+	_, oldID, err := s.DeliverCommand(sidA, compactCmd, "alex", "UALEX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(commandTTL - time.Second)
+	_, freshID, err := s.DeliverCommand(sidA, Command{Name: "clear", Kind: "slash", Command: "clear"}, "alex", "UALEX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = s.Deliver(sidA, "plain", "alex"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Second)
+	msgs := waitMessages(t, r, sidA)
+	if len(msgs) != 2 || msgs[0].ID != freshID || msgs[1].Body != "plain" {
+		t.Fatalf("wait = %+v", msgs)
+	}
+	posts := fb.postsCopy()
+	if len(posts) != 1 || posts[0].ReplyTo != oldID || posts[0].SessionID != sidA || !strings.Contains(posts[0].Body, "`!compact` expired before the agent picked it up") {
+		t.Fatalf("expiry posts = %+v", posts)
+	}
+
+	// Pending (like /inbox and injection) expires commands too.
+	_, queuedID, err := s.DeliverCommand(sidA, compactCmd, "alex", "UALEX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Pending(sidA) {
+		t.Fatal("fresh command not pending")
+	}
+	clock.Advance(commandTTL)
+	if s.Pending(sidA) {
+		t.Fatal("expired command still pending")
+	}
+	posts = fb.postsCopy()
+	if len(posts) != 2 || posts[1].ReplyTo != queuedID {
+		t.Fatalf("expiry posts = %+v", posts)
 	}
 }

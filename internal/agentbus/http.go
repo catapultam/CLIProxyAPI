@@ -104,6 +104,9 @@ type helloRequest struct {
 	Cwd     string `json:"cwd"`
 	Name    string `json:"name"`
 	Mod     bool   `json:"mod"`
+	// Version is the mod's version; with mod set, empty means a mod older
+	// than commands.
+	Version string `json:"version"`
 }
 
 func (s *Store) handleHello(c *gin.Context) {
@@ -113,6 +116,10 @@ func (s *Store) handleHello(c *gin.Context) {
 		return
 	}
 	s.Hello(strings.TrimSpace(req.Session), req.Machine, req.Cwd, req.Name, req.Mod)
+	if req.Mod {
+		// A mod without a version is older than commands: clear the record.
+		s.SetModVersion(strings.TrimSpace(req.Session), req.Version)
+	}
 	c.JSON(http.StatusOK, gin.H{"address": s.Address(strings.TrimSpace(req.Session))})
 }
 
@@ -142,7 +149,14 @@ func (s *Store) handleWait(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
 		return
 	}
-	s.Hello(id, c.Query("machine"), c.Query("cwd"), c.Query("name"), c.Query("mod") == "1")
+	// version is this waiter's own mod version. Only a mod-marked waiter has
+	// one, and only a waiter whose version can run commands gets them.
+	mod, version := c.Query("mod") == "1", ""
+	s.Hello(id, c.Query("machine"), c.Query("cwd"), c.Query("name"), mod)
+	if mod {
+		version = c.Query("v")
+		s.SetModVersion(id, version)
+	}
 	gen := s.NewWaiter(id)
 	timeout := s.waitTimeout
 	if timeout <= 0 {
@@ -157,7 +171,7 @@ func (s *Store) handleWait(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "superseded by a newer waiter"})
 			return
 		}
-		if msgs := s.ClaimForWait(id); len(msgs) > 0 {
+		if msgs := s.ClaimForWait(id, version); len(msgs) > 0 {
 			c.JSON(http.StatusOK, gin.H{"messages": msgs})
 			return
 		}

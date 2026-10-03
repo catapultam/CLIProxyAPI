@@ -76,12 +76,26 @@ type commandSpec struct {
 }
 
 // checkArgs reports why rest isn't acceptable for c, as a reply to the
-// owner. Slash and prompt commands take free-form arguments.
+// owner. Prompt commands, and slash commands whose args template uses
+// {args} (or that have none), take free-form arguments. A slash template
+// without {args}, and a shell command without args_pattern or args_enum,
+// take none.
 func (c *commandSpec) checkArgs(rest string) error {
-	if c.Kind != agentbus.CommandShell {
+	noArgs := fmt.Errorf("`!%s` takes no arguments.", c.Name)
+	switch c.Kind {
+	case agentbus.CommandSlash:
+		if c.Args != "" && !strings.Contains(c.Args, argsPlaceholder) && rest != "" {
+			return noArgs
+		}
+		return nil
+	case agentbus.CommandShell:
+	default:
 		return nil
 	}
 	invalid := fmt.Errorf("invalid arguments for `!%s`.", c.Name)
+	if strings.ContainsAny(rest, "\r\n") {
+		return invalid
+	}
 	switch {
 	case c.argsPattern != nil:
 		if !c.argsPattern.MatchString(rest) {
@@ -92,7 +106,7 @@ func (c *commandSpec) checkArgs(rest string) error {
 			return invalid
 		}
 	case rest != "":
-		return fmt.Errorf("`!%s` takes no arguments.", c.Name)
+		return noArgs
 	}
 	return nil
 }
@@ -230,6 +244,12 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 		return errors.New("declare args_pattern or args_enum, not both")
 	}
 	if f.ArgsPattern != "" {
+		// Compile the pattern on its own first: one with unbalanced groups,
+		// like "a)|(.*", would otherwise close the wrapper's group and
+		// escape the anchors.
+		if _, errRaw := regexp.Compile(f.ArgsPattern); errRaw != nil {
+			return fmt.Errorf("args_pattern: %w", errRaw)
+		}
 		re, errCompile := regexp.Compile(`^(?:` + f.ArgsPattern + `)$`)
 		if errCompile != nil {
 			return fmt.Errorf("args_pattern: %w", errCompile)
@@ -259,6 +279,9 @@ type registry struct {
 	// file is logged once per change.
 	warned  map[string]string
 	dirWarn string
+	// readDir and stat are os.ReadDir and os.Stat (tests replace them).
+	readDir func(string) ([]os.DirEntry, error)
+	stat    func(string) (os.FileInfo, error)
 }
 
 // newRegistry returns the registry in dir, or nil when dir is empty.
@@ -266,7 +289,7 @@ func newRegistry(dir string) *registry {
 	if strings.TrimSpace(dir) == "" {
 		return nil
 	}
-	return &registry{dir: dir, warned: map[string]string{}}
+	return &registry{dir: dir, warned: map[string]string{}, readDir: os.ReadDir, stat: os.Stat}
 }
 
 // lookup returns the entry for name; a nil registry has none.
@@ -297,21 +320,27 @@ func (r *registry) list() []registryEntry {
 	return out
 }
 
+// commandFileStamp is one .yaml entry: its name, a stamp that changes when
+// it does, and, when stat failed or it isn't a regular file, why it can't
+// be loaded.
 type commandFileStamp struct {
 	file, stamp string
+	err         error
 }
 
 func (r *registry) refreshLocked() {
 	files, errDir := r.scanLocked()
 	if errDir != nil {
-		r.entries, r.stamp, r.loaded = nil, "", false
 		if errors.Is(errDir, fs.ErrNotExist) {
-			r.dirWarn = ""
+			// No directory, no commands.
+			r.entries, r.stamp, r.loaded, r.dirWarn = nil, "", false, ""
 			return
 		}
+		// Any other read error keeps the last good entries, so a passing
+		// glitch can't turn registry commands into harness passthroughs.
 		if msg := errDir.Error(); msg != r.dirWarn {
 			r.dirWarn = msg
-			log.Warnf("slack: read agent commands: %v", errDir)
+			log.Warnf("slack: read agent commands (keeping the last good list): %v", errDir)
 		}
 		return
 	}
@@ -328,7 +357,11 @@ func (r *registry) refreshLocked() {
 	for _, f := range files {
 		present[f.file] = true
 		name := strings.TrimSuffix(f.file, commandFileExt)
-		spec, errLoad := r.loadFile(f.file, name)
+		errLoad := f.err
+		var spec *commandSpec
+		if errLoad == nil {
+			spec, errLoad = r.loadFile(f.file, name)
+		}
 		if errLoad == nil {
 			entries[name] = registryEntry{name: name, spec: spec}
 			delete(r.warned, f.file)
@@ -350,26 +383,32 @@ func (r *registry) refreshLocked() {
 	r.entries, r.stamp, r.loaded = entries, all.String(), true
 }
 
-// scanLocked lists the registry's .yaml files with a stamp each (name, size,
-// mtime), sorted by name.
+// scanLocked lists the registry's .yaml entries with a stamp each (name,
+// size, mtime), sorted by name. An entry that can't be stat'ed or isn't a
+// regular file is listed with its error, so it shows up as misconfigured.
 func (r *registry) scanLocked() ([]commandFileStamp, error) {
-	dirEntries, errRead := os.ReadDir(r.dir)
+	dirEntries, errRead := r.readDir(r.dir)
 	if errRead != nil {
 		return nil, errRead
 	}
 	var out []commandFileStamp
 	for _, de := range dirEntries {
-		if !strings.HasSuffix(de.Name(), commandFileExt) {
+		file := de.Name()
+		if !strings.HasSuffix(file, commandFileExt) {
 			continue
 		}
-		info, errStat := os.Stat(filepath.Join(r.dir, de.Name()))
-		if errStat != nil || !info.Mode().IsRegular() {
-			continue
+		info, errStat := r.stat(filepath.Join(r.dir, file))
+		switch {
+		case errStat != nil:
+			out = append(out, commandFileStamp{file: file, stamp: file + "\x00stat\x00" + errStat.Error(), err: errStat})
+		case !info.Mode().IsRegular():
+			out = append(out, commandFileStamp{file: file, stamp: file + "\x00mode\x00" + info.Mode().String(), err: errors.New("not a regular file")})
+		default:
+			out = append(out, commandFileStamp{
+				file:  file,
+				stamp: fmt.Sprintf("%s\x00%d\x00%d", file, info.Size(), info.ModTime().UnixNano()),
+			})
 		}
-		out = append(out, commandFileStamp{
-			file:  de.Name(),
-			stamp: fmt.Sprintf("%s\x00%d\x00%d", de.Name(), info.Size(), info.ModTime().UnixNano()),
-		})
 	}
 	return out, nil
 }

@@ -120,7 +120,16 @@ func versionSegment(parts []string, i int) int {
 // the attached bridge. Otherwise (the sender was demoted, no bridge is
 // attached, or the bridge can't tell) it is dropped, logged, and refused in
 // the Slack thread it came from. Owners are checked without the store lock.
-func (s *Store) ClaimForWait(id string) []Message {
+//
+// waiterVersion is the mod version the requesting waiter itself reported
+// (/wait's v parameter). Below MinCommandModVersion, or absent, the waiter
+// can't run commands (an older mod would show one to the model as an
+// instruction), so command messages stay queued, where they expire after
+// commandTTL.
+func (s *Store) ClaimForWait(id, waiterVersion string) []Message {
+	if !versionAtLeast(strings.TrimSpace(waiterVersion), MinCommandModVersion) {
+		return s.ClaimPlain(id)
+	}
 	msgs := s.Claim(id)
 	hasCommand := false
 	for _, m := range msgs {
@@ -132,24 +141,28 @@ func (s *Store) ClaimForWait(id string) []Message {
 	if !hasCommand {
 		return msgs
 	}
-	bridge := s.currentBridge()
-	owners, _ := bridge.(OwnerChecker)
+	owners, _ := s.currentBridge().(OwnerChecker)
+	now := s.now()
 	out := make([]Message, 0, len(msgs))
+	var notices []commandNotice
 	for _, m := range msgs {
-		if m.Command == nil || (owners != nil && m.SlackUserID != "" && owners.IsOwner(m.SlackUserID)) {
+		switch {
+		case m.Command == nil:
 			out = append(out, m)
-			continue
+		case commandExpired(m, now):
+			// Claim expires these already; this guards the hand-out itself.
+			log.Infof("agentbus: command %s (!%s) for %s expired unclaimed", m.ID, m.Command.Name, m.To)
+			notices = append(notices, expiredNotice(id, m))
+		case owners != nil && m.SlackUserID != "" && owners.IsOwner(m.SlackUserID):
+			out = append(out, m)
+		default:
+			log.Warnf("agentbus: dropped command %s (!%s) for %s: sender %s is not an owner now", m.ID, m.Command.Name, m.To, m.SlackUserID)
+			notices = append(notices, commandNotice{sessionID: id, msgID: m.ID,
+				body: fmt.Sprintf("`!%s` was not run: %s may no longer run commands.", m.Command.Name, m.SlackUser)})
 		}
-		log.Warnf("agentbus: dropped command %s (!%s) for %s: sender %s is not an owner now", m.ID, m.Command.Name, m.To, m.SlackUserID)
-		if bridge == nil {
-			continue
-		}
-		refusal, errOut := s.outboundFor(id, fmt.Sprintf("`!%s` was not run: %s may no longer run commands.", m.Command.Name, m.SlackUser))
-		if errOut != nil {
-			continue
-		}
-		refusal.ReplyTo = m.ID
-		bridge.Post(refusal)
+	}
+	if len(notices) > 0 {
+		s.postNotices(notices...)
 	}
 	return out
 }

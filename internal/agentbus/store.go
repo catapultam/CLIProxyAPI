@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,13 +17,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
 	// MaxBodyBytes caps one message body.
 	MaxBodyBytes = 16 * 1024
 
-	messageTTL      = 7 * 24 * time.Hour
+	messageTTL = 7 * 24 * time.Hour
+	// commandTTL is how long a command message waits for the mod. An owner
+	// expects a command to run now, not whenever the session comes back.
+	commandTTL      = 10 * time.Minute
 	idleWithin      = 2 * time.Minute
 	awayWithin      = 30 * time.Minute
 	offlineListFor  = 24 * time.Hour
@@ -164,6 +170,9 @@ type Store struct {
 	waitTimeout time.Duration
 	// uploadSlots holds one token per image upload in progress.
 	uploadSlots chan struct{}
+	// notices are command notices queued under mu (by expireLocked) for
+	// postNotices to hand to the bridge once mu is released.
+	notices []commandNotice
 }
 
 // NewStore returns an empty store persisted at path (empty disables saving).
@@ -244,13 +253,14 @@ func (s *Store) Hello(id, machine, cwd, name string, mod bool) {
 	s.dirty = true
 }
 
-// SetModVersion records the agentbus mod version a known session reports.
-// A value validModVersion rejects (including empty) is ignored, so the last
-// valid version stands.
+// SetModVersion records the agentbus mod version a known session's mod
+// reports. Callers pass what a mod-marked /hello or /wait carried; an empty
+// or invalid value clears the record, since an older mod (which sends none)
+// has taken over the session and can't run commands.
 func (s *Store) SetModVersion(id, version string) {
 	version = strings.TrimSpace(version)
 	if !validModVersion.MatchString(version) {
-		return
+		version = ""
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -451,11 +461,19 @@ func (s *Store) enqueueLocked(target *session, msg Message) {
 	s.dirty = true
 }
 
+// expireLocked drops a session's messages older than messageTTL, and command
+// messages older than commandTTL. Each expired command queues a notice for
+// its Slack thread; the caller must call postNotices after releasing s.mu.
 func (s *Store) expireLocked(sess *session) {
-	cutoff := s.now().Add(-messageTTL)
+	now := s.now()
+	cutoff := now.Add(-messageTTL)
 	kept := sess.Inbox[:0]
 	for _, m := range sess.Inbox {
-		if m.CreatedAt.After(cutoff) {
+		switch {
+		case m.Command != nil && commandExpired(m, now):
+			log.Infof("agentbus: command %s (!%s) for %s expired unclaimed", m.ID, m.Command.Name, m.To)
+			s.notices = append(s.notices, expiredNotice(sess.ID, m))
+		case m.CreatedAt.After(cutoff):
 			kept = append(kept, m)
 		}
 	}
@@ -463,6 +481,47 @@ func (s *Store) expireLocked(sess *session) {
 		s.dirty = true
 	}
 	sess.Inbox = kept
+}
+
+// commandExpired reports whether command message m is older than commandTTL.
+func commandExpired(m Message, now time.Time) bool {
+	return !m.CreatedAt.After(now.Add(-commandTTL))
+}
+
+// commandNotice is a bridge post about a command message, made in the Slack
+// thread the command came from.
+type commandNotice struct {
+	sessionID, msgID, body string
+}
+
+func expiredNotice(sessionID string, m Message) commandNotice {
+	return commandNotice{sessionID: sessionID, msgID: m.ID, body: fmt.Sprintf("`!%s` expired before the agent picked it up.", m.Command.Name)}
+}
+
+// postNotices hands extra and the notices expireLocked queued to the bridge
+// (dropping them when Slack is off). It takes s.mu itself, so callers call
+// it after releasing the lock, and it posts without holding it.
+func (s *Store) postNotices(extra ...commandNotice) {
+	s.mu.Lock()
+	notices := append(s.notices, extra...)
+	s.notices = nil
+	bridge := s.bridge
+	var outs []Outbound
+	if bridge != nil {
+		for _, n := range notices {
+			sess, ok := s.byID[n.sessionID]
+			if !ok {
+				continue
+			}
+			out := s.outboundLocked(n.sessionID, sess, n.body)
+			out.ReplyTo = n.msgID
+			outs = append(outs, out)
+		}
+	}
+	s.mu.Unlock()
+	for _, out := range outs {
+		bridge.Post(out)
+	}
 }
 
 // Claim removes and returns every pending message for a session.
@@ -479,6 +538,8 @@ func (s *Store) ClaimPlain(id string) []Message {
 // claimWhere removes and returns the pending messages take accepts, in
 // order, and leaves the rest queued.
 func (s *Store) claimWhere(id string, take func(Message) bool) []Message {
+	// Deferred first, so it runs after the unlock below.
+	defer s.postNotices()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.byID[id]
@@ -510,6 +571,8 @@ func splitInbox(msgs []Message, take func(Message) bool) (taken, kept []Message)
 
 // Pending reports whether a session has unclaimed messages.
 func (s *Store) Pending(id string) bool {
+	// Deferred first, so it runs after the unlock below.
+	defer s.postNotices()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.byID[id]
@@ -676,6 +739,7 @@ func (s *Store) Save() error {
 	}
 	s.dirty = false
 	s.mu.Unlock()
+	s.postNotices()
 
 	data, errMarshal := json.Marshal(state)
 	if errMarshal == nil {

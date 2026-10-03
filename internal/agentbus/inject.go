@@ -164,6 +164,7 @@ func (s *Store) planInjection(sid, base string) injection {
 	}
 	name := sess.Name
 	s.mu.Unlock()
+	s.postNotices()
 
 	if !plan.note && len(plan.messages) == 0 {
 		return injection{}
