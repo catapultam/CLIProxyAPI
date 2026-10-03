@@ -2,6 +2,7 @@ package slackbridge
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
@@ -273,7 +274,7 @@ func TestForeignConversationTagIsDelivered(t *testing.T) {
 	nameSession(t, bus, sidB, "bridge")
 	b.handleEvent("EvF1", foreignMsg("UALEX", "bridge: hi", "1700002700.000001", ""))
 	msgs := bus.Claim(sidB)
-	if len(msgs) != 1 || msgs[0].Body != "hi" || !msgs[0].FromUser || msgs[0].Via != "" {
+	if len(msgs) != 1 || msgs[0].Body != "hi" || !msgs[0].FromUser || msgs[0].Via != agentbus.ViaGroup {
 		t.Fatalf("sidB msgs = %+v", msgs)
 	}
 	if r := lastRecord(b); r.Channel != "GMPIM1" || r.ThreadTS != "1700002700.000001" || r.Session != sidB || r.DMUser != "" {
@@ -291,10 +292,11 @@ func TestForeignConversationTagIsDelivered(t *testing.T) {
 		t.Fatalf("answer = %+v", got)
 	}
 
-	// In a thread there, with the @ form.
+	// In the thread under it, which now goes to bridge: a tag of bridge
+	// itself leaves the text whole, as in a channel thread.
 	b.handleEvent("EvF2", foreignMsg("UALEX", "@bridge and this", "1700002700.000003", "1700002700.000001"))
 	msgs = bus.Claim(sidB)
-	if len(msgs) != 1 || msgs[0].Body != "and this" {
+	if len(msgs) != 1 || msgs[0].Body != "@bridge and this" {
 		t.Fatalf("sidB msgs = %+v", msgs)
 	}
 	sendReply(t, b, bus, sidB, "ok", msgs[0].ID)
@@ -306,7 +308,7 @@ func TestForeignConversationTagIsDelivered(t *testing.T) {
 	other := msg("UALEX", "bridge: from general", "1700002700.000004", "")
 	other.Channel, other.ChannelType = "CGEN", "channel"
 	b.handleEvent("EvF3", other)
-	if got := bus.Claim(sidB); len(got) != 1 || got[0].Body != "from general" || got[0].Via != "" {
+	if got := bus.Claim(sidB); len(got) != 1 || got[0].Body != "from general" || got[0].Via != agentbus.ViaGroup {
 		t.Fatalf("sidB msgs = %+v", got)
 	}
 }
@@ -356,5 +358,104 @@ func TestForeignConversationTagCommand(t *testing.T) {
 	}
 	if bus.Pending(sidB) {
 		t.Fatal("a non-owner's command was delivered")
+	}
+}
+
+func TestBotMentionThenTagIsATag(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	nameSession(t, bus, sidB, "bridge")
+	root := threadOf(t, b, bus)
+	posts := len(f.callsTo("chat.postMessage"))
+	for i, ev := range []messageEvent{
+		msg("UALEX", "<@UBOT> bridge: top level", "1700003100.000001", ""),
+		msg("UALEX", "<@UBOT> @bridge in a thread", "1700003100.000002", root),
+		dmMsg("UALEX", "<@UBOT> bridge: in a DM", "1700003100.000003", ""),
+		foreignMsg("UALEX", "<@UBOT> bridge: in a group", "1700003100.000004", ""),
+	} {
+		b.handleEvent("EvBM"+string(rune('a'+i)), ev)
+		want := []string{"top level", "in a thread", "in a DM", "in a group"}[i]
+		if got := bus.Claim(sidB); len(got) != 1 || got[0].Body != want {
+			t.Fatalf("%d: sidB msgs = %+v", i, got)
+		}
+	}
+	if bus.Pending(sidA) {
+		t.Fatalf("sidA got %+v", bus.Claim(sidA))
+	}
+	drainJobs(t, b)
+	// Only receipts went out: no help replies.
+	if n := len(f.callsTo("chat.postMessage")); n != posts {
+		t.Fatalf("posts %d -> %d", posts, n)
+	}
+	// A mention that isn't a command or a tag still gets help in the
+	// channel, and nothing in a group the bot was only added to.
+	b.handleEvent("EvBMh", msg("UALEX", "<@UBOT> what now", "1700003100.000005", ""))
+	b.handleEvent("EvBMg", foreignMsg("UALEX", "<@UBOT> what now", "1700003100.000006", ""))
+	drainJobs(t, b)
+	if n := len(f.callsTo("chat.postMessage")); n != posts+1 || !strings.Contains(lastPostText(f), "allow @person") {
+		t.Fatalf("posts %d -> %d: %q", posts, n, lastPostText(f))
+	}
+}
+
+func TestUnlinkedThreadReplyAfterTagGoesToTheTaggedAgent(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	nameSession(t, bus, sidB, "bridge")
+	b.handleEvent("EvTR1", foreignMsg("UALEX", "bridge: look at this", "1700003200.000001", ""))
+	tagged := claimOne(t, bus, sidB)
+	sendReply(t, b, bus, sidB, "looked", tagged.ID)
+	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["thread_ts"] != "1700003200.000001" {
+		t.Fatalf("answer = %+v", got)
+	}
+	// A plain reply under it reaches the tagged agent, marked as from a group.
+	b.handleEvent("EvTR2", foreignMsg("UALEX", "and now?", "1700003200.000002", "1700003200.000001"))
+	if m := claimOne(t, bus, sidB); m.Body != "and now?" || !m.FromUser || m.Via != agentbus.ViaGroup {
+		t.Fatalf("thread reply = %+v", m)
+	}
+	// A tag inside a thread makes its thread reach that agent too.
+	b.handleEvent("EvTR3", foreignMsg("UALEX", "flyer: you too", "1700003200.000004", "1700003200.000003"))
+	claimOne(t, bus, sidA)
+	b.handleEvent("EvTR4", foreignMsg("UALEX", "follow-up", "1700003200.000005", "1700003200.000003"))
+	if m := claimOne(t, bus, sidA); m.Body != "follow-up" {
+		t.Fatalf("follow-up = %+v", m)
+	}
+	// Not for someone who isn't allowed, and not in a thread no agent was
+	// tagged in.
+	b.handleEvent("EvTR5", foreignMsg("UEVE", "me too", "1700003200.000006", "1700003200.000001"))
+	b.handleEvent("EvTR6", foreignMsg("UALEX", "chat", "1700003200.000008", "1700003200.000007"))
+	if bus.Pending(sidA) || bus.Pending(sidB) {
+		t.Fatalf("delivered: %+v %+v", bus.Claim(sidA), bus.Claim(sidB))
+	}
+	// Under the agent's own top-level post there (an answer to its link
+	// notice), a reply reaches it.
+	b.handleEvent("EvTR7", foreignMsg("UALEX", "<@UBOT> link bridge", "1700003200.000009", ""))
+	drainJobs(t, b)
+	notice := claimOne(t, bus, sidB)
+	b.handleEvent("EvTR8", foreignMsg("UALEX", "<@UBOT> unlink", "1700003200.000010", ""))
+	drainJobs(t, b)
+	claimOne(t, bus, sidB) // the unlink notice
+	sendReply(t, b, bus, sidB, "posting at the top", notice.ID)
+	if got := lastPost(t, f); got["channel"] != "CAGENTS" {
+		t.Fatalf("answer to the notice after unlink = %+v", got)
+	}
+}
+
+func TestThreadUnderAgentTopLevelPostInGroup(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	nameSession(t, bus, sidB, "bridge")
+	b.handleEvent("EvAT1", foreignMsg("UALEX", "<@UBOT> link bridge", "1700003300.000001", ""))
+	drainJobs(t, b)
+	notice := claimOne(t, bus, sidB)
+	sendReply(t, b, bus, sidB, "hello group", notice.ID)
+	post := lastPost(t, f)
+	if post["channel"] != "GMPIM1" || post["thread_ts"] != "" {
+		t.Fatalf("post = %+v", post)
+	}
+	ts := lastPostTS(f)
+	b.handleEvent("EvAT2", foreignMsg("UALEX", "<@UBOT> unlink", "1700003300.000002", ""))
+	drainJobs(t, b)
+	claimOne(t, bus, sidB)
+	// Unlinked, a reply under the agent's own post still reaches it.
+	b.handleEvent("EvAT3", foreignMsg("UALEX", "about that", "1700003300.000003", ts))
+	if m := claimOne(t, bus, sidB); m.Body != "about that" {
+		t.Fatalf("msg = %+v", m)
 	}
 }

@@ -1,6 +1,7 @@
 package slackbridge
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
@@ -75,19 +76,35 @@ func TestParseAtTagged(t *testing.T) {
 
 func TestParseCommand(t *testing.T) {
 	cases := []struct {
-		in, verb, user string
-		isCmd          bool
+		in        string
+		want      botCommand
+		rest      string
+		mentioned bool
 	}{
-		{"<@UBOT> allow <@UJANE>", "allow", "UJANE", true},
-		{"<@UBOT>  Remove  <@UJANE|jane>", "remove", "UJANE", true},
-		{"<@UBOT> hello", "", "", true},
-		{"<@UOTHER> allow <@UJANE>", "", "", false},
-		{"flyer: <@UBOT> allow <@UJANE>", "", "", false},
+		{"<@UBOT> allow <@UJANE>", botCommand{verb: "allow", users: []string{"UJANE"}, ok: true}, "allow <@UJANE>", true},
+		{"<@UBOT>  Remove  <@UJANE|jane>", botCommand{verb: "remove", users: []string{"UJANE"}, ok: true}, "Remove  <@UJANE|jane>", true},
+		{"<@UBOT> allow", botCommand{verb: "allow"}, "allow", true},
+		{"<@UBOT> hello", botCommand{}, "hello", true},
+		{"<@UBOT> bridge: hi", botCommand{}, "bridge: hi", true},
+		{"<@UBOT>", botCommand{}, "", true},
+		{"<@UOTHER> allow <@UJANE>", botCommand{}, "", false},
+		{"flyer: <@UBOT> allow <@UJANE>", botCommand{}, "", false},
+		{"<@UBOT> chat <@UBOB> <@UCAROL|carol> with flyer", botCommand{verb: "chat", users: []string{"UBOB", "UCAROL"}, agent: "flyer", ok: true}, "chat <@UBOB> <@UCAROL|carol> with flyer", true},
+		{"<@UBOT> chat <@UBOB> With @pc/flyer-aaaaaa", botCommand{verb: "chat", users: []string{"UBOB"}, agent: "pc/flyer-aaaaaa", ok: true}, "chat <@UBOB> With @pc/flyer-aaaaaa", true},
+		{"<@UBOT> chat bob with flyer", botCommand{verb: "chat"}, "chat bob with flyer", true},
+		{"<@UBOT> chat <@UBOB> flyer", botCommand{verb: "chat"}, "chat <@UBOB> flyer", true},
+		{"<@UBOT> chat <@UBOB> with <@UALEX>", botCommand{verb: "chat", users: []string{"UBOB"}}, "chat <@UBOB> with <@UALEX>", true},
+		{"<@UBOT> dm <@UBOB> with flyer", botCommand{verb: "dm", users: []string{"UBOB"}, agent: "flyer", ok: true}, "dm <@UBOB> with flyer", true},
+		{"<@UBOT> dm <@UBOB> <@UCAROL> with flyer", botCommand{verb: "dm", users: []string{"UBOB", "UCAROL"}, agent: "flyer"}, "dm <@UBOB> <@UCAROL> with flyer", true},
+		{"<@UBOT> link flyer", botCommand{verb: "link", agent: "flyer", ok: true}, "link flyer", true},
+		{"<@UBOT> LINK", botCommand{verb: "link"}, "LINK", true},
+		{"<@UBOT> unlink", botCommand{verb: "unlink", ok: true}, "unlink", true},
+		{"<@UBOT> unlink flyer", botCommand{verb: "unlink"}, "unlink flyer", true},
 	}
 	for _, c := range cases {
-		verb, user, isCmd := parseCommand(c.in, "UBOT")
-		if verb != c.verb || user != c.user || isCmd != c.isCmd {
-			t.Errorf("parseCommand(%q) = %q %q %v", c.in, verb, user, isCmd)
+		got, rest, mentioned := parseCommand(c.in, "UBOT")
+		if !reflect.DeepEqual(got, c.want) || rest != c.rest || mentioned != c.mentioned {
+			t.Errorf("parseCommand(%q) = %+v %q %v, want %+v %q %v", c.in, got, rest, mentioned, c.want, c.rest, c.mentioned)
 		}
 	}
 }

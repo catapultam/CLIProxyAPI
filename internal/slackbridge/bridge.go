@@ -89,6 +89,15 @@ type Bridge struct {
 	dmMu       sync.Mutex
 	dmChannels map[string]string
 
+	// guestNames caches guest user ID -> their sanitized Slack display name.
+	// guestQueued counts each guest's messages waiting on the job queue for
+	// a users.info lookup; while any wait, later ones queue behind them, so
+	// a guest's messages stay in order. guestMu guards both and is never
+	// held across a Slack call or a Store call.
+	guestMu     sync.Mutex
+	guestNames  map[string]string
+	guestQueued map[string]int
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	jobsWG sync.WaitGroup
@@ -103,7 +112,7 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 	if errLoad != nil {
 		log.Warnf("slack: load state (starting empty): %v", errLoad)
 	}
-	return &Bridge{
+	b := &Bridge{
 		cfg:         cfg,
 		bus:         bus,
 		api:         newAPI(cfg.APIBase),
@@ -118,7 +127,11 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 		cmdSeq:      map[string]uint64{},
 		opening:     map[string]*openGate{},
 		dmChannels:  map[string]string{},
-	}, nil
+		guestNames:  map[string]string{},
+		guestQueued: map[string]int{},
+	}
+	b.refreshLinks()
+	return b, nil
 }
 
 func defaultBackoff(attempt int) time.Duration {
@@ -297,6 +310,15 @@ func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool) {
 		if r.DMUser != "" {
 			if _, allowed := b.state.user(r.DMUser); !allowed {
 				log.Warnf("slack: %s answered message %s from the DM of %s, who is no longer allowed; posting in its own thread instead", o.Address, o.ReplyTo, r.DMUser)
+				return postTarget{}, false
+			}
+		}
+		// A guest's message or the link notice reached the session only
+		// through the conversation's link; once that is gone, so is the
+		// session's way in.
+		if r.Link {
+			if l, linked := b.conversationLink(r.Channel); !linked || l.Session != o.SessionID {
+				log.Warnf("slack: %s answered message %s from conversation %s, which is no longer linked to it; posting in its own thread instead", o.Address, o.ReplyTo, r.Channel)
 				return postTarget{}, false
 			}
 		}

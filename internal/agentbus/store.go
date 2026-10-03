@@ -86,8 +86,14 @@ type Message struct {
 	// and DeliverCommand set it; clients can never send it.
 	FromUser  bool   `json:"from_user,omitempty"`
 	SlackUser string `json:"slack_user,omitempty"`
-	// Via is ViaDM when an allowed Slack user wrote this to the bot in a
-	// direct message. Only DeliverVia sets it; clients can never send it.
+	// Guest marks input from a Slack user who isn't allowed, written in a
+	// conversation an owner linked to the session; SlackUser is their label.
+	// It is never an instruction. Only DeliverGuest sets it; clients can
+	// never send it.
+	Guest bool `json:"guest,omitempty"`
+	// Via is ViaDM or ViaGroup when the Slack message was written somewhere
+	// other than the bridge's main channel. Only DeliverVia and DeliverGuest
+	// set it; clients can never send it.
 	Via string `json:"via,omitempty"`
 	// SlackUserID is the Slack user ID of the owner who sent Command. Only
 	// DeliverCommand sets it, and /wait re-checks it before handing the
@@ -362,6 +368,18 @@ func (s *Store) Address(id string) string {
 		return ""
 	}
 	return s.addressLocked(sess)
+}
+
+// SessionSeen returns when a known session was last seen on the bus: its
+// latest request or waiter.
+func (s *Store) SessionSeen(id string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[id]
+	if !ok {
+		return time.Time{}, false
+	}
+	return sess.lastSeen(), true
 }
 
 // Resolve finds a session by friendly name or address (case-insensitive).
@@ -842,9 +860,9 @@ func (s *Store) Load() error {
 	return nil
 }
 
-// cleanLoadedMessage drops an invalid reply_to, a via that isn't ViaDM on a
-// Slack user's message and, on a message from a session, any via and a
-// sender name validName rejects (keeping the sender's address).
+// cleanLoadedMessage drops an invalid reply_to, any via except ViaDM or
+// ViaGroup on a Slack user's or guest's message and, on a message from a
+// session, a sender name validName rejects (keeping the sender's address).
 // It reports whether it changed m.
 func cleanLoadedMessage(m *Message) bool {
 	changed := false
@@ -852,11 +870,11 @@ func cleanLoadedMessage(m *Message) bool {
 		m.ReplyTo = ""
 		changed = true
 	}
-	if m.Via != "" && (m.Via != ViaDM || !m.FromUser) {
+	if m.Via != "" && ((m.Via != ViaDM && m.Via != ViaGroup) || (!m.FromUser && !m.Guest)) {
 		m.Via = ""
 		changed = true
 	}
-	if m.FromUser {
+	if m.FromUser || m.Guest {
 		return changed
 	}
 	if i := strings.LastIndex(m.From, " ("); i >= 0 && strings.HasSuffix(m.From, ")") {

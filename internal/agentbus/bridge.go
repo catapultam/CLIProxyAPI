@@ -12,9 +12,15 @@ import (
 // is reserved too and never resolves to a session.
 const SlackAddress = "slack"
 
-// ViaDM marks a message an allowed Slack user wrote to the bot in a direct
-// message, not in the channel.
-const ViaDM = "dm"
+// Via values: where in Slack a message reached the bridge, when not in its
+// main channel.
+const (
+	// ViaDM marks a message written to the bot in a direct message.
+	ViaDM = "dm"
+	// ViaGroup marks a message written in a group DM or a channel other than
+	// the main one, where other people can read the answer.
+	ViaGroup = "group"
+)
 
 var (
 	// ErrUnknownSlackUser is a "slack@<label>" target whose label isn't an
@@ -173,10 +179,39 @@ func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string
 }
 
 // DeliverVia is Deliver for a message that reached the bridge other than in
-// the channel: via is ViaDM for a direct message, or empty. Only the Slack
-// bridge calls it, and it is the only way a message gets Via.
+// the channel: via is ViaDM for a direct message, ViaGroup for a group DM or
+// another channel, or empty. Only the Slack bridge calls it, and together
+// with DeliverGuest it is the only way a message gets Via.
 func (s *Store) DeliverVia(target, body, slackUser, via string) (sessionID, msgID string, err error) {
-	if via != "" && via != ViaDM {
+	return s.deliverFromSlack(target, body, via, func(m *Message) {
+		m.FromUser = true
+		m.SlackUser = slackUser
+	})
+}
+
+// DeliverGuest queues a message from a guest: a Slack user who isn't
+// allowed, writing in a conversation an owner linked to the session. label
+// names the guest; via is as for DeliverVia. It sets Guest, never FromUser.
+// Only the Slack bridge calls it, and it is the only way a message gets
+// Guest.
+func (s *Store) DeliverGuest(target, body, label, via string) (sessionID, msgID string, err error) {
+	return s.deliverFromSlack(target, body, via, func(m *Message) {
+		m.Guest = true
+		m.SlackUser = label
+	})
+}
+
+// DeliverNotice queues a notice from the Slack bridge itself, such as "you
+// were linked to a conversation": From is SlackAddress, and it is neither a
+// user's instruction nor a guest's input. Only the Slack bridge calls it.
+func (s *Store) DeliverNotice(target, body string) (sessionID, msgID string, err error) {
+	return s.deliverFromSlack(target, body, "", func(*Message) {})
+}
+
+// deliverFromSlack queues a message from SlackAddress for target (id, name
+// or address), with fill marking who it is from.
+func (s *Store) deliverFromSlack(target, body, via string, fill func(*Message)) (string, string, error) {
+	if via != "" && via != ViaDM && via != ViaGroup {
 		return "", "", ErrInvalidVia
 	}
 	if strings.TrimSpace(body) == "" {
@@ -191,8 +226,8 @@ func (s *Store) DeliverVia(target, body, slackUser, via string) (sessionID, msgI
 	if err != nil {
 		return "", "", err
 	}
-	msg := s.fromSlackLocked(sess, body, slackUser)
-	msg.Via = via
+	msg := Message{ID: newMessageID(), From: SlackAddress, To: s.addressLocked(sess), Body: body, Via: via, CreatedAt: s.now()}
+	fill(&msg)
 	s.enqueueLocked(sess, msg)
 	return id, msg.ID, nil
 }

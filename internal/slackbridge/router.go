@@ -12,9 +12,13 @@ import (
 
 const (
 	howToAddress = "To reach an agent, reply in its thread, or post `name: message` at the top level (the name or address from its thread header)."
-	commandHelp  = "Commands (for people set in config.yaml): `@agents allow @person` lets someone instruct agents; `@agents remove @person` takes that back."
-	ownersOnly   = "Only people set in config.yaml (allowed-emails) can allow or remove users."
-	notSavedNote = " (not saved; this reverts when the proxy restarts)"
+	commandHelp  = "Commands (for people set in config.yaml): `@agents allow @person` lets someone instruct agents; `@agents remove @person` takes that back. " +
+		"`@agents chat @person [@person …] with <agent>` opens a group DM linked to an agent; `@agents dm @person with <agent>` opens the bot's DM with that person, linked to an agent. " +
+		"`@agents link <agent>` links the conversation it's posted in; `@agents unlink` undoes that. In a linked conversation, everyone who isn't allowed is a guest: the agent gets their messages as input, not instructions."
+	ownersOnly = "Only people set in config.yaml (allowed-emails) can allow or remove users."
+	// ownersOnlyLinks refuses chat, dm, link and unlink from a non-owner.
+	ownersOnlyLinks = "Only people set in config.yaml (allowed-emails) can open, link or unlink conversations."
+	notSavedNote    = " (not saved; this reverts when the proxy restarts)"
 	// ownersOnlyCommands refuses a "!" command from a non-owner.
 	ownersOnlyCommands = "Only owners can run commands."
 	howToCommand       = "Run a command in an agent's thread (`!compact`), or at the top level as `name: !compact`. `!commands` lists them."
@@ -54,19 +58,30 @@ func isDM(ev messageEvent) bool {
 //
 // Anywhere, a message that tags an agent ("name: message" or "@name
 // message", where name resolves to a session) reaches that agent, and its
-// answer lands where the message was (see sendTagged).
+// answer lands where the message was (see sendTagged). A leading mention of
+// the bot that isn't a command is dropped first, so "@agents name: …" tags
+// too.
+//
+// Only allowed users get through, except in a conversation linked to an
+// agent, where anyone else is a guest (see routeGuest).
 func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	dm := isDM(ev)
 	if ev.Type != "message" || !relayedSubtypes[ev.Subtype] || ev.BotID != "" ||
 		ev.Channel == "" || ev.User == "" || ev.User == b.botUserID {
 		return
 	}
-	user, ok := b.state.user(ev.User)
-	if !ok {
+	main := !dm && ev.Channel == b.channelID
+	user, allowed := b.state.user(ev.User)
+	var link convLink
+	linked := false
+	if !main {
+		link, linked = b.conversationLink(ev.Channel)
+	}
+	if !allowed && !linked {
 		return
 	}
-	// Dedup after the allowlist so strangers can't flush the ring. Without an
-	// event id, fall back to the message identity.
+	// Dedup after the allowlist (and the link check) so strangers can't
+	// flush the ring. Without an event id, fall back to the message identity.
 	key := eventID
 	if key == "" {
 		key = ev.Channel + ":" + ev.TS
@@ -74,17 +89,36 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	if b.alreadySeen(key) {
 		return
 	}
-	if !dm && ev.Channel != b.channelID {
-		b.routeForeign(ev, user)
+	if !allowed {
+		b.routeGuest(ev, link)
 		return
 	}
-	if verb, target, isCommand := parseCommand(ev.Text, b.botUserID); isCommand {
-		b.command(ev, user, verb, target)
+	active := main || dm || linked
+	cmd, rest, mentioned := parseCommand(ev.Text, b.botUserID)
+	if cmd.verb != "" {
+		// Where the bot was only added, it answers nothing but the commands
+		// that link it.
+		if active || cmd.opensLink() {
+			b.command(ev, user, cmd)
+		}
 		return
+	}
+	if mentioned {
+		ev.Text = rest
+		if _, _, tagOK := b.tagged(ev, plainText(rest, b.state.idLabels())); !tagOK {
+			if active {
+				b.replyCommand(ev, commandHelp)
+			}
+			return
+		}
 	}
 	text := plainText(ev.Text, b.state.idLabels())
+	if !main && !dm {
+		b.routeForeign(ev, user, text, link, linked)
+		return
+	}
 	if dm {
-		b.routeDM(ev, user, text)
+		b.routeDM(ev, user, text, link, linked)
 		return
 	}
 	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
@@ -126,12 +160,39 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 
 // routeForeign handles a message from an allowed user in a conversation
 // that is neither the channel nor their DM with the bot: a group DM or
-// another channel the bot was added to. Only a message that tags an agent
-// is delivered, with the usual "!" command rule; the answer lands in that
-// conversation and thread. Anything else, a bot mention included, is
-// ignored without a reply, so the bot stays quiet where it was only added.
-func (b *Bridge) routeForeign(ev messageEvent, user allowedUser) {
-	b.sendTagged(ev, user, plainText(ev.Text, b.state.idLabels()), "")
+// another channel the bot was added to. The answer lands in that
+// conversation and thread. With the usual "!" command rule:
+//   - a message that tags an agent goes to that agent;
+//   - else a reply in a thread whose first message (or, failing that, a
+//     later one) went to an agent, or under an agent's own post there, goes
+//     to that agent;
+//   - else, when the conversation is linked, the message goes to its agent.
+//
+// Anything else is ignored without a reply, so the bot stays quiet where
+// it was only added.
+func (b *Bridge) routeForeign(ev messageEvent, user allowedUser, text string, link convLink, linked bool) {
+	own, ownOK := "", false
+	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
+		own, ownOK = b.foreignThreadSession(ev)
+	}
+	if !ownOK && linked {
+		own, ownOK = link.Session, true
+	}
+	if b.sendTagged(ev, user, text, own) || !ownOK {
+		return
+	}
+	b.send(ev, user, own, text, false)
+}
+
+// foreignThreadSession is the session a thread reply in a conversation
+// other than the main channel and DMs goes to: the agent whose own
+// top-level post started the thread, else the one its messages went to
+// (state.threadSession).
+func (b *Bridge) foreignThreadSession(ev messageEvent) (string, bool) {
+	if sid, ok := b.state.dmSession(ev.Channel, ev.ThreadTS); ok {
+		return sid, true
+	}
+	return b.state.threadSession(ev.Channel, ev.ThreadTS)
 }
 
 // tagged finds the agent text tags: "name: message" or "@name message" (see
@@ -182,14 +243,18 @@ func (b *Bridge) send(ev messageEvent, user allowedUser, sid, text string, adopt
 //     tied to, unless it tags another agent;
 //   - a top-level "name: …" or "@name …" goes to that agent;
 //   - any other top-level message goes to the agent the user last talked to
-//     in the DM (dmLast, while it hasn't expired), or gets a help reply.
+//     in the DM (dmLast, while it hasn't expired), else to the agent the DM
+//     is linked to, or gets a help reply.
 //
 // "!" commands take the same routes, with the same owner rule. Every
 // delivery makes its agent the user's dmLast.
-func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string) {
+func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link convLink, linkedDM bool) {
 	b.rememberDM(ev.User, ev.Channel)
 	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
 		sid, linked := b.dmThreadSession(ev)
+		if !linked && linkedDM {
+			sid, linked = link.Session, true
+		}
 		if b.sendTagged(ev, user, text, sid) {
 			return
 		}
@@ -216,6 +281,9 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string) {
 		return
 	}
 	sid, ok := b.state.dmLast(ev.User)
+	if !ok && linkedDM {
+		sid, ok = link.Session, true
+	}
 	if isBang(text) {
 		// Without a dmLast the target is empty: runCommand answers !commands
 		// and explains the rest.
@@ -329,16 +397,24 @@ func (b *Bridge) alreadySeen(eventID string) bool {
 	return false
 }
 
-// deliver queues body for target; notFound is the reply when the target is
-// unknown. A message from a DM is marked as such. Where it came from is
-// recorded (recordDelivery), so the session can answer there; adopt is true
-// for a top-level post.
-func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string, adopt bool) {
-	via := ""
-	if isDM(ev) {
-		via = agentbus.ViaDM
+// viaOf is where ev was written, as agentbus marks it: a DM, a group
+// conversation (a group DM or another channel), or the main channel ("").
+func (b *Bridge) viaOf(ev messageEvent) string {
+	switch {
+	case isDM(ev):
+		return agentbus.ViaDM
+	case ev.Channel != b.channelID:
+		return agentbus.ViaGroup
 	}
-	sid, msgID, err := b.bus.DeliverVia(target, body, user.Label, via)
+	return ""
+}
+
+// deliver queues body for target; notFound is the reply when the target is
+// unknown. A message from a DM or a group conversation is marked as such.
+// Where it came from is recorded (recordDelivery), so the session can
+// answer there; adopt is true for a top-level post.
+func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string, adopt bool) {
+	sid, msgID, err := b.bus.DeliverVia(target, body, user.Label, b.viaOf(ev))
 	switch {
 	case err == nil:
 		b.react(ev, b.recordDelivery(ev, msgID, sid, adopt, reactionQueued))
@@ -400,21 +476,41 @@ func (b *Bridge) onlineHint() string {
 	return "Online: " + strings.Join(names, ", ")
 }
 
-// command runs allow/remove. Only users seeded from config (owners) may run
-// them, so access granted from Slack can't chain. The check happens before
-// any lookup or enqueue, so a non-owner's attempt never calls users.info.
+// command runs an "@bot <verb>" command: allow/remove, or chat, dm, link
+// and unlink (see conversations.go). Only users seeded from config (owners)
+// may run them, so access granted from Slack can't chain. The check happens
+// before any lookup or enqueue, so a non-owner's attempt never calls
+// users.info.
 //
 // remove applies at once, so revoking access never waits behind queued
 // posts. allow needs a users.info lookup, so it is a queued command job; it
 // records the target's command count now and applies only if no later
 // allow/remove for the same user came in meanwhile.
-func (b *Bridge) command(ev messageEvent, user allowedUser, verb, target string) {
-	if (verb == "allow" || verb == "remove") && !user.config {
-		log.Infof("slack: refused %s of %s by non-owner %s", verb, target, user.ID)
-		b.replyCommand(ev, ownersOnly)
+func (b *Bridge) command(ev messageEvent, user allowedUser, cmd botCommand) {
+	if !user.config {
+		log.Infof("slack: refused %s by non-owner %s", cmd.verb, user.ID)
+		if cmd.opensLink() {
+			b.replyCommand(ev, ownersOnlyLinks)
+		} else {
+			b.replyCommand(ev, ownersOnly)
+		}
 		return
 	}
-	switch verb {
+	if !cmd.ok {
+		b.replyCommand(ev, commandHelp)
+		return
+	}
+	var target string
+	if len(cmd.users) == 1 {
+		target = cmd.users[0]
+	}
+	switch cmd.verb {
+	case "chat", "dm":
+		b.openLinked(ev, user, cmd)
+	case "link":
+		b.linkHere(ev, user, cmd.agent)
+	case "unlink":
+		b.unlinkHere(ev, user)
 	case "allow":
 		b.cmdMu.Lock()
 		b.cmdSeq[target]++

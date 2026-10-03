@@ -76,24 +76,97 @@ func parseAtTagged(raw, text string) (string, string, bool) {
 	return m[1], strings.TrimSpace(m[2]), true
 }
 
-// parseCommand recognises "@bot allow @user" and "@bot remove @user". isCommand
-// is true for anything that starts by mentioning the bot.
-func parseCommand(text, botID string) (string, string, bool) {
+// botCommand is an "@bot <verb> …" command.
+type botCommand struct {
+	// verb is allow, remove, chat, dm, link or unlink.
+	verb string
+	// users: the person to allow or remove, to DM, or to add to a chat.
+	users []string
+	// agent is the agent to chat, DM or link with, as written.
+	agent string
+	// ok is false when the arguments don't fit the verb.
+	ok bool
+}
+
+// opensLink reports whether c opens, links or unlinks a conversation.
+func (c botCommand) opensLink() bool {
+	return c.verb == "chat" || c.verb == "dm" || c.verb == "link" || c.verb == "unlink"
+}
+
+var commandVerbs = map[string]bool{"allow": true, "remove": true, "chat": true, "dm": true, "link": true, "unlink": true}
+
+// parseCommand reads a message that starts by mentioning the bot
+// (mentioned). When the next word is a command verb it returns the command:
+//
+//	@bot allow @user | @bot remove @user
+//	@bot chat @user [@user …] with <agent> | @bot dm @user with <agent>
+//	@bot link <agent> | @bot unlink
+//
+// Otherwise cmd.verb is empty and rest is the raw text after the mention.
+func parseCommand(text, botID string) (cmd botCommand, rest string, mentioned bool) {
 	t := strings.TrimSpace(text)
 	loc := slackMention.FindStringSubmatchIndex(t)
 	if loc == nil || loc[0] != 0 || t[loc[2]:loc[3]] != botID {
-		return "", "", false
+		return botCommand{}, "", false
 	}
-	rest := strings.Fields(t[loc[1]:])
-	if len(rest) != 2 {
-		return "", "", true
+	rest = strings.TrimSpace(t[loc[1]:])
+	fields := strings.Fields(rest)
+	if len(fields) == 0 || !commandVerbs[strings.ToLower(fields[0])] {
+		return botCommand{}, rest, true
 	}
-	verb := strings.ToLower(rest[0])
-	m := slackMention.FindStringSubmatch(rest[1])
-	if (verb != "allow" && verb != "remove") || m == nil || m[0] != rest[1] {
-		return "", "", true
+	cmd.verb = strings.ToLower(fields[0])
+	args := fields[1:]
+	switch cmd.verb {
+	case "allow", "remove":
+		if id, ok := mentionID(args); ok {
+			cmd.users, cmd.ok = []string{id}, true
+		}
+	case "link":
+		if len(args) == 1 {
+			cmd.agent, cmd.ok = agentArg(args[0])
+		}
+	case "unlink":
+		cmd.ok = len(args) == 0
+	case "chat", "dm":
+		n := len(args)
+		if n < 3 || !strings.EqualFold(args[n-2], "with") {
+			break
+		}
+		for _, a := range args[:n-2] {
+			id, ok := mentionID([]string{a})
+			if !ok {
+				return cmd, rest, true
+			}
+			cmd.users = append(cmd.users, id)
+		}
+		cmd.agent, cmd.ok = agentArg(args[n-1])
+		if cmd.verb == "dm" && len(cmd.users) != 1 {
+			cmd.ok = false
+		}
 	}
-	return verb, m[1], true
+	return cmd, rest, true
+}
+
+// mentionID returns the user ID when args is exactly one Slack mention.
+func mentionID(args []string) (string, bool) {
+	if len(args) != 1 {
+		return "", false
+	}
+	m := slackMention.FindStringSubmatch(args[0])
+	if m == nil || m[0] != args[0] {
+		return "", false
+	}
+	return m[1], true
+}
+
+// agentArg is an agent name or address as written after a command: a
+// leading "@" is dropped, and Slack markup (a mention or link) is no agent.
+func agentArg(word string) (string, bool) {
+	word = strings.TrimPrefix(word, "@")
+	if word == "" || strings.ContainsAny(word, "<>") {
+		return "", false
+	}
+	return slackUnescaper.Replace(word), true
 }
 
 // sanitizeLabel makes a short lowercase handle agents can write as @label.

@@ -23,6 +23,9 @@ const (
 	// dmLastTTL is how long a plain DM still goes to the agent the user last
 	// talked to there.
 	dmLastTTL = 7 * 24 * time.Hour
+	// linkAbsentTTL is how long a linked conversation keeps its link while
+	// the session is gone from the bus.
+	linkAbsentTTL = 7 * 24 * time.Hour
 )
 
 var (
@@ -47,6 +50,22 @@ type replyRecord struct {
 	// Receipt is the receipt reaction on TS now: the queued one it was
 	// delivered with, then reactionReceived, then reactionRead.
 	Receipt string `json:"receipt,omitempty"`
+	// Link marks a message that reached Session only because Channel was
+	// linked to it (a guest's message, or the link notice). An answer goes
+	// there only while Channel is still linked to Session.
+	Link bool `json:"link,omitempty"`
+}
+
+// convLink ties a whole Slack conversation other than the main channel (a
+// group DM, another channel, a DM) to a session.
+type convLink struct {
+	Session string `json:"session"`
+	// By is the owner who linked it.
+	By string    `json:"by"`
+	At time.Time `json:"at"`
+	// Seen is when the session was last known to be on the bus. The link is
+	// dropped once that is more than linkAbsentTTL ago.
+	Seen time.Time `json:"seen"`
 }
 
 // dmLink ties a top-level message in a DM to a session, so a thread reply
@@ -88,6 +107,8 @@ type stateFile struct {
 	DMLinks []dmLink `json:"dm_links,omitempty"`
 	// DMLast maps a user ID to the agent they last talked to in their DM.
 	DMLast map[string]dmLastEntry `json:"dm_last,omitempty"`
+	// Conversations maps a linked conversation's channel ID to its link.
+	Conversations map[string]convLink `json:"conversations,omitempty"`
 }
 
 // state holds session threads, delivered messages, DM routing and the
@@ -102,6 +123,7 @@ type state struct {
 	replies  []replyRecord          // delivered messages, oldest first, at most maxReplies
 	dmLinks  []dmLink               // top-level DM messages, oldest first, at most maxDMLinks
 	dmLasts  map[string]dmLastEntry // user ID -> the agent they last talked to in their DM
+	convs    map[string]convLink    // channel ID -> the session the conversation is linked to
 	users    []allowedUser          // config users first
 	// early holds receipts for message ids not recorded yet (a waiter can
 	// claim a message before deliver records it); record applies them. Not
@@ -113,7 +135,7 @@ type state struct {
 // loadState reads path; a missing file is an empty state. On a corrupt file it
 // returns an empty state and the error.
 func loadState(path string) (*state, error) {
-	st := &state{path: path, now: time.Now, threads: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, early: map[string]string{}}
+	st := &state{path: path, now: time.Now, threads: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, early: map[string]string{}}
 	if path == "" {
 		return st, nil
 	}
@@ -157,6 +179,13 @@ func loadState(path string) (*state, error) {
 	for user, e := range file.DMLast {
 		if user != "" && e.Session != "" {
 			st.dmLasts[user] = e
+		}
+	}
+	// Links of sessions absent too long are dropped by the next prune (the
+	// bridge refreshes them on start); lookups never return them.
+	for channel, l := range file.Conversations {
+		if channel != "" && l.Session != "" {
+			st.convs[channel] = l
 		}
 	}
 	st.users = file.Allowed
@@ -552,11 +581,128 @@ func (st *state) userByLabel(label string) (allowedUser, bool) {
 	return allowedUser{}, false
 }
 
+// threadSession returns the session a thread in a conversation other than
+// the main channel goes to by its reply records: the one its first message
+// was delivered to, else the one the newest unexpired message in the thread
+// was. Records that exist only because of a conversation link don't count,
+// so after an unlink only tags (and threads under them) reach agents there.
+func (st *state) threadSession(channel, threadTS string) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	cutoff := st.now().Add(-replyTTL)
+	newest := ""
+	for i := len(st.replies) - 1; i >= 0; i-- {
+		r := st.replies[i]
+		if r.Channel != channel || r.Link || !r.At.After(cutoff) {
+			continue
+		}
+		if r.TS == threadTS {
+			return r.Session, true
+		}
+		if newest == "" && r.ThreadTS == threadTS {
+			newest = r.Session
+		}
+	}
+	return newest, newest != ""
+}
+
+// linkConversation links channel to sid, as owner by did, replacing any
+// link it had. It returns the session channel was linked to before (empty
+// for none) and the save error.
+func (st *state) linkConversation(channel, sid, by string) (string, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	prev := ""
+	if l, ok := st.liveConvLocked(channel); ok {
+		prev = l.Session
+	}
+	now := st.now()
+	st.convs[channel] = convLink{Session: sid, By: by, At: now, Seen: now}
+	return prev, st.saveLocked()
+}
+
+// unlinkConversation removes channel's link. It returns the session it was
+// linked to, whether there was a live link, and the save error.
+func (st *state) unlinkConversation(channel string) (string, bool, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	l, ok := st.liveConvLocked(channel)
+	if _, present := st.convs[channel]; !present {
+		return "", false, nil
+	}
+	delete(st.convs, channel)
+	return l.Session, ok, st.saveLocked()
+}
+
+// conversation returns channel's link, unless its session has been absent
+// for more than linkAbsentTTL.
+func (st *state) conversation(channel string) (convLink, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.liveConvLocked(channel)
+}
+
+func (st *state) liveConvLocked(channel string) (convLink, bool) {
+	l, ok := st.convs[channel]
+	if !ok || !l.Seen.After(st.now().Add(-linkAbsentTTL)) {
+		return convLink{}, false
+	}
+	return l, true
+}
+
+// conversationSessions lists the sessions conversations are linked to.
+func (st *state) conversationSessions() []string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var out []string
+	for _, l := range st.convs {
+		out = append(out, l.Session)
+	}
+	return out
+}
+
+// touchConversations moves each link's Seen up to when its session was
+// last on the bus (seen maps session id to that time), then drops the links
+// of sessions absent for more than linkAbsentTTL, saving when it dropped
+// any. Seen alone changes in memory and is saved with the next change.
+func (st *state) touchConversations(seen map[string]time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for channel, l := range st.convs {
+		if at, ok := seen[l.Session]; ok && at.After(l.Seen) {
+			l.Seen = at
+			st.convs[channel] = l
+		}
+	}
+	if st.pruneConvsLocked() {
+		if errSave := st.saveLocked(); errSave != nil {
+			logSaveError(errSave)
+		}
+	}
+}
+
+// pruneConvsLocked drops links whose session has been absent for more than
+// linkAbsentTTL and reports whether it dropped any. The caller holds st.mu.
+func (st *state) pruneConvsLocked() bool {
+	pruned := false
+	for channel := range st.convs {
+		if _, ok := st.liveConvLocked(channel); !ok {
+			delete(st.convs, channel)
+			pruned = true
+		}
+	}
+	return pruned
+}
+
 func (st *state) saveLocked() error {
 	if st.path == "" {
 		return nil
 	}
+	st.pruneConvsLocked()
 	file := stateFile{Threads: st.threads, Links: st.sessions, Replies: st.replies, DMLinks: st.dmLinks}
+	if len(st.convs) > 0 {
+		file.Conversations = st.convs
+	}
 	cutoff := st.now().Add(-dmLastTTL)
 	for user, e := range st.dmLasts {
 		if e.At.After(cutoff) {

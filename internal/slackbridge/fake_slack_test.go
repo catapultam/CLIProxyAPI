@@ -98,8 +98,14 @@ const uploadSecret = "presigned-sig-0123"
 func newFakeSlack(t *testing.T) *fakeSlack {
 	t.Helper()
 	f := &fakeSlack{
-		t:         t,
-		users:     []fakeUser{{ID: "UALEX", Name: "alex", Display: "Alex", Email: "alex@example.com"}, {ID: "UJANE", Name: "jane", Display: "Jane D", Email: "jane@example.com"}, {ID: "UJANE2", Name: "jane2", Display: "jane d", Email: "jane2@example.com"}, {ID: "UEVE", Name: "eve", Display: "Eve"}, {ID: "UHOOK", Name: "ci", Display: "CI", Bot: true}},
+		t: t,
+		users: []fakeUser{
+			{ID: "UALEX", Name: "alex", Display: "Alex", Email: "alex@example.com"}, {ID: "UJANE", Name: "jane", Display: "Jane D", Email: "jane@example.com"},
+			{ID: "UJANE2", Name: "jane2", Display: "jane d", Email: "jane2@example.com"}, {ID: "UEVE", Name: "eve", Display: "Eve"}, {ID: "UHOOK", Name: "ci", Display: "CI", Bot: true},
+			// Guests: no email, so never allowed from config. UFAKE's display
+			// name is an allowed user's label.
+			{ID: "UBOB", Name: "bob", Display: "Bob"}, {ID: "UCAROL", Name: "carol", Display: "Carol"}, {ID: "UFAKE", Name: "alexfake", Display: "Alex"},
+		},
 		channels:  []fakeChannel{{ID: "CGEN", Name: "general"}, {ID: "CAGENTS", Name: "agents"}},
 		fail:      map[string]string{},
 		reactions: map[reactionKey]bool{},
@@ -271,13 +277,17 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"ok": true})
 	case "conversations.open":
-		// A 1:1 DM with the bot: its id is "D" + the user's id.
+		// A 1:1 DM with the bot: its id is "D" + the user's id. A group DM:
+		// "G" + the users' ids.
 		users := r.PostForm.Get("users")
-		if users == "" || strings.Contains(users, ",") {
+		switch {
+		case users == "":
 			writeJSON(w, map[string]any{"ok": false, "error": "invalid_users"})
-			return
+		case strings.Contains(users, ","):
+			writeJSON(w, map[string]any{"ok": true, "channel": map[string]any{"id": "G" + strings.ReplaceAll(users, ",", "")}})
+		default:
+			writeJSON(w, map[string]any{"ok": true, "channel": map[string]any{"id": "D" + users}})
 		}
-		writeJSON(w, map[string]any{"ok": true, "channel": map[string]any{"id": "D" + users}})
 	case "files.getUploadURLExternal":
 		f.mu.Lock()
 		f.nextFile++

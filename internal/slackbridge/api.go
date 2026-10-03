@@ -159,8 +159,15 @@ func (a *api) userInfo(ctx context.Context, token, userID string) (string, bool,
 // openDM opens (or finds) the bot's direct message with userID and returns
 // its channel id. It needs the im:write scope.
 func (a *api) openDM(ctx context.Context, token, userID string) (string, error) {
+	return a.openConversation(ctx, token, []string{userID})
+}
+
+// openConversation opens (or finds) the conversation of the bot with
+// userIDs: a DM for one user (im:write), a group DM for more (mpim:write).
+// It returns its channel id.
+func (a *api) openConversation(ctx context.Context, token string, userIDs []string) (string, error) {
 	const method = "conversations.open"
-	body, err := a.call(ctx, token, method, url.Values{"users": {userID}})
+	body, err := a.call(ctx, token, method, url.Values{"users": {strings.Join(userIDs, ",")}})
 	if err != nil {
 		return "", err
 	}

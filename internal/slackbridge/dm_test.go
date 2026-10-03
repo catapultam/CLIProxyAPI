@@ -199,8 +199,8 @@ func TestInboundDMDetectedByChannelPrefix(t *testing.T) {
 	other.Channel = "CGEN"
 	other.ChannelType = "channel"
 	b.handleEvent("EvDQ", other)
-	// Another channel is no DM: a tag there is delivered without via.
-	if msgs := bus.Claim(sidA); len(msgs) != 1 || msgs[0].Via != "" {
+	// Another channel is no DM: a tag there is delivered as from a group.
+	if msgs := bus.Claim(sidA); len(msgs) != 1 || msgs[0].Via != agentbus.ViaGroup {
 		t.Fatalf("msgs = %+v", msgs)
 	}
 }

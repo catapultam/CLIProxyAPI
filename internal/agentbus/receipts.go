@@ -26,11 +26,12 @@ type Receipts interface {
 	Read(ids []string)
 }
 
-// slackIDs lists the ids of msgs that came from Slack users.
+// slackIDs lists the ids of msgs that came from Slack users: allowed users
+// and guests.
 func slackIDs(msgs []Message) []string {
 	var ids []string
 	for _, m := range msgs {
-		if m.FromUser {
+		if m.FromUser || m.Guest {
 			ids = append(ids, m.ID)
 		}
 	}
