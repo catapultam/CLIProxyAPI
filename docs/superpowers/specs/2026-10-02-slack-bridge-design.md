@@ -62,6 +62,9 @@ features:
   bot_user:
     display_name: agents
     always_online: true
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
 oauth_config:
   scopes:
     bot:
@@ -69,6 +72,8 @@ oauth_config:
       - files:write
       - channels:history
       - groups:history
+      - im:history
+      - im:write
       - reactions:write
       - channels:read
       - groups:read
@@ -79,6 +84,7 @@ settings:
     bot_events:
       - message.channels
       - message.groups
+      - message.im
   socket_mode_enabled: true
   org_deploy_enabled: false
   token_rotation_enabled: false
@@ -248,3 +254,68 @@ Comms owns the marketplace. This edit goes in
 4. Mod change in comms' marketplace, with a version bump.
 5. Update `homelab-notes` (`agentbus.md`, `proxy.md`, `cakebox.md`): where the
    Slack tokens live, the channel, the allowed users, and how routing works.
+
+## Batch 2: remote commands, command registry, DMs
+
+Date: 2026-10-03. Branch: `slack-features`. Plan:
+`docs/superpowers/plans/2026-10-03-slack-commands-dms.md`.
+
+User decisions:
+
+- Commands use `!`, because Slack refuses messages that start with `/`: in an
+  agent's thread or DM, `!compact`; at the top level, `name: !compact`. A bare
+  top-level `!commands` also works.
+- Only owners (config-seeded users) run commands. An allowed non-owner gets
+  "Only owners can run commands." and nothing is delivered.
+- Any Claude Code slash command passes through unfiltered. `!rename X` sets
+  both the session title and the bus name.
+- The registry is a directory of files on cakebox, so new commands need no
+  plugin redeploy and no proxy restart. `shell` commands are allowed.
+- DMs work in both directions, limited to allowed users (Task 3).
+- The manifest above gains `im:history`, `im:write`, the `message.im` event
+  and the app home messages tab; an installed app must be reinstalled to get
+  them.
+
+**Registry.** `slackbridge.Config.CommandsDir` (`<state dir>/agent-commands/`,
+next to `slack-state.json`) holds one `<name>.yaml` per command; the name is
+the file name and must match `^[a-z0-9][a-z0-9_-]{0,31}$` (`commands` is
+built in). Fields: `description`; `kind` (`slash`, `prompt` or `shell`);
+`slash`: `command` (without `/`) and optional `args` (may contain `{args}`);
+`prompt`: `text` (may contain `{args}`); `shell`: `argv` (`windows`, `darwin`,
+`linux` → list of strings, where `{args}` and `{out}` may only be whole
+elements and never the program), `output` (`text` default, or `image`, which
+needs an `{out}` element), `timeout_seconds` (1-120, default 30), and at most
+one of `args_pattern` (a regex, anchored as `^(?:…)$`) and `args_enum` (a
+list). A shell command with neither takes no arguments. Files are decoded
+strictly (unknown keys, a second document or an empty file disable it). The
+directory is re-read on lookup when its listing or a file's size or mtime
+changes. A broken file is logged at Warn once per change and answers
+"`!name` is misconfigured"; it never falls through to the harness command of
+the same name. A registry name shadows a harness command.
+
+**Parsing and checks**, after the allowlist and dedup: `!name rest`, name
+`^[a-z0-9][a-z0-9:_-]{0,63}$` (lowercased), rest trimmed and at most 2000
+characters. Order: owner check, `!commands` (the bridge lists the registry
+and notes that any `/command` works; nothing goes to an agent), registry
+lookup (misconfigured → refuse; shell args rule → "`!name` takes no
+arguments" or "invalid arguments for `!name`"), otherwise
+`{kind: slash, command: name, args: rest}`. A registry slash command's
+`{args}` is filled by the proxy; prompt and shell templates are sent as they
+are with `args` = rest, and the mod substitutes. The target must be
+`CommandCapable`: the session runs the mod (`mod`) and reported a mod version
+(`ModVersion`, from `/hello`) of 0.3.3 or later, compared numerically per
+segment; otherwise "`name` can't run commands (agentbus plugin 0.3.3+
+required)". A delivered command gets a :gear: reaction, its reply-map entry
+(so the mod's result lands in the asking thread), and an Info log with the
+owner's user ID, command name, kind and target address (never arguments or
+output).
+
+**Bus message.** `Message.command` (`name`, `kind`, `command`, `args`,
+`text`, `argv`, `output`, `timeout`) and `Message.slack_user_id` are set only
+by `Store.DeliverCommand`, which only the bridge calls; a client `/send`
+can't set either. A command message is never injected into a request (the
+model might obey it as text) and `/inbox` leaves it queued: it leaves the
+store only through `/wait`. There, after the claim and outside the store
+lock, the store asks the bridge (`OwnerChecker.IsOwner`) whether
+`slack_user_id` is still an owner; if not, or if no bridge can tell, the
+command is dropped, logged, and refused in its Slack thread.
