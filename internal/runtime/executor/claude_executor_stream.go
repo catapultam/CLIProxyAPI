@@ -355,6 +355,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
+		b = annotateClaudeMissingThreadState(httpResp.StatusCode, b)
 		if fastRequest {
 			return nil, newClaudeFastDirectResponseError(httpResp, b)
 		}

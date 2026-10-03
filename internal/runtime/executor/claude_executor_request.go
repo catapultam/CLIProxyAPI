@@ -683,10 +683,10 @@ func (e claudeRateLimitError) IsRequestScoped() bool {
 
 // claudeMissingThreadStateError marks the 404 Anthropic returns when a thread
 // continuation (thread: {"type":"continue","previous_message_id":...}) names a
-// previous_message_id the server has no state for. No other credential has
-// that thread state either, so the auth manager must neither rotate nor cool
-// down on this; the 404 is returned to the client unchanged so it can replay
-// the full conversation with thread: {"type": "create"}.
+// previous_message_id the server has no state for. Rotating or cooling down
+// credentials cannot help, so the 404 is returned to the client, annotated with
+// error.details.error_code "thread_not_found" so Claude Code replays the full
+// conversation with thread: {"type": "create"} on its own.
 type claudeMissingThreadStateError struct {
 	statusErr
 }
@@ -730,9 +730,33 @@ func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header,
 		return claudeRateLimitError{statusErr: err, credentialScoped: false}
 	}
 	if statusCode == http.StatusNotFound && claudeBodyIndicatesMissingThreadState(body) {
+		err.msg = string(annotateClaudeMissingThreadState(statusCode, body))
 		return claudeMissingThreadStateError{err}
 	}
 	return err
+}
+
+// claudeThreadNotFoundErrorCode is the error code Claude Code checks for in
+// error.details.error_code before it retries a thread continuation as a full
+// replay. Anthropic's missing-thread 404 does not carry it.
+const claudeThreadNotFoundErrorCode = "thread_not_found"
+
+// annotateClaudeMissingThreadState adds error.details.error_code
+// "thread_not_found" to Anthropic's missing-thread 404 so Claude Code recovers
+// by replaying the conversation instead of reporting a model error. The status,
+// error type and message are left unchanged; any other body is returned as is.
+func annotateClaudeMissingThreadState(statusCode int, body []byte) []byte {
+	if statusCode != http.StatusNotFound || !claudeBodyIndicatesMissingThreadState(body) {
+		return body
+	}
+	if details := gjson.GetBytes(body, "error.details"); details.Exists() && !details.IsObject() {
+		return body
+	}
+	annotated, errSet := sjson.SetBytes(body, "error.details.error_code", claudeThreadNotFoundErrorCode)
+	if errSet != nil {
+		return body
+	}
+	return annotated
 }
 
 // claudeBodyIndicatesMissingThreadState matches Anthropic's not_found_error for

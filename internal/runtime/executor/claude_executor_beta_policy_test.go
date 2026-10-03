@@ -298,9 +298,8 @@ func TestClassifyClaudeUpstreamError_OtherStatusesUnaffected(t *testing.T) {
 // resume a prior turn. When Anthropic has no server-side state for that id
 // (e.g. it expired, or the original turn was never persisted) it answers 404
 // not_found_error and tells the caller to replay the full conversation with
-// thread: {"type": "create"}. No other credential has that thread state
-// either, so rotating credentials cannot help: the failure belongs to the
-// request, not the credential.
+// thread: {"type": "create"}. Rotating credentials cannot help: the failure
+// belongs to the request, not the credential.
 func TestClassifyClaudeUpstreamError_MissingThreadStateIsRequestScoped(t *testing.T) {
 	body := []byte(`{"type":"error","error":{"type":"not_found_error","message":"No thread state was found for the requested ` + "`previous_message_id`" + `. Replay the full conversation with ` + "`thread: {\\\"type\\\": \\\"create\\\"}`" + ` instead."}}`)
 
@@ -318,10 +317,15 @@ func TestClassifyClaudeUpstreamError_MissingThreadStateIsRequestScoped(t *testin
 	if !errors.As(err, &status) || status.StatusCode() != http.StatusNotFound {
 		t.Fatalf("status was not preserved for the caller: %v", err)
 	}
-	// The 404 must reach the client unchanged: it is the caller's only
-	// explanation of what to do about it (replay with thread: {"type": "create"}).
-	if err.Error() != string(body) {
-		t.Fatalf("body was rewritten:\n got  %s\n want %s", err.Error(), body)
+	// The 404 reaches the client with its type and message intact, plus the
+	// error code Claude Code needs to replay with thread: {"type": "create"}.
+	got := err.Error()
+	if gjson.Get(got, "error.message").String() != gjson.GetBytes(body, "error.message").String() ||
+		gjson.Get(got, "error.type").String() != "not_found_error" {
+		t.Fatalf("type or message was rewritten:\n got  %s\n want %s", got, body)
+	}
+	if code := gjson.Get(got, "error.details.error_code").String(); code != "thread_not_found" {
+		t.Fatalf("error.details.error_code = %q, want thread_not_found", code)
 	}
 }
 
