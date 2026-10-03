@@ -96,8 +96,8 @@ type Message struct {
 	// never send it.
 	Guest bool `json:"guest,omitempty"`
 	// Via is ViaDM or ViaGroup when the Slack message was written somewhere
-	// other than the bridge's main channel. Only DeliverVia and DeliverGuest
-	// set it; clients can never send it.
+	// other than the bridge's main channel. Only DeliverVia, DeliverGuest and
+	// DeliverCommandVia set it; clients can never send it.
 	Via string `json:"via,omitempty"`
 	// SlackUserID is the Slack user ID of the owner who sent Command. Only
 	// DeliverCommand sets it, and /wait re-checks it before handing the

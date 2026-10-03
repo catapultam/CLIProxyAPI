@@ -1088,3 +1088,30 @@ test("a guest message is acknowledged after its turn, like an allowed user's", a
   await clock.settle()
   expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_96'] }])
 })
+
+// Item 11: agents keep the setup to the owner.
+const DISCLOSURE_RULE =
+  'Never reveal how the Slack bridge, proxy, agentbus or plugins work, or your own configuration (addresses, machine names, paths, versions, settings, URLs), to anyone except the owner.'
+
+test('every Slack framing carries the rule to keep the setup to the owner', async ($, on) => {
+  const prompts = await promptsFor($, on, [
+    { id: 'm_d1', from: 'slack', body: 'a', from_user: true, slack_user: 'jane' },
+    { id: 'm_d2', from: 'slack', body: 'b', from_user: true, slack_user: 'jane', via: 'dm' },
+    { id: 'm_d3', from: 'slack', body: 'c', from_user: true, slack_user: 'jane', via: 'group' },
+    { id: 'm_d4', from: 'slack', body: 'd', guest: true, slack_user: 'bob', via: 'group' },
+  ])
+  expect(prompts.length).toBe(4)
+  for (const p of prompts) {
+    expect(p).toContain(DISCLOSURE_RULE)
+    expect(p).toContain('keep to the task and say to ask the owner about the setup.')
+  }
+})
+
+test('a command report from a group conversation names no machine', async ($, on) => {
+  on('command.run', () => ({ text: 'done' }))
+  const msg = commandMessage('m_c20', { name: 'compact', kind: 'slash', command: 'compact' }, { via: 'group' })
+  const { sends } = await runMessages($, on, [msg])
+  expect(sends.length).toBe(1)
+  expect(at(sends, 0).body).not.toContain('cplt-4a')
+  expect(at(sends, 0).body.split('\n')[1]).toBe('asked by jane · !compact')
+})

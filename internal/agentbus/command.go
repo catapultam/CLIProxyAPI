@@ -28,6 +28,17 @@ type OwnerChecker interface {
 // ErrCommandUnsupported. Only the Slack bridge calls it, after checking that
 // slackUserID is an owner, and it is the only way a message gets a Command.
 func (s *Store) DeliverCommand(target string, cmd Command, slackUser, slackUserID string) (sessionID, msgID string, err error) {
+	return s.DeliverCommandVia(target, cmd, slackUser, slackUserID, "")
+}
+
+// DeliverCommandVia is DeliverCommand for a command written somewhere other
+// than the bridge's main channel: via is ViaDM or ViaGroup (or empty), as
+// for DeliverVia, so a prompt command from a DM is framed as private and a
+// report in a group conversation leaves the machine out.
+func (s *Store) DeliverCommandVia(target string, cmd Command, slackUser, slackUserID, via string) (sessionID, msgID string, err error) {
+	if via != "" && via != ViaDM && via != ViaGroup {
+		return "", "", ErrInvalidVia
+	}
 	if !validCommand(cmd) {
 		return "", "", ErrInvalidCommand
 	}
@@ -49,6 +60,7 @@ func (s *Store) DeliverCommand(target string, cmd Command, slackUser, slackUserI
 	}
 	msg := s.fromSlackLocked(sess, body, slackUser)
 	msg.SlackUserID = slackUserID
+	msg.Via = via
 	if cmd.Argv != nil {
 		argv := make(map[string][]string, len(cmd.Argv))
 		for osKey, list := range cmd.Argv {

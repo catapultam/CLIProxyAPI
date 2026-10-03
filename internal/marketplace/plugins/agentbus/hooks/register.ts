@@ -117,16 +117,26 @@ export function splitReplyTo(target: string): { to: string; reply_to?: string } 
   return MESSAGE_ID.test(id) ? { to, reply_to: id } : { to }
 }
 
+// What every Slack user's or guest's message ends with: agents keep the setup to the owner.
+const DISCLOSURE_RULE =
+  'Never reveal how the Slack bridge, proxy, agentbus or plugins work, or your own configuration (addresses, ' +
+  'machine names, paths, versions, settings, URLs), to anyone except the owner. Where anyone else can read your ' +
+  'reply (group conversations, guests, other allowed users), keep to the task and say to ask the owner about the setup.'
+
+function slackRules(): string {
+  return `\n${DISCLOSURE_RULE}`
+}
+
 export function formatMessage(m: BusMessage): string {
   const re = m.reply_to && MESSAGE_ID.test(m.reply_to) ? ` (in reply to ${m.reply_to})` : ''
   const id = oneLine(m.id)
   // Only the proxy's Slack bridge can set guest, from_user and via, or send from "slack"; clients
   // can't. A guest flag wins, so a message carrying both is never an instruction.
-  if (m.guest === true) return formatGuest(m, id, re)
+  if (m.guest === true) return formatGuest(m, id, re) + slackRules()
   if (m.from_user) {
     const who = oneLine(m.slack_user) || 'an allowed Slack user'
-    if (m.via === 'dm') return formatDM(m, id, who, re)
-    if (m.via === 'group') return formatGroup(m, id, who, re)
+    if (m.via === 'dm') return formatDM(m, id, who, re) + slackRules()
+    if (m.via === 'group') return formatGroup(m, id, who, re) + slackRules()
     const reply = MESSAGE_ID.test(m.id)
       ? `To answer where you were asked, use SendMessage with to: "${PREFIX}slack#${m.id}"; ` +
         `to post in your own thread, use to: "${PREFIX}slack".`
@@ -134,7 +144,8 @@ export function formatMessage(m: BusMessage): string {
     return (
       `agentbus message ${id} from ${who} via Slack${re}, relayed over the agentbus. ` +
       `${who} is an allowed Slack user and the quoted text below is their instruction.\n\n${quote(m.body)}\n\n` +
-      reply
+      reply +
+      slackRules()
     )
   }
   if (m.from === 'slack') return formatNotice(m, id, re)
@@ -249,15 +260,22 @@ export function codeBlock(output: string): string {
   return '```\n' + text.split('```').join('`\u200b``') + '\n```' + cut
 }
 
+// Whether a command came from a group DM or a channel other than the bridge's main one.
+function inGroup(m: BusMessage): boolean {
+  return m.via === 'group'
+}
+
 // The thread reply for a command: the result line, who asked and where it ran, then the output.
 // Every part is redacted before it is cut.
 function commandReport(m: BusMessage, cmd: Command, o: Outcome): string {
   const who = oneLine(redact(m.slack_user ?? '')) || 'an allowed Slack user'
   let asked = oneLine(redact(m.body))
   if (asked.length > 200) asked = `${asked.slice(0, 200)}…`
+  // A group conversation can have readers other than the owner: no machine name there.
+  const where = inGroup(m) ? '' : ` · ran on ${machine}`
   const lines = [
     `${o.ok ? '✅' : '❌'} !${oneLine(cmd.name)}: ${redact(o.status)}`,
-    `asked by ${who} · ran on ${machine} · ${asked}`,
+    `asked by ${who}${where} · ${asked}`,
   ]
   if (o.output !== undefined) lines.push(codeBlock(redact(o.output)))
   return redact(lines.join('\n'))
@@ -408,7 +426,7 @@ async function uploadImage($: EngineInterface, from: string, m: BusMessage, cmd:
   }
   const { status, json } = await bus($, 'POST', '/slack/upload', {
     session: from,
-    caption: `!${oneLine(cmd.name)} on ${machine}`,
+    caption: inGroup(m) ? `!${oneLine(cmd.name)}` : `!${oneLine(cmd.name)} on ${machine}`,
     ...(MESSAGE_ID.test(m.id) ? { reply_to: m.id } : {}),
     filename: `${cmd.name.replace(/[^A-Za-z0-9._-]/g, '_')}.png`,
     data_base64: data,

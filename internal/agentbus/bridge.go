@@ -65,6 +65,13 @@ type BotNamer interface {
 	BotName() string
 }
 
+// OwnerLister is implemented by bridges that know which allowed users are
+// owners (set in config), so the note can name who may hear about the
+// setup. Store calls it without holding its lock.
+type OwnerLister interface {
+	Owners() []string
+}
+
 // ImagePoster is implemented by bridges that can post images.
 type ImagePoster interface {
 	// PostImage posts data into the thread Post would pick for o, with o.Body

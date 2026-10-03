@@ -108,7 +108,7 @@ func (b *Bridge) openLinked(ev messageEvent, owner allowedUser, cmd botCommand) 
 	var confirm string
 	b.enqueueCommand(func(ctx context.Context) error {
 		if confirm == "" {
-			confirm = b.applyOpen(ctx, owner, cmd.verb, members, sid, cmd.agent)
+			confirm = b.applyOpen(ctx, ev, owner, cmd.verb, members, sid, cmd.agent)
 		}
 		return b.replyNow(ctx, ev, confirm)
 	})
@@ -117,7 +117,7 @@ func (b *Bridge) openLinked(ev messageEvent, owner allowedUser, cmd botCommand) 
 // applyOpen opens the conversation of the bot with members, links it to
 // sid, posts the intro there and tells the agent. It returns the reply for
 // the owner.
-func (b *Bridge) applyOpen(ctx context.Context, owner allowedUser, verb string, members []string, sid, agent string) string {
+func (b *Bridge) applyOpen(ctx context.Context, ev messageEvent, owner allowedUser, verb string, members []string, sid, agent string) string {
 	kind := "group DM"
 	if verb == "dm" {
 		kind = "direct message"
@@ -150,14 +150,15 @@ func (b *Bridge) applyOpen(ctx context.Context, owner allowedUser, verb string, 
 			b.rememberDM(u.ID, channel)
 		}
 	}
-	intro := fmt.Sprintf("Linked to *%s*. Messages here go to that agent. %s", escape(agent), whoInstructs(instructorIDs))
+	// The intro is read by everyone there: the agent's name only.
+	intro := fmt.Sprintf("Linked to *%s*. Messages here go to that agent. %s", escape(b.publicName(sid)), whoInstructs(instructorIDs))
 	if _, errPost := b.api.postMessage(ctx, b.cfg.BotToken, channel, intro, ""); errPost != nil {
 		log.Warnf("slack: intro for %s %s: %v", kind, channel, errPost)
 	}
 	b.noticeLinked(channel, sid, fmt.Sprintf("You were linked to a Slack %s with %s (opened by @%s). %s To post there, reply to this notice.",
 		kind, strings.Join(names, ", "), owner.Label, whoInstructsAgent(instructors)))
 	log.Infof("slack: %s opened %s %s, linked to %s", owner.ID, kind, channel, b.bus.Address(sid))
-	confirm := fmt.Sprintf("Opened a %s with %s, linked to *%s*.", kind, mentionList(members), escape(agent)) + b.relinked(prev, sid, owner)
+	confirm := fmt.Sprintf("Opened a %s with %s, linked to *%s*.", kind, mentionList(members), escape(b.shownAgent(ev, sid, agent))) + b.relinked(ev, prev, sid, owner)
 	if errSave != nil {
 		logSaveError(errSave)
 		confirm += notSavedNote
@@ -185,7 +186,7 @@ func (b *Bridge) linkHere(ev messageEvent, owner allowedUser, agent string) {
 	b.noticeLinked(ev.Channel, sid, fmt.Sprintf("You were linked to a Slack %s by @%s. %s To post there, reply to this notice.",
 		kind, owner.Label, whoInstructsAgent(nil)))
 	log.Infof("slack: %s linked %s %s to %s", owner.ID, kind, ev.Channel, b.bus.Address(sid))
-	confirm := fmt.Sprintf("Linked this conversation to *%s*. Messages here go to that agent. %s", escape(agent), whoInstructs(nil)) + b.relinked(prev, sid, owner)
+	confirm := fmt.Sprintf("Linked this conversation to *%s*. Messages here go to that agent. %s", escape(b.shownAgent(ev, sid, agent)), whoInstructs(nil)) + b.relinked(ev, prev, sid, owner)
 	if errSave != nil {
 		logSaveError(errSave)
 		confirm += notSavedNote
@@ -206,7 +207,7 @@ func (b *Bridge) unlinkHere(ev messageEvent, owner allowedUser) {
 	}
 	b.noticeUnlinked(l.Session, owner)
 	log.Infof("slack: %s unlinked %s from %s", owner.ID, ev.Channel, b.bus.Address(l.Session))
-	confirm := fmt.Sprintf("Unlinked this conversation from `%s`. Messages here no longer reach it; tag an agent (`name: message`) to reach one.", escape(b.bus.Address(l.Session)))
+	confirm := fmt.Sprintf("Unlinked this conversation from %s. Messages here no longer reach it; tag an agent (`name: message`) to reach one.", b.agentRef(ev, l.Session))
 	if errSave != nil {
 		logSaveError(errSave)
 		confirm += notSavedNote
@@ -353,9 +354,10 @@ func (b *Bridge) revoke(channel string, owner allowedUser) (convLink, bool, erro
 	return l, true, errSave
 }
 
-// relinked is what the confirmation adds when the conversation was linked
-// before (to prev); a session that lost the link is told so.
-func (b *Bridge) relinked(prev, sid string, owner allowedUser) string {
+// relinked is what the confirmation in ev's conversation adds when the
+// conversation was linked before (to prev); a session that lost the link is
+// told so.
+func (b *Bridge) relinked(ev messageEvent, prev, sid string, owner allowedUser) string {
 	switch prev {
 	case "":
 		return ""
@@ -363,7 +365,41 @@ func (b *Bridge) relinked(prev, sid string, owner allowedUser) string {
 		return " (It already was.)"
 	}
 	b.noticeUnlinked(prev, owner)
-	return fmt.Sprintf(" It was linked to `%s` before; that link is replaced.", escape(b.bus.Address(prev)))
+	return fmt.Sprintf(" It was linked to %s before; that link is replaced.", b.agentRef(ev, prev))
+}
+
+// publicName is how session sid is named where people other than owners
+// read: its name, or "an agent".
+func (b *Bridge) publicName(sid string) string {
+	if o, err := b.bus.SessionOutbound(sid); err == nil && o.Name != "" {
+		return o.Name
+	}
+	return "an agent"
+}
+
+// shownAgent is the agent an owner named as typed, echoed in ev's
+// conversation: as typed where only owners read, else its public name.
+func (b *Bridge) shownAgent(ev messageEvent, sid, typed string) string {
+	if b.ownerOnly(ev) {
+		return typed
+	}
+	return b.publicName(sid)
+}
+
+// agentRef names session sid in a reply in ev's conversation: by address
+// where only owners read (ownerOnly), else by name only ("another agent"
+// when it has none), so the setup isn't disclosed.
+func (b *Bridge) agentRef(ev messageEvent, sid string) string {
+	o, err := b.bus.SessionOutbound(sid)
+	switch {
+	case err != nil:
+		return "an agent that has left the bus"
+	case b.ownerOnly(ev):
+		return "`" + escape(o.Address) + "`"
+	case o.Name != "":
+		return "`" + escape(o.Name) + "`"
+	}
+	return "another agent"
 }
 
 // whoInstructs is the intro's line on whose messages are instructions:

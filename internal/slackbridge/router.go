@@ -451,7 +451,7 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 	}
 	var msgID string
 	if errCapable == nil {
-		sid, msgID, errCapable = b.bus.DeliverCommand(sid, cmd, user.Label, user.ID)
+		sid, msgID, errCapable = b.bus.DeliverCommandVia(sid, cmd, user.Label, user.ID, b.viaOf(ev))
 	}
 	switch {
 	case errCapable == nil:

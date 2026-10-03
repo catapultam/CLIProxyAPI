@@ -220,7 +220,8 @@ func TestLinkRelinkAndUnlinkInPlace(t *testing.T) {
 	// Relinking replaces the link and says so; both agents are told.
 	b.handleEvent("EvL2", foreignMsg("UALEX", "<@UBOT> link bridge", "1700004300.000002", ""))
 	drainJobs(t, b)
-	if got := lastPost(t, f); !strings.Contains(got["text"], "It was linked to `"+bus.Address(sidA)+"` before") {
+	// In a group the agents are named, never addressed (item 11).
+	if got := lastPost(t, f); !strings.Contains(got["text"], "It was linked to `flyer` before") {
 		t.Fatalf("relink confirm = %+v", got)
 	}
 	if l, _ := b.state.conversation("GMPIM1"); l.Session != sidB {
@@ -242,7 +243,7 @@ func TestLinkRelinkAndUnlinkInPlace(t *testing.T) {
 	// Unlink.
 	b.handleEvent("EvL3", foreignMsg("UALEX", "<@UBOT> unlink", "1700004300.000004", ""))
 	drainJobs(t, b)
-	if got := lastPost(t, f); !strings.HasPrefix(got["text"], "Unlinked this conversation from `"+bus.Address(sidB)+"`.") {
+	if got := lastPost(t, f); !strings.HasPrefix(got["text"], "Unlinked this conversation from `bridge`.") {
 		t.Fatalf("unlink confirm = %+v", got)
 	}
 	if _, ok := b.state.conversation("GMPIM1"); ok {

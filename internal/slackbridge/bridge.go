@@ -64,6 +64,7 @@ var (
 	_ agentbus.Bridge       = (*Bridge)(nil)
 	_ agentbus.ImagePoster  = (*Bridge)(nil)
 	_ agentbus.OwnerChecker = (*Bridge)(nil)
+	_ agentbus.OwnerLister  = (*Bridge)(nil)
 )
 
 // Bridge links the agentbus to one Slack channel. It implements
@@ -186,6 +187,10 @@ func logSaveError(err error) { log.Warnf("slack: save state: %v", err) }
 
 // Users lists the allowed users' labels.
 func (b *Bridge) Users() []string { return b.state.labels() }
+
+// Owners lists the labels of the allowed users seeded from config. It
+// implements agentbus.OwnerLister.
+func (b *Bridge) Owners() []string { return b.state.ownerLabels() }
 
 // IsOwner reports whether userID is an allowed user seeded from config. It
 // implements agentbus.OwnerChecker.
@@ -366,7 +371,7 @@ func (b *Bridge) dmTop(ctx context.Context, o agentbus.Outbound, channel, text s
 	if b.state.dmHeaded(channel, o.SessionID) {
 		return t, false, nil
 	}
-	first := sessionHeader(o)
+	first := b.headerFor(o, channel)
 	if text != "" {
 		first += "\n" + text
 	}
@@ -376,6 +381,48 @@ func (b *Bridge) dmTop(ctx context.Context, o agentbus.Outbound, channel, text s
 	}
 	b.state.linkDM(channel, ts, o.SessionID, true)
 	return t, true, nil
+}
+
+// headerFor is the header line of o's session for a top-level post in
+// conversation channel. The full header (name, address, machine) goes only
+// where owners alone read it: the main channel and an owner's DM with the
+// bot. Anywhere else (group DMs, other channels, guests' and non-owners'
+// DMs) it is the agent's name, or "an agent", so the setup isn't disclosed.
+func (b *Bridge) headerFor(o agentbus.Outbound, channel string) string {
+	if b.ownerOnlyChannel(channel) {
+		return sessionHeader(o)
+	}
+	name := o.Name
+	if name == "" {
+		name = "an agent"
+	}
+	return "*" + escape(name) + "*"
+}
+
+// ownerOnlyChannel reports whether only owners read conversation channel:
+// the main channel, or the bot's DM with an owner (as far as the DM cache
+// knows; an unknown DM counts as not owner-only).
+func (b *Bridge) ownerOnlyChannel(channel string) bool {
+	if channel == "" {
+		return false
+	}
+	if channel == b.channelID {
+		return true
+	}
+	b.dmMu.Lock()
+	var userID string
+	for id, ch := range b.dmChannels {
+		if ch == channel {
+			userID = id
+			break
+		}
+	}
+	b.dmMu.Unlock()
+	if userID == "" {
+		return false
+	}
+	u, ok := b.state.user(userID)
+	return ok && u.config
 }
 
 // dmChannelFor finds the allowed user o.DM labels (errDMUserGone when there

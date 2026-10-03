@@ -355,6 +355,19 @@ func (st *state) labels() []string {
 	return out
 }
 
+// ownerLabels lists the labels of the users seeded from config.
+func (st *state) ownerLabels() []string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var out []string
+	for _, u := range st.users {
+		if u.config {
+			out = append(out, u.Label)
+		}
+	}
+	return out
+}
+
 // mentionIDs maps label to user ID.
 func (st *state) mentionIDs() map[string]string {
 	st.mu.Lock()
