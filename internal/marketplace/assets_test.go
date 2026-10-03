@@ -69,8 +69,22 @@ func TestAgentbusZipFilesReadBack(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"name": "agentbus"`)) {
 		t.Fatalf("plugin.json content unexpected: %s", data)
 	}
-	if asset.Version != "0.3.2" {
-		t.Fatalf("version = %q, want 0.3.2", asset.Version)
+	if asset.Version != "0.3.3" {
+		t.Fatalf("version = %q, want 0.3.3", asset.Version)
+	}
+	// The mod reports its own version to the proxy, which gates commands on
+	// it, so the constant in register.ts must match plugin.json.
+	hooks, errOpenHooks := zr.Open("hooks/register.ts")
+	if errOpenHooks != nil {
+		t.Fatal(errOpenHooks)
+	}
+	defer func() { _ = hooks.Close() }()
+	src, errReadHooks := io.ReadAll(hooks)
+	if errReadHooks != nil {
+		t.Fatal(errReadHooks)
+	}
+	if want := "export const VERSION = '" + asset.Version + "'"; !bytes.Contains(src, []byte(want)) {
+		t.Fatalf("register.ts does not declare %s", want)
 	}
 }
 

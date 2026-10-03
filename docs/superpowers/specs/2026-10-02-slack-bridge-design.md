@@ -201,6 +201,11 @@ the escaped caption), synchronously, so the agent gets 200 `{"ok":true}` or
 502 with Slack's error code. The upload URL, tokens and image bytes are never
 logged, and the request log skips this route. This needs the `files:write`
 scope; an app installed before it was added must be reinstalled to grant it.
+The same route takes `Content-Type: application/json` with
+`{session, caption, reply_to, filename, data_base64}` (standard base64) under
+a 14 MiB body cap; the decoded image goes through the same checks (10 MiB,
+sniffing, upload slots, known session, Slack enabled). The mod uses it for
+`output: image` commands, since a plugin can't build a multipart body.
 The injected note's Slack lines include the curl command for it.
 
 ## Client side (agentbus mod)
@@ -330,3 +335,34 @@ command is dropped, logged, and refused in its Slack thread. A command
 message expires 10 minutes after it was sent (`commandTTL`), checked
 wherever the inbox is read and again at hand-out; its thread is told
 "`!name` expired before the agent picked it up".
+
+**Mod (0.3.3).** Both `/hello` calls (session start, and the follow after
+`/clear`, `/resume` or `/branch`) send `version: "0.3.3"`; every `/wait` sends
+`mod=1&v=0.3.3`. A waited message with `command` runs only when it also has
+`from_user`; otherwise it is dropped, neither run nor shown to the model. The
+mod runs it in the background, so polling continues:
+
+- `slash`: `$.command.run({command, args})`. Args holding a line break are
+  refused. The output is the command's text, or "done".
+- `prompt`: `text` with `{args}` replaced, submitted framed exactly like a
+  `from_user` Slack message.
+- `shell`: only where the machine opts in with `AGENTBUS_ALLOW_SHELL=1` in
+  its environment; otherwise "shell commands are disabled on `<machine>` (set
+  AGENTBUS_ALLOW_SHELL=1 there)". The argv is `windows` when `OS=Windows_NT`,
+  else `darwin` when `uname -s` says `Darwin`, else `linux`. An element that
+  is exactly `{args}` becomes `args` as one element; `{out}` becomes
+  `<TEMP|TMP|TMPDIR|/tmp>/agentbus-<message id>.png`. It runs through
+  `$.process.run` (no shell) with `timeout` seconds. `text` output posts
+  stdout, or stderr (falling back to stdout) on a non-zero exit, which is ❌.
+  `image` output reads `{out}` as bytes (`$.fs.read`, 4 MiB limit), posts it
+  with the JSON upload and `reply_to`, and deletes the file afterwards with
+  `rm -f` or `cmd /c del /q` (the plugin API has no remove).
+
+Every run is reported with `/send` to `slack`, `reply_to` the command's
+message id: `✅ !name: <ok|exit 0|…>` or `❌ !name: <error>`, then
+`asked by <slack_user> · ran on <machine> · <!name args>`, then the output
+in a code block cut to 3500 characters. The proxy token is redacted from
+the report; nothing is logged locally. A `command.run` hook on `rename`
+calls `next(e)` first, then, when the trimmed args match
+`^[A-Za-z0-9._-]{1,64}$`, posts `/name`; an invalid or taken bus name keeps
+the new title and appends a note to the command's output.
