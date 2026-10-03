@@ -25,7 +25,11 @@ type Config struct {
 	AppToken      string
 	Channel       string
 	AllowedEmails []string
-	StatePath     string
+	// Home is where sessions' threads open: "channel" (the default) or "dm",
+	// the first allowed user's DM with the bot. With "dm", Channel is
+	// optional.
+	Home      string
+	StatePath string
 	// CommandsDir holds the agent command registry (<name>.yaml files).
 	// Empty means no registry: only harness commands and !commands work.
 	CommandsDir string
@@ -33,9 +37,25 @@ type Config struct {
 	APIBase string
 }
 
+// parseHome reads a home setting, case-insensitively: homeDM or homeChannel
+// (also for an empty value). known is false for anything else, which falls
+// back to homeChannel.
+func parseHome(s string) (home string, known bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case homeDM:
+		return homeDM, true
+	case homeChannel, "":
+		return homeChannel, true
+	}
+	return homeChannel, false
+}
+
 func (c Config) complete() bool {
-	return strings.TrimSpace(c.BotToken) != "" && strings.TrimSpace(c.AppToken) != "" &&
-		strings.TrimSpace(c.Channel) != "" && len(c.AllowedEmails) > 0
+	if strings.TrimSpace(c.BotToken) == "" || strings.TrimSpace(c.AppToken) == "" || len(c.AllowedEmails) == 0 {
+		return false
+	}
+	home, _ := parseHome(c.Home)
+	return home == homeDM || strings.TrimSpace(c.Channel) != ""
 }
 
 type job func(ctx context.Context) error
@@ -63,9 +83,17 @@ type Bridge struct {
 	backoff    func(attempt int) time.Duration
 	retryDelay time.Duration
 
+	// home is the config's home (homeChannel or homeDM), set by New.
+	home string
+
 	// Set by resolve before the bridge is attached or the socket runs.
-	channelID string
-	botUserID string
+	// channelID is empty when no channel is configured (home dm only).
+	// homeChannelID is where new sessions' threads open: channelID, or the
+	// first owner's DM with the bot (ownerID's).
+	channelID     string
+	botUserID     string
+	homeChannelID string
+	ownerID       string
 
 	seenMu   sync.Mutex
 	seen     map[string]bool
@@ -105,6 +133,10 @@ type Bridge struct {
 
 // New builds a bridge, or returns nil, nil when cfg is incomplete (Slack off).
 func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
+	home, known := parseHome(cfg.Home)
+	if !known {
+		log.Warnf("slack: unknown home %q (want channel or dm); using channel", strings.TrimSpace(cfg.Home))
+	}
 	if !cfg.complete() {
 		return nil, nil
 	}
@@ -114,6 +146,7 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 	}
 	b := &Bridge{
 		cfg:         cfg,
+		home:        home,
 		bus:         bus,
 		api:         newAPI(cfg.APIBase),
 		dialer:      websocket.DefaultDialer,
@@ -187,9 +220,10 @@ type postTarget struct{ channel, threadTS string }
 //   - else the conversation and thread o.ReplyTo came from, when that message
 //     was delivered to this session (a top-level DM is answered at the DM's
 //     top level);
-//   - else the session's own thread. When it has none, threadFor opens one
-//     by posting the session header, followed by text when text isn't empty,
-//     at the top level of the channel.
+//   - else the session's home thread, wherever it is (threads stay put when
+//     the home setting changes). When it has none, threadFor opens one by
+//     posting the session header, followed by text when text isn't empty,
+//     at the top level of its home conversation (homeChannelFor).
 //
 // A session's first top-level post in a DM also starts with its header (see
 // dmTop). opened reports that text already went out with a header, so the
@@ -215,19 +249,62 @@ func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string
 		return postTarget{}, false, errLock
 	}
 	defer unlock()
-	if ts, ok := b.state.thread(o.SessionID); ok {
-		return postTarget{channel: b.channelID, threadTS: ts}, false, nil
+	if t, ok := b.ownThread(o.SessionID); ok {
+		return t, false, nil
+	}
+	channel, err := b.homeChannelFor(ctx, o.SessionID)
+	if err != nil {
+		return postTarget{}, false, err
 	}
 	first := sessionHeader(o)
 	if text != "" {
 		first += "\n" + text
 	}
-	ts, err := b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, first, "")
+	ts, err := b.api.postMessage(ctx, b.cfg.BotToken, channel, first, "")
 	if err != nil {
 		return postTarget{}, false, err
 	}
-	b.state.setThread(o.SessionID, ts)
-	return postTarget{channel: b.channelID, threadTS: ts}, true, nil
+	b.state.moveThread(o.SessionID, channel, ts, "")
+	return postTarget{channel: channel, threadTS: ts}, true, nil
+}
+
+// ownThread returns session sid's home thread. A thread with no channel
+// (from an old state file, when no channel is configured to place it in)
+// counts as none.
+func (b *Bridge) ownThread(sid string) (postTarget, bool) {
+	ref, ok := b.state.homeThread(sid)
+	if !ok {
+		return postTarget{}, false
+	}
+	if ref.Channel == "" {
+		ref.Channel = b.channelID
+	}
+	return postTarget{channel: ref.Channel, threadTS: ref.TS}, ref.Channel != ""
+}
+
+// homeOf is where session sid's home thread belongs: where an owner moved
+// it, else the config's home.
+func (b *Bridge) homeOf(sid string) string {
+	if home := b.state.home(sid); home != "" {
+		return home
+	}
+	return b.home
+}
+
+// homeChannelFor is the conversation a new home thread for session sid
+// opens in: the channel, or the first owner's DM, by homeOf. A session moved
+// to the channel opens in the home conversation when no channel is
+// configured any more.
+func (b *Bridge) homeChannelFor(ctx context.Context, sid string) (string, error) {
+	switch b.homeOf(sid) {
+	case homeChannel:
+		if b.channelID != "" {
+			return b.channelID, nil
+		}
+	case homeDM:
+		return b.dmChannel(ctx, b.ownerID)
+	}
+	return b.homeChannelID, nil
 }
 
 // dmTop prepares a top-level post by o's session in DM channel. The session's
@@ -324,9 +401,10 @@ func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool) {
 		}
 		channel := r.Channel
 		if channel == "" {
+			// An old record from the main channel.
 			channel = b.channelID
 		}
-		return postTarget{channel: channel, threadTS: r.ThreadTS}, true
+		return postTarget{channel: channel, threadTS: r.ThreadTS}, channel != ""
 	}
 	if owner, ok := b.state.replyOwner(o.ReplyTo); ok && owner != o.SessionID {
 		other := b.bus.Address(owner)
@@ -502,16 +580,20 @@ func (b *Bridge) sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// resolve finds the bot, the channel and the config users. Emails Slack
-// doesn't know are skipped; other errors abort so Start retries.
+// resolve finds the bot, the channel (when one is configured), the config
+// users and the home conversation: the channel, or with home dm the first
+// resolved owner's DM with the bot. Emails Slack doesn't know are skipped;
+// other errors abort so Start retries.
 func (b *Bridge) resolve(ctx context.Context) error {
 	botID, err := b.api.authTest(ctx, b.cfg.BotToken)
 	if err != nil {
 		return err
 	}
-	channelID, err := b.api.findChannel(ctx, b.cfg.BotToken, b.cfg.Channel)
-	if err != nil {
-		return err
+	channelID := ""
+	if strings.TrimSpace(b.cfg.Channel) != "" {
+		if channelID, err = b.api.findChannel(ctx, b.cfg.BotToken, b.cfg.Channel); err != nil {
+			return err
+		}
 	}
 	var users []allowedUser
 	for _, email := range b.cfg.AllowedEmails {
@@ -529,9 +611,36 @@ func (b *Bridge) resolve(ctx context.Context) error {
 	if len(users) == 0 {
 		return errors.New("slack: none of allowed-emails matched a Slack user")
 	}
-	b.botUserID, b.channelID = botID, channelID
+	ownerID, homeChannelID := users[0].ID, channelID
+	if b.home == homeDM {
+		if homeChannelID, err = b.api.openDM(ctx, b.cfg.BotToken, ownerID); err != nil {
+			return err
+		}
+		b.rememberDM(ownerID, homeChannelID)
+	}
+	b.botUserID, b.channelID, b.homeChannelID, b.ownerID = botID, channelID, homeChannelID, ownerID
 	b.state.seed(users)
+	if channelID != "" {
+		// Threads from an old state file are all in the channel.
+		b.state.fillThreadChannels(channelID)
+	}
 	return nil
+}
+
+// homeDescription names the home conversation for the start-up log line.
+func (b *Bridge) homeDescription() string {
+	if b.home != homeDM {
+		return "home channel " + b.cfg.Channel
+	}
+	owner := b.ownerID
+	if u, ok := b.state.user(b.ownerID); ok {
+		owner = u.Label
+	}
+	desc := "home dm (" + owner + ")"
+	if b.channelID != "" {
+		desc += ", channel " + b.cfg.Channel
+	}
+	return desc
 }
 
 // Start resolves the bot, channel and users in the background (retrying with
@@ -556,7 +665,7 @@ func (b *Bridge) Start() {
 			}
 		}
 		b.bus.SetBridge(b)
-		log.Infof("slack: bridge on, channel %s, allowed users %s", b.cfg.Channel, strings.Join(b.Users(), ", "))
+		log.Infof("slack: bridge on, %s, allowed users %s", b.homeDescription(), strings.Join(b.Users(), ", "))
 		b.jobsWG.Add(1)
 		go func() {
 			defer b.jobsWG.Done()

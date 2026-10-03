@@ -60,6 +60,7 @@ func (s *Server) initSlack() {
 		AppToken:      sc.AppToken,
 		Channel:       sc.Channel,
 		AllowedEmails: sc.AllowedEmails,
+		Home:          sc.Home,
 		StatePath:     s.runtimeStatePath("slack-state.json"),
 	}, s.agentbus)
 	if errNew != nil {

@@ -13,6 +13,7 @@ slack:
   bot-token: xoxb-test
   app-token: xapp-test
   channel: agents
+  home: dm
   allowed-emails:
     - alex@example.com
     - jane@example.com
@@ -24,7 +25,7 @@ func TestParseSlackConfigV8(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := cfg.Slack
-	if s.BotToken != "xoxb-test" || s.AppToken != "xapp-test" || s.Channel != "agents" {
+	if s.BotToken != "xoxb-test" || s.AppToken != "xapp-test" || s.Channel != "agents" || s.Home != "dm" {
 		t.Fatalf("slack = %+v", s)
 	}
 	if len(s.AllowedEmails) != 2 || s.AllowedEmails[1] != "jane@example.com" {
@@ -38,7 +39,7 @@ func TestSlackSectionSurvivesV8Normalization(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(out)
-	if strings.Contains(text, "# slack") || !strings.Contains(text, "\nslack:") || !strings.Contains(text, "allowed-emails:") {
+	if strings.Contains(text, "# slack") || !strings.Contains(text, "\nslack:") || !strings.Contains(text, "allowed-emails:") || !strings.Contains(text, "home: dm") {
 		t.Fatalf("slack section was dropped or commented out:\n%s", text)
 	}
 }

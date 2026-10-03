@@ -172,10 +172,27 @@ func TestInjectSlackLineMentionsDMs(t *testing.T) {
 	s.Touch(sidA)
 	s.SetBridge(&fakeBridge{users: []string{"alex", "jane"}})
 	got := injectedText(t, r, seen)
-	for _, want := range []string{`"slack@<name>"`, `agentbus:slack@<name>`, "-F to=slack@<name>"} {
+	for _, want := range []string{`"slack@<name>"`, `agentbus:slack@<name>`, "-F to=slack@<name>", "Your messages go to your own thread in Slack;"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("note lacks %q:\n%s", want, got)
 		}
+	}
+	// The home thread may be in a DM (slack.home: dm), so the note names no
+	// channel.
+	if strings.Contains(got, "thread in their Slack channel") {
+		t.Fatalf("note still says the thread is in a channel:\n%s", got)
+	}
+}
+
+func TestSessionOutboundIsByIDOnly(t *testing.T) {
+	s := NewStore("", nil)
+	s.Hello(sidA, "pc", "/work/flyer", "flyer", true)
+	o, err := s.SessionOutbound(sidA)
+	if err != nil || o.SessionID != sidA || o.Name != "flyer" || o.Machine != "pc" || o.Address != s.Address(sidA) || o.Body != "" {
+		t.Fatalf("SessionOutbound = %+v, %v", o, err)
+	}
+	if _, err = s.SessionOutbound("flyer"); !errors.Is(err, ErrUnknownSender) {
+		t.Fatalf("by name: %v", err)
 	}
 }
 

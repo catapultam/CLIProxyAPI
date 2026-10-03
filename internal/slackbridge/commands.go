@@ -503,7 +503,7 @@ func (r *registry) refreshLocked() {
 			r.warned[f.file] = f.stamp
 			log.Warnf("slack: agent command file %s disabled: %v", f.file, errLoad)
 		}
-		if commandFileName.MatchString(name) && name != listCommandsName {
+		if commandFileName.MatchString(name) && !isBuiltinCommand(name) {
 			entries[name] = registryEntry{name: name, err: errLoad}
 		}
 	}
@@ -549,8 +549,8 @@ func (r *registry) loadFile(file, name string) (*commandSpec, error) {
 	if !commandFileName.MatchString(name) {
 		return nil, errors.New("the name must match [a-z0-9][a-z0-9_-]{0,31}")
 	}
-	if name == listCommandsName {
-		return nil, errors.New("!commands is built in")
+	if isBuiltinCommand(name) {
+		return nil, fmt.Errorf("!%s is built in", name)
 	}
 	fh, errOpen := os.Open(filepath.Join(r.dir, file))
 	if errOpen != nil {
@@ -596,6 +596,13 @@ func parseBang(text string) (name, rest string, err error) {
 	return name, rest, nil
 }
 
+// isBuiltinCommand reports whether name is one of the bridge's own commands
+// (!commands, and !channel and !dm, which move a home thread), which a
+// registry file can't take.
+func isBuiltinCommand(name string) bool {
+	return name == listCommandsName || name == moveChannelName || name == moveDMName
+}
+
 // isBang reports whether text is written as a command.
 func isBang(text string) bool { return strings.HasPrefix(strings.TrimSpace(text), "!") }
 
@@ -618,5 +625,6 @@ func (b *Bridge) commandList() string {
 		head = "No registry commands are set up."
 	}
 	return head + "\n" + strings.Join(append(lines,
-		"Any Claude Code `/command` also works: write it as `!command` (for example `!compact`). Only owners can run commands."), "\n")
+		"Any Claude Code `/command` also works: write it as `!command` (for example `!compact`). Only owners can run commands.",
+		"`!channel` and `!dm` move the agent's thread to the channel or to your DM with the bot (also \"take it to the channel\", \"take it to my DM\")."), "\n")
 }

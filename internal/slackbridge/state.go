@@ -95,8 +95,42 @@ type allowedUser struct {
 	config bool
 }
 
+// threadRef is a session's home thread: the conversation it is in and its
+// top message. Channel is empty only for a thread from a state file written
+// before threads named their conversation; resolve fills in the channel.
+type threadRef struct {
+	Channel string `json:"channel"`
+	TS      string `json:"ts"`
+}
+
+// UnmarshalJSON reads a threadRef, or a bare thread ts as older state files
+// wrote it (Channel left empty).
+func (r *threadRef) UnmarshalJSON(data []byte) error {
+	var ts string
+	if errTS := json.Unmarshal(data, &ts); errTS == nil {
+		*r = threadRef{TS: ts}
+		return nil
+	}
+	type plain threadRef
+	var p plain
+	if errJSON := json.Unmarshal(data, &p); errJSON != nil {
+		return errJSON
+	}
+	*r = threadRef(p)
+	return nil
+}
+
+// Where a session's home thread is: the main channel or an owner's DM.
+const (
+	homeChannel = "channel"
+	homeDM      = "dm"
+)
+
 type stateFile struct {
-	Threads map[string]string `json:"threads"`
+	Threads map[string]threadRef `json:"threads"`
+	// Homes maps a session id to where an owner moved its home thread
+	// (homeChannel or homeDM); without an entry the config's home applies.
+	Homes map[string]string `json:"homes,omitempty"`
 	// Links maps every thread ts linked to a session (not just the first
 	// one in Threads) to its session id.
 	Links   map[string]string `json:"links,omitempty"`
@@ -118,7 +152,8 @@ type state struct {
 	path     string
 	now      func() time.Time
 	mu       sync.Mutex
-	threads  map[string]string      // session id -> its first thread ts (agents post there)
+	threads  map[string]threadRef   // session id -> its home thread (agents post there)
+	homes    map[string]string      // session id -> where an owner moved its home thread
 	sessions map[string]string      // thread ts -> session id, for every linked thread
 	replies  []replyRecord          // delivered messages, oldest first, at most maxReplies
 	dmLinks  []dmLink               // top-level DM messages, oldest first, at most maxDMLinks
@@ -135,7 +170,7 @@ type state struct {
 // loadState reads path; a missing file is an empty state. On a corrupt file it
 // returns an empty state and the error.
 func loadState(path string) (*state, error) {
-	st := &state{path: path, now: time.Now, threads: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, early: map[string]string{}}
+	st := &state{path: path, now: time.Now, threads: map[string]threadRef{}, homes: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, early: map[string]string{}}
 	if path == "" {
 		return st, nil
 	}
@@ -150,9 +185,17 @@ func loadState(path string) (*state, error) {
 	if errJSON := json.Unmarshal(data, &file); errJSON != nil {
 		return st, errJSON
 	}
-	for sid, ts := range file.Threads {
-		st.threads[sid] = ts
-		st.sessions[ts] = sid
+	for sid, ref := range file.Threads {
+		if sid == "" || ref.TS == "" {
+			continue
+		}
+		st.threads[sid] = ref
+		st.sessions[ref.TS] = sid
+	}
+	for sid, home := range file.Homes {
+		if sid != "" && (home == homeChannel || home == homeDM) {
+			st.homes[sid] = home
+		}
 	}
 	for ts, sid := range file.Links {
 		st.sessions[ts] = sid
@@ -312,11 +355,18 @@ func (st *state) remove(id string) error {
 	return errNotAllowed
 }
 
+// thread returns the ts of session sid's home thread.
 func (st *state) thread(sid string) (string, bool) {
+	ref, ok := st.homeThread(sid)
+	return ref.TS, ok
+}
+
+// homeThread returns session sid's home thread.
+func (st *state) homeThread(sid string) (threadRef, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	ts, ok := st.threads[sid]
-	return ts, ok
+	ref, ok := st.threads[sid]
+	return ref, ok
 }
 
 func (st *state) session(ts string) (string, bool) {
@@ -326,15 +376,16 @@ func (st *state) session(ts string) (string, bool) {
 	return sid, ok
 }
 
-// setThread links thread ts to a session, so replies in it reach the
-// session. The session's first thread stays the one its posts go to;
-// setThread reports whether ts became that thread.
-func (st *state) setThread(sid, ts string) bool {
+// setThread links thread ts in channel to a session, so replies in it reach
+// the session. When the session has no home thread yet and canBeHome is
+// set, ts becomes it, and setThread reports that it did; otherwise the home
+// thread stays the one its posts go to.
+func (st *state) setThread(sid, channel, ts string, canBeHome bool) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	first := false
-	if _, ok := st.threads[sid]; !ok {
-		st.threads[sid] = ts
+	if _, ok := st.threads[sid]; !ok && canBeHome {
+		st.threads[sid] = threadRef{Channel: channel, TS: ts}
 		first = true
 	}
 	if !first && st.sessions[ts] == sid {
@@ -345,6 +396,52 @@ func (st *state) setThread(sid, ts string) bool {
 		logSaveError(errSave)
 	}
 	return first
+}
+
+// moveThread makes thread ts in channel session sid's home thread, replacing
+// any it had. An old thread stays linked, so replies in it still reach sid.
+// A non-empty home is recorded as where an owner moved it.
+func (st *state) moveThread(sid, channel, ts, home string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.threads[sid] = threadRef{Channel: channel, TS: ts}
+	st.sessions[ts] = sid
+	if home != "" {
+		st.homes[sid] = home
+	}
+	if errSave := st.saveLocked(); errSave != nil {
+		logSaveError(errSave)
+	}
+}
+
+// home returns where an owner moved session sid's home thread (homeChannel
+// or homeDM), or "" when no one did.
+func (st *state) home(sid string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.homes[sid]
+}
+
+// fillThreadChannels puts channel on home threads loaded from a state file
+// that stored a bare ts (all of those are in the main channel), saving when
+// it changed any.
+func (st *state) fillThreadChannels(channel string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	changed := false
+	for sid, ref := range st.threads {
+		if ref.Channel == "" {
+			ref.Channel = channel
+			st.threads[sid] = ref
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	if errSave := st.saveLocked(); errSave != nil {
+		logSaveError(errSave)
+	}
 }
 
 // record remembers delivered message r (stamped now): where it came from
@@ -700,6 +797,9 @@ func (st *state) saveLocked() error {
 	}
 	st.pruneConvsLocked()
 	file := stateFile{Threads: st.threads, Links: st.sessions, Replies: st.replies, DMLinks: st.dmLinks}
+	if len(st.homes) > 0 {
+		file.Homes = st.homes
+	}
 	if len(st.convs) > 0 {
 		file.Conversations = st.convs
 	}

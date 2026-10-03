@@ -1,7 +1,8 @@
 package config
 
-// SlackConfig connects the agentbus to one Slack channel (catapultam fork).
-// The bridge is off unless every field is set.
+// SlackConfig connects the agentbus to Slack (catapultam fork). The bridge
+// is off unless the tokens and allowed-emails are set, and channel too
+// unless home is "dm".
 type SlackConfig struct {
 	// BotToken is the bot user OAuth token (xoxb-).
 	BotToken string `yaml:"bot-token,omitempty" json:"bot-token,omitempty"`
@@ -11,4 +12,7 @@ type SlackConfig struct {
 	Channel string `yaml:"channel,omitempty" json:"channel,omitempty"`
 	// AllowedEmails seeds the users allowed to instruct sessions.
 	AllowedEmails []string `yaml:"allowed-emails,omitempty" json:"allowed-emails,omitempty"`
+	// Home is where sessions' threads open: "channel" (default) or "dm",
+	// the first allowed-emails user's DM with the bot.
+	Home string `yaml:"home,omitempty" json:"home,omitempty"`
 }

@@ -158,7 +158,7 @@ func TestStateSeedAllowRemove(t *testing.T) {
 	if _, ok := st.user("UJANE2"); ok {
 		t.Fatal("still allowed after remove")
 	}
-	if !st.setThread("sid-a", "1.1") || st.setThread("sid-a", "2.2") {
+	if !st.setThread("sid-a", "CAGENTS", "1.1", true) || st.setThread("sid-a", "CAGENTS", "2.2", true) {
 		t.Fatal("only the first thread is the session's posting thread")
 	}
 	if ts, _ := st.thread("sid-a"); ts != "1.1" {

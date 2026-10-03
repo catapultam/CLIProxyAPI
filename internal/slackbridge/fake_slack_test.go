@@ -288,6 +288,9 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeJSON(w, map[string]any{"ok": true, "channel": map[string]any{"id": "D" + users}})
 		}
+	case "chat.getPermalink":
+		ch, ts := r.PostForm.Get("channel"), r.PostForm.Get("message_ts")
+		writeJSON(w, map[string]any{"ok": true, "channel": ch, "permalink": "https://example.slack.com/archives/" + ch + "/p" + strings.ReplaceAll(ts, ".", "")})
 	case "files.getUploadURLExternal":
 		f.mu.Lock()
 		f.nextFile++

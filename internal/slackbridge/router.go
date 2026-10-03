@@ -127,6 +127,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 			return
 		}
 		if !linked {
+			if home, isMove := parseMove(text); isMove {
+				b.move(ev, user, "", home, "")
+				return
+			}
 			// Answer an unlinked thread once, not on every message in it.
 			if !b.alreadySeen("unlinked:" + ev.ThreadTS) {
 				b.reply(ev, "This thread isn't linked to an agent. "+howToAddress)
@@ -142,6 +146,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 			b.send(ev, user, sid, tagBody, true)
 			return
 		}
+		if home, isMove := parseMove(text); isMove {
+			b.move(ev, user, "", home, "")
+			return
+		}
 		if isBang(text) {
 			// Only !commands needs no target; runCommand explains the rest.
 			b.runCommand(ev, user, "", text, "", false)
@@ -151,6 +159,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		return
 	}
 	notFound := fmt.Sprintf("No agent called `%s`. %s", escape(target), b.onlineHint())
+	if home, isMove := parseMove(body); isMove {
+		b.move(ev, user, target, home, notFound)
+		return
+	}
 	if isBang(body) {
 		b.runCommand(ev, user, target, body, notFound, true)
 		return
@@ -229,8 +241,13 @@ func (b *Bridge) sendTagged(ev messageEvent, user allowedUser, text, own string)
 }
 
 // send delivers text to the session sid, or runs it there when it is a "!"
-// command. adopt is as for deliver.
+// command, or moves sid's home thread when it asks for that (parseMove).
+// adopt is as for deliver.
 func (b *Bridge) send(ev messageEvent, user allowedUser, sid, text string, adopt bool) {
+	if home, isMove := parseMove(text); isMove {
+		b.move(ev, user, sid, home, sessionEnded)
+		return
+	}
 	if isBang(text) {
 		b.runCommand(ev, user, sid, text, sessionEnded, adopt)
 		return
@@ -259,6 +276,10 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 			return
 		}
 		if !linked {
+			if home, isMove := parseMove(text); isMove {
+				b.move(ev, user, "", home, "")
+				return
+			}
 			if !b.alreadySeen("unlinked:" + ev.Channel + ":" + ev.ThreadTS) {
 				b.reply(ev, "This thread isn't linked to an agent. "+howToDM)
 			}
@@ -269,6 +290,10 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 	}
 	if target, body, addressedOK := parseAddressed(text); addressedOK {
 		notFound := fmt.Sprintf("No agent called `%s`. %s", escape(target), b.onlineHint())
+		if home, isMove := parseMove(body); isMove {
+			b.move(ev, user, target, home, notFound)
+			return
+		}
 		if isBang(body) {
 			b.runCommand(ev, user, target, body, notFound, true)
 			return
@@ -278,6 +303,11 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 	}
 	if sid, body, ok := b.tagged(ev, text); ok {
 		b.send(ev, user, sid, body, true)
+		return
+	}
+	if home, isMove := parseMove(text); isMove {
+		// A move names its agent by thread or "name:", never by dmLast.
+		b.move(ev, user, "", home, "")
 		return
 	}
 	sid, ok := b.state.dmLast(ev.User)
@@ -430,7 +460,8 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 // recordDelivery remembers that msgID, delivered to sid, came from ev, so sid
 // can answer in that conversation and thread. With adopt (a top-level post),
 // later messages there reach sid too: in the channel the post's thread
-// becomes one of sid's threads; in a DM the post is linked to sid, so thread
+// becomes one of sid's threads (its home thread when it has none and its
+// home is the channel); in a DM the post is linked to sid, so thread
 // replies under it reach sid. Every delivery from a DM also makes sid the
 // user's dmLast.
 //
@@ -442,7 +473,9 @@ func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, 
 	if !isDM(ev) {
 		reaction := b.state.record(r)
 		if adopt {
-			b.state.setThread(sid, ev.TS)
+			// The post's thread becomes sid's home thread only when sid has
+			// none and its home is the channel; else it is just linked.
+			b.state.setThread(sid, ev.Channel, ev.TS, b.homeOf(sid) == homeChannel)
 		}
 		return reaction
 	}

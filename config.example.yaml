@@ -1202,9 +1202,13 @@ plugins:
 # Slack bridge for the agentbus (catapultam fork). Sessions reach the channel
 # as "slack"; allowed users instruct them by replying in a session's thread.
 # More users can be allowed from Slack with "@agents allow @person".
+# "home" is where sessions' threads open: "channel" (the default) or "dm",
+# the first allowed-emails user's DM with the bot. With "dm", channel is
+# optional. Owners can move one agent's thread with "!channel" or "!dm".
 # slack:
 #   bot-token: "xoxb-..."
 #   app-token: "xapp-..."
 #   channel: "agents"
+#   home: "channel"
 #   allowed-emails:
 #     - "you@example.com"

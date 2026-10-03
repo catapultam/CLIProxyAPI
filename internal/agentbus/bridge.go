@@ -106,6 +106,13 @@ func (s *Store) outboundFor(sessionID, body string) (Outbound, error) {
 	return s.outboundLocked(sessionID, sess, body), nil
 }
 
+// SessionOutbound returns what the bridge needs to post as the session with
+// id sessionID (address, name and machine, with no body), or
+// ErrUnknownSender. Only a session id matches, never a name or address.
+func (s *Store) SessionOutbound(sessionID string) (Outbound, error) {
+	return s.outboundFor(sessionID, "")
+}
+
 func isSlackAddress(target string) bool {
 	return strings.EqualFold(strings.TrimSpace(target), SlackAddress)
 }

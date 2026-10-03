@@ -190,6 +190,15 @@ func (a *api) postMessage(ctx context.Context, token, channel, text, threadTS st
 	return body.Get("ts").String(), nil
 }
 
+// permalink returns a link to message ts in channel.
+func (a *api) permalink(ctx context.Context, token, channel, ts string) (string, error) {
+	body, err := a.call(ctx, token, "chat.getPermalink", url.Values{"channel": {channel}, "message_ts": {ts}})
+	if err != nil {
+		return "", err
+	}
+	return body.Get("permalink").String(), nil
+}
+
 func (a *api) addReaction(ctx context.Context, token, channel, ts, name string) error {
 	_, err := a.call(ctx, token, "reactions.add", url.Values{"channel": {channel}, "timestamp": {ts}, "name": {name}})
 	var apiErr *apiError

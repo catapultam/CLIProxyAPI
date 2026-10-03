@@ -654,3 +654,49 @@ input.
 - *Scopes.* `mpim:write` (opening group DMs) and `mpim:read` are added to
   the manifest; `mpim:history` and `message.mpim` were already there, and
   `channels:history` / `groups:history` cover linked channels.
+
+**Home thread placement (Task 7).** `slack.home` is `channel` (default; the
+old behavior) or `dm`, case-insensitive; anything else logs a warning and
+means `channel`. With `dm`, `channel` is optional (the bridge needs the
+tokens and `allowed-emails`, plus `channel` only for home `channel`), and
+`resolve()` opens `conversations.open users=<first resolved owner>`: new
+sessions' header threads open in that owner's DM with the bot instead of
+the channel. A configured channel still works as a place to talk to agents
+(inbound routing unchanged), but a top-level `name: …` there no longer
+makes the post the agent's home thread; it is only linked. The startup line
+reads `slack: bridge on, home dm (<label>)[, channel <name>]` or `home
+channel <name>`. `slack-state.json` `threads` now stores `{channel, ts}` per
+session; a bare ts from an older file loads with no channel and gets the
+configured channel at `resolve()` (a thread whose channel can't be known
+opens a new one in the home). Existing threads stay where they are: only
+sessions without a thread open in the new home. Inbound in the home DM is
+the DM routing above: a thread reply under an agent's header reaches it
+(the thread is linked through `links`), `name: …` and `dm_last` work at the
+top level, and deliveries carry `via=dm`. The inject note says "Your
+messages go to your own thread in Slack" (no channel).
+
+- *Moving one agent.* Owners say `!channel` or `!dm` (anything after the
+  word is ignored), or exactly one of "take it to the channel", "move it to
+  the channel", "move to the channel", "take it to dm", "take it to my dm",
+  "move it to dm", "move to dm" (case-insensitive, trailing punctuation
+  ignored), in the agent's thread (channel, DM or a conversation it is
+  linked to), or as `name: !channel` at the top level. These are bridge
+  commands: never delivered to an agent, and `channel`/`dm` can't be
+  registry names. A non-owner gets "Only people set in config.yaml
+  (allowed-emails) can move an agent's thread." (logged); anywhere else
+  (bare top level, an unlinked thread) the help line. `!dm` means the asking
+  owner's own DM with the bot. `!channel` without a configured channel
+  answers "No channel is configured."; a move to where the home thread
+  already is answers "Already there.". Otherwise, in a command job holding
+  the session's opening gate, the bridge posts a new header in the target
+  (ending "(moved from DM)" or "(moved from <#channel>)" when there was an
+  old thread), makes it `threads[sid]` and records `homes[sid]` =
+  `channel|dm` (persisted; like `threads` and `links`, never pruned). The
+  old thread stays in `links`, so replies there still reach the agent. It
+  posts "Moved to <#channel>|DM → <permalink>" (`chat.getPermalink`; the
+  link is left out if that fails) in the old thread, and also in place when
+  the command was given elsewhere, then delivers the notice "Your Slack home
+  thread moved to <place>. Your messages go there now." (`DeliverNotice`).
+  `homes[sid]` decides where a new thread opens if the session has none
+  (for `dm`, the first owner's DM) and keeps a channel post from becoming a
+  DM-homed agent's home thread.
