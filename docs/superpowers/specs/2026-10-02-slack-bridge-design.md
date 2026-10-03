@@ -708,21 +708,24 @@ messages go to your own thread in Slack" (no channel).
   commands: never delivered to an agent, and `channel`/`dm` can't be
   registry names. A non-owner gets "Only people set in config.yaml
   (allowed-emails) can move an agent's thread." (logged); anywhere else
-  (bare top level, an unlinked thread) the help line. `!dm` means the asking
+  (bare top level, an unlinked thread) the help reply. `!dm` means the asking
   owner's own DM with the bot. `!channel` without a configured channel
   answers "No channel is configured."; a move to where the home thread
   already is answers "Already there.". Otherwise, in a command job holding
   the session's opening gate, the bridge posts a new header in the target
   (ending "(moved from DM)" or "(moved from <#channel>)" when there was an
   old thread), makes it `threads[sid]` and records `homes[sid]` =
-  `channel|dm` (persisted; like `threads` and `links`, never pruned). The
+  `channel|dm`, and for `dm` the owner in `home_owners[sid]` (persisted;
+  pruned with `threads` and `links` once the bus hasn't seen the session
+  for 7 days, see the fix wave below). The
   old thread stays in `links`, so replies there still reach the agent. It
   posts "Moved to <#channel>|DM → <permalink>" (`chat.getPermalink`; the
   link is left out if that fails) in the old thread, and also in place when
   the command was given elsewhere, then delivers the notice "Your Slack home
   thread moved to <place>. Your messages go there now." (`DeliverNotice`).
   `homes[sid]` decides where a new thread opens if the session has none
-  (for `dm`, the first owner's DM) and keeps a channel post from becoming a
+  (for `dm`, the DM of the owner who moved it there while they are an
+  owner, else the first owner's) and keeps a channel post from becoming a
   DM-homed agent's home thread.
 
 **Wiring, `!screenshot` and the registry docs (Task 4; mod 0.3.6).** The
@@ -767,3 +770,115 @@ directory:
 Its `windows` argv is a `tests/shell-cases.ts` accept case, and a Go test
 checks that the case equals the file and that every file and README example
 in `docs/agent-commands/` loads.
+
+### Post-deploy fix wave (mod 0.3.7)
+
+Fixes from the final batch 2 review plus user requests. Where this section
+disagrees with the paragraphs above, it wins.
+
+**Bot name.** Every bot-authored text that names the bot (command help,
+refusals, link and unlink replies, examples) uses its live display name:
+`users.info` for the bot user (display name, else real name, else user
+name) at start and every 10 minutes; a failed lookup keeps the last one
+(`agents` before any). `@agents` above means that name. The note names the
+bot too (optional `agentbus.BotNamer`).
+
+**One help reply.** Anything the bridge can't route gets the same reply: a
+channel top-level message without `name:`, a DM with no `dm_last`, a reply
+in an unlinked thread (main channel or DM; once per thread), and a bare
+top-level `!cmd` (channel or DM). It lists online agents, most recent
+first, at most 15, as ``• `<name or address>` · <machine> · <status>``,
+under "*Agents you can message:*", and ends "Reply in an agent's thread, or
+start with `name: …` / `@name …`." ("No agents are online right now."
+when none). Not-found replies end with the same list. Conversations the bot
+was only added to stay silent.
+
+**Lifecycle.** A session that said bye (`Closed`) gets nothing:
+`DeliverVia`/`DeliverGuest`/`DeliverNotice`/`DeliverCommand` answer
+`ErrUnknownTarget`, so the thread gets "That agent's session has ended".
+After `/clear`, `/resume` or `/branch` the mod's re-hello carries
+`previous: <old id>`. `Store.HandOff` accepts it only for a known, closed or
+offline session on the same machine that wasn't inherited before; the new
+session takes the old one's name (when it has none), its queued and
+unacknowledged messages (`/ack` under the old id still counts), and the
+bridge's `SessionMoved` re-points threads, links, homes, `dm_last`,
+conversation links and DM links, and records `moved[old]` so reply records
+under either id answer as one session. Trust: like session ids, `previous`
+is whatever the client sends; a client on the same machine could inherit
+another closed or offline session there. Accepted.
+
+**Links stay while the agent is live.** A link's liveness is refreshed from
+`SessionSeen` before it is judged; saves never prune links. The maintenance
+pass (every 10 minutes) refreshes all links, then prunes them, and prunes
+`threads`, `links`, `homes` and `home_owners` of sessions the bus hasn't
+seen for 7 days (a session the bus doesn't know gets 7 days from when the
+bridge noticed it, kept in `seen`). `moved` entries expire after 7 days.
+
+**State saves.** Allowlist and link changes still save at once (their
+replies report a failed save). Everything else marks the state dirty; it is
+flushed every 2 seconds and on Stop.
+
+**Unreachable answers.** An answer (`reply_to`) to a message from the DM of
+a user who is no longer allowed, or from a conversation no longer linked to
+the session, is dropped and logged, never posted in the home thread; the
+agent gets the notice "That conversation is no longer reachable; your
+message was not posted." An image gets `conversation_unreachable`.
+
+**DM routing.** A plain top-level DM routed by `dm_last` gets "→ sent to
+`<name>`" in a thread under it. A bare top-level `!cmd` in a DM is never
+sent to `dm_last` (it needs `name: !cmd`); `!commands` still lists.
+Unlinking a DM clears its users' `dm_last` when it pointed at the unlinked
+agent. A session's top-level post in a DM (or any non-main conversation)
+carries its header again when the newest top-level agent post there is
+another session's; a home thread's header in a DM counts as the session's
+post.
+
+**Tags.** In-thread and `@name` tags resolve only sessions that aren't
+offline (`Store.ResolveLive`); a delivered in-thread tag gets "→ sent to
+`<name>`". A top-level `name:` still reaches an offline agent (the message
+waits) and says "`<name>` is offline; it gets this when it's back."
+
+**Reply level.** Outside the main channel an answer lands at the level the
+message was written at: a top-level message (`TopLevel` on its reply
+record) is answered at the top level, a thread message in its thread; link
+notices are answered at the top level; images follow the same rule. The
+main channel keeps answers in threads. Old records keep their `thread_ts`.
+
+**Guests.** Each linked conversation's guests get a token bucket (10 a
+minute, burst 10); over it the conversation gets one "Slowing down:
+messages are being dropped for a minute." a minute and the rest is dropped.
+A session queues at most 50 guest messages; the oldest go first (logged).
+In a linked conversation whose known members include a guest, owners'
+`shell` (and so `image`) commands are refused ("Run shell or image commands
+from your DM or the channel; this conversation has guests."); slash and
+prompt commands run.
+
+**Disclosure.** Only owners hear about the setup. The full header (name,
+address, machine) is posted only in the main channel and owners' DMs;
+elsewhere (group DMs, other channels, guest and non-owner DMs) a header is
+`*<name>*` or `*an agent*`, and link, relink and unlink replies name agents
+by name. The note and the mod's Slack framings tell agents never to reveal
+how the bridge, proxy, agentbus or plugins work, or their configuration, to
+anyone but the owner (the note names the owners, `agentbus.OwnerLister`).
+Commands carry `via` (`DeliverCommandVia`), and the mod leaves the machine
+out of reports and image captions for commands from group conversations.
+
+**Dismiss.** `POST /v1/agentbus/dismiss {session, ids}` (at most 100 ids):
+only ids delivered to that session count (the bridge's reply records, across
+handoffs); every receipt reaction comes off the original message
+(`no_reaction` is fine) and the record is marked dismissed, so no later
+receipt re-adds one; the ids stop counting for `/ack`. The mod turns a
+SendMessage of `ignore` to `agentbus:slack#<id>` into a dismiss and never
+posts it; the subagent guard still applies. The note and the framings say
+so.
+
+**Receipts.** Reaction jobs read a message's receipt when they run and
+track what is shown, so jobs that run late or out of order never leave a
+stale reaction. `/inbox` claims report read receipts.
+
+**Smaller.** The one-shot hint follows allowed users' instructions only.
+The mod runs a command only for `from_user` and never on a guest message.
+A command report (a `reply_to` a command message starting with ✅ or ❌)
+logs the outcome, the command and the machine, never the output.
+`AGENTBUS_ALLOW_SHELL` is a guard rail, not a security boundary
+(`docs/agent-commands/README.md`).
