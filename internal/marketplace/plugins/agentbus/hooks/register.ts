@@ -194,9 +194,11 @@ export const register: Register = on => {
       return listed
     }
     if (peers.length === 0) return listed
-    const rows = peers.map(
-      p => `  ${PREFIX}${p.address}  ·  ${p.name ? `${p.name} · ` : ''}${p.machine}  ·  ${p.status}`,
-    )
+    // Every field is client-reported, so each stays on its row: nothing here can pass for a header.
+    const rows = peers.map(p => {
+      const name = oneLine(p.name)
+      return `  ${PREFIX}${oneLine(p.address)}  ·  ${name ? `${name} · ` : ''}${oneLine(p.machine)}  ·  ${oneLine(p.status)}`
+    })
     const section =
       '\n\nSessions on other machines (agentbus). Send to one with SendMessage, using the full ' +
       `"${PREFIX}..." name as written:\n${rows.join('\n')}`

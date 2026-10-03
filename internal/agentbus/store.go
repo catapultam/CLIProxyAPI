@@ -54,6 +54,9 @@ var (
 	// validName keeps a name to one plain word, so it can't imitate the
 	// header the proxy writes for a Slack user's instruction.
 	validName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	// validMachine keeps a client-reported machine to one plain word too:
+	// /peers returns it verbatim and the mod prints it into ListAgents.
+	validMachine = validName
 	// validReplyTo is the shape of an id from newMessageID.
 	validReplyTo = regexp.MustCompile(`^m_[0-9a-f]{1,64}$`)
 )
@@ -169,7 +172,7 @@ func (s *Store) EndRequest(id string) {
 
 // Hello records what a client reports: machine, cwd and an optional friendly
 // name. A name already used by another session, or one validName rejects, is
-// ignored. /hello and /wait
+// ignored, and so is a machine validMachine rejects. /hello and /wait
 // are also reachable from curl and the legacy wait.sh hook, so reaching this
 // method does not by itself mean the agentbus mod is running: mod is true
 // only when the caller sent an explicit marker (the /hello body's "mod"
@@ -186,7 +189,7 @@ func (s *Store) Hello(id, machine, cwd, name string, mod bool) {
 		sess.Mod = true
 	}
 	sess.Closed = false
-	if machine = strings.TrimSpace(machine); machine != "" {
+	if machine = strings.TrimSpace(machine); validMachine.MatchString(machine) {
 		sess.Machine = machine
 	}
 	if cwd = strings.TrimSpace(cwd); cwd != "" {
@@ -611,8 +614,9 @@ func (s *Store) Save() error {
 	return errMarshal
 }
 
-// Load restores sessions and inboxes; a missing file is not an error. Names
-// and queued messages saved before names were restricted are cleaned up.
+// Load restores sessions and inboxes; a missing file is not an error. Names,
+// machines and queued messages saved before they were restricted are cleaned
+// up.
 func (s *Store) Load() error {
 	if s.path == "" {
 		return nil
@@ -636,6 +640,10 @@ func (s *Store) Load() error {
 		}
 		if sess.Name != "" && !validName.MatchString(sess.Name) {
 			sess.Name = ""
+			s.dirty = true
+		}
+		if sess.Machine != "" && !validMachine.MatchString(sess.Machine) {
+			sess.Machine = ""
 			s.dirty = true
 		}
 		for i := range sess.Inbox {
