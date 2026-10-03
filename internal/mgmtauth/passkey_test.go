@@ -320,3 +320,29 @@ func TestCeremonyCacheUnknownID(t *testing.T) {
 		t.Fatal("expected an unknown ceremony id to be rejected")
 	}
 }
+
+// TestCeremonyCacheCapsPendingCeremonies verifies Begin refuses to grow the
+// cache past MaxPendingCeremonies, protecting against an unbounded-memory
+// DoS from a client that only ever calls begin.
+func TestCeremonyCacheCapsPendingCeremonies(t *testing.T) {
+	clock := newMockClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	cache := NewCeremonyCache(clock)
+
+	for i := 0; i < MaxPendingCeremonies; i++ {
+		if _, err := cache.Begin(webauthn.SessionData{Challenge: "abc"}); err != nil {
+			t.Fatalf("Begin() #%d: %v", i, err)
+		}
+	}
+
+	if _, err := cache.Begin(webauthn.SessionData{Challenge: "overflow"}); err != ErrTooManyCeremonies {
+		t.Fatalf("Begin() at capacity: err = %v, want ErrTooManyCeremonies", err)
+	}
+
+	// Expiring everything and advancing past the cache's internal purge
+	// interval frees room again; a purge can happen even without reaching
+	// the interval once the cache is at capacity.
+	clock.Advance(CeremonyTTL + time.Second)
+	if _, err := cache.Begin(webauthn.SessionData{Challenge: "after-purge"}); err != nil {
+		t.Fatalf("Begin() after expiry: %v", err)
+	}
+}

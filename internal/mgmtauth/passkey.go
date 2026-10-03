@@ -178,14 +178,28 @@ type Ceremony struct {
 	ExpiresAt time.Time
 }
 
+// MaxPendingCeremonies caps the number of outstanding ceremonies, so an
+// attacker spamming begin endpoints cannot grow the cache without bound.
+const MaxPendingCeremonies = 256
+
+// ceremonyPurgeMinInterval bounds how often Begin scans for expired entries
+// when the cache is not already at capacity, so a steady trickle of begins
+// does not pay an O(n) purge scan on every single call.
+const ceremonyPurgeMinInterval = 10 * time.Second
+
+// ErrTooManyCeremonies is returned by Begin when MaxPendingCeremonies
+// pending ceremonies already exist, even after purging expired ones.
+var ErrTooManyCeremonies = errors.New("mgmtauth: too many pending ceremonies")
+
 // CeremonyCache holds single-use, TTL-bound WebAuthn ceremonies in memory
 // only, as the management login design requires: no persistence, so a
 // restart mid-ceremony just means pressing the button again.
 type CeremonyCache struct {
 	clock Clock
 
-	mu    sync.Mutex
-	items map[string]Ceremony
+	mu        sync.Mutex
+	items     map[string]Ceremony
+	lastPurge time.Time
 }
 
 // NewCeremonyCache creates an empty cache driven by clock. A nil clock uses
@@ -198,15 +212,27 @@ func NewCeremonyCache(clock Clock) *CeremonyCache {
 }
 
 // Begin stores session under a fresh random ceremony id and returns the id.
+// It returns ErrTooManyCeremonies when MaxPendingCeremonies are already
+// outstanding even after an expiry purge.
 func (c *CeremonyCache) Begin(session webauthn.SessionData) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.clock.Now()
+	atCapacity := len(c.items) >= MaxPendingCeremonies
+	if atCapacity || now.Sub(c.lastPurge) >= ceremonyPurgeMinInterval {
+		c.purgeExpiredLocked(now)
+		c.lastPurge = now
+	}
+	if len(c.items) >= MaxPendingCeremonies {
+		return "", ErrTooManyCeremonies
+	}
+
 	id, err := randomCeremonyID()
 	if err != nil {
 		return "", err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.purgeExpiredLocked()
-	c.items[id] = Ceremony{Session: session, ExpiresAt: c.clock.Now().Add(CeremonyTTL)}
+	c.items[id] = Ceremony{Session: session, ExpiresAt: now.Add(CeremonyTTL)}
 	return id, nil
 }
 
@@ -228,8 +254,7 @@ func (c *CeremonyCache) Take(id string) (webauthn.SessionData, bool) {
 	return ceremony.Session, true
 }
 
-func (c *CeremonyCache) purgeExpiredLocked() {
-	now := c.clock.Now()
+func (c *CeremonyCache) purgeExpiredLocked(now time.Time) {
 	for id, ceremony := range c.items {
 		if !now.Before(ceremony.ExpiresAt) {
 			delete(c.items, id)
