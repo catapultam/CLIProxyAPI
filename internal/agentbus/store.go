@@ -85,6 +85,9 @@ type Message struct {
 	// and DeliverCommand set it; clients can never send it.
 	FromUser  bool   `json:"from_user,omitempty"`
 	SlackUser string `json:"slack_user,omitempty"`
+	// Via is ViaDM when an allowed Slack user wrote this to the bot in a
+	// direct message. Only DeliverVia sets it; clients can never send it.
+	Via string `json:"via,omitempty"`
 	// SlackUserID is the Slack user ID of the owner who sent Command. Only
 	// DeliverCommand sets it, and /wait re-checks it before handing the
 	// command out.
@@ -279,7 +282,7 @@ func (s *Store) SetModVersion(id, version string) {
 }
 
 func (s *Store) nameFree(name, exceptID string) bool {
-	if isSlackAddress(name) {
+	if isReservedTarget(name) {
 		return false
 	}
 	now := s.now()
@@ -365,11 +368,11 @@ func (s *Store) Resolve(target string) (string, bool) {
 }
 
 // resolveLocked finds a session by friendly name or address. The reserved
-// "slack" address never resolves to a session, even a legacy one still
-// carrying that name from before nameFree rejected it.
+// "slack" and "slack@<label>" addresses never resolve to a session, even a
+// legacy one still carrying that name from before nameFree rejected it.
 func (s *Store) resolveLocked(target string) (string, bool) {
 	target = strings.TrimSpace(target)
-	if target == "" || isSlackAddress(target) {
+	if target == "" || isReservedTarget(target) {
 		return "", false
 	}
 	lower := strings.ToLower(target)
@@ -405,14 +408,19 @@ func newMessageID() string {
 }
 
 // Send queues a message from a known session to a name or address. Messages
-// to SlackAddress go to the bridge instead of an inbox. A replyTo that isn't
-// a message id is dropped.
+// to SlackAddress go to the bridge instead of an inbox, and so do messages to
+// "slack@<label>" (a DM) when label is one of the bridge's allowed users;
+// any other "slack@..." is ErrUnknownSlackUser. A replyTo that isn't a
+// message id is dropped.
 func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	if strings.TrimSpace(body) == "" {
 		return Message{}, ErrEmptyBody
 	}
 	if len(body) > MaxBodyBytes {
 		return Message{}, ErrBodyTooLarge
+	}
+	if label, dm := slackDMLabel(to); dm {
+		return s.sendDM(fromID, label, body)
 	}
 	s.mu.Lock()
 	from, ok := s.byID[fromID]
@@ -421,16 +429,7 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 		return Message{}, ErrUnknownSender
 	}
 	replyTo = cleanReplyTo(replyTo)
-	msg := Message{
-		ID:        newMessageID(),
-		From:      s.addressLocked(from),
-		Body:      body,
-		ReplyTo:   replyTo,
-		CreatedAt: s.now(),
-	}
-	if from.Name != "" {
-		msg.From = from.Name + " (" + msg.From + ")"
-	}
+	msg := s.sentLocked(from, body, replyTo)
 	if b := s.bridge; b != nil && isSlackAddress(to) {
 		out := s.outboundLocked(fromID, from, body)
 		out.ReplyTo = replyTo
@@ -448,6 +447,22 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	msg.To = s.addressLocked(target)
 	s.enqueueLocked(target, msg)
 	return msg, nil
+}
+
+// sentLocked builds a message from session from, without To. The caller
+// holds s.mu.
+func (s *Store) sentLocked(from *session, body, replyTo string) Message {
+	msg := Message{
+		ID:        newMessageID(),
+		From:      s.addressLocked(from),
+		Body:      body,
+		ReplyTo:   replyTo,
+		CreatedAt: s.now(),
+	}
+	if from.Name != "" {
+		msg.From = from.Name + " (" + msg.From + ")"
+	}
+	return msg
 }
 
 // cleanReplyTo returns replyTo trimmed, or empty when it isn't a message id.
@@ -815,13 +830,18 @@ func (s *Store) Load() error {
 	return nil
 }
 
-// cleanLoadedMessage drops an invalid reply_to and, on a message from a
-// session, a sender name validName rejects (keeping the sender's address).
+// cleanLoadedMessage drops an invalid reply_to, a via that isn't ViaDM on a
+// Slack user's message and, on a message from a session, any via and a
+// sender name validName rejects (keeping the sender's address).
 // It reports whether it changed m.
 func cleanLoadedMessage(m *Message) bool {
 	changed := false
 	if m.ReplyTo != "" && !validReplyTo.MatchString(m.ReplyTo) {
 		m.ReplyTo = ""
+		changed = true
+	}
+	if m.Via != "" && (m.Via != ViaDM || !m.FromUser) {
+		m.Via = ""
 		changed = true
 	}
 	if m.FromUser {

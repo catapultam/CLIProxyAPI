@@ -2,11 +2,27 @@ package agentbus
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 )
 
-// SlackAddress is the reserved bus address of the Slack bridge.
+// SlackAddress is the reserved bus address of the Slack bridge. A DM to an
+// allowed Slack user is addressed "slack@<label>"; every "slack@..." target
+// is reserved too and never resolves to a session.
 const SlackAddress = "slack"
+
+// ViaDM marks a message an allowed Slack user wrote to the bot in a direct
+// message, not in the channel.
+const ViaDM = "dm"
+
+var (
+	// ErrUnknownSlackUser is a "slack@<label>" target whose label isn't an
+	// allowed Slack user. It is an ErrUnknownTarget.
+	ErrUnknownSlackUser = fmt.Errorf("%w: no allowed Slack user with that label", ErrUnknownTarget)
+	// ErrInvalidVia is a Via value DeliverVia doesn't know.
+	ErrInvalidVia = errors.New("invalid via")
+)
 
 // Outbound is a message a session sent to SlackAddress, with what the bridge
 // needs to label the session's thread.
@@ -20,6 +36,10 @@ type Outbound struct {
 	// Slack thread that message came from only when it was delivered to this
 	// session; otherwise it uses the session's own thread.
 	ReplyTo string
+	// DM is the label of the allowed Slack user this message is a direct
+	// message to, or empty. The Store sets it only to a label the bridge's
+	// Users listed; a DM ignores ReplyTo.
+	DM string
 }
 
 // Bridge carries messages between the bus and Slack. Store calls it without
@@ -84,11 +104,81 @@ func isSlackAddress(target string) bool {
 	return strings.EqualFold(strings.TrimSpace(target), SlackAddress)
 }
 
+// slackDMLabel splits a "slack@<label>" target (the prefix compared
+// case-insensitively) and returns the trimmed label, which may be empty. ok
+// is false for any other target.
+func slackDMLabel(target string) (label string, ok bool) {
+	target = strings.TrimSpace(target)
+	prefix := SlackAddress + "@"
+	if len(target) < len(prefix) || !strings.EqualFold(target[:len(prefix)], prefix) {
+		return "", false
+	}
+	return strings.TrimSpace(target[len(prefix):]), true
+}
+
+// isReservedTarget reports whether target is "slack" or "slack@...", which
+// never name a session.
+func isReservedTarget(target string) bool {
+	_, dm := slackDMLabel(target)
+	return dm || isSlackAddress(target)
+}
+
+// slackDMTarget checks a DM label against bridge's allowed users, compared
+// case-insensitively, and returns it as the bridge spells it, or
+// ErrUnknownSlackUser. It calls bridge.Users, so the caller must not hold
+// s.mu.
+func slackDMTarget(bridge Bridge, label string) (string, error) {
+	if bridge == nil || label == "" {
+		return "", ErrUnknownSlackUser
+	}
+	for _, u := range bridge.Users() {
+		if strings.EqualFold(u, label) {
+			return u, nil
+		}
+	}
+	return "", ErrUnknownSlackUser
+}
+
+// sendDM hands body from a known session to the bridge as a DM to the allowed
+// Slack user label names. A DM ignores reply_to.
+func (s *Store) sendDM(fromID, label, body string) (Message, error) {
+	bridge := s.currentBridge()
+	// Users is asked before taking s.mu (the lock rule).
+	canonical, errLabel := slackDMTarget(bridge, label)
+	s.mu.Lock()
+	from, ok := s.byID[fromID]
+	if !ok {
+		s.mu.Unlock()
+		return Message{}, ErrUnknownSender
+	}
+	if errLabel != nil {
+		s.mu.Unlock()
+		return Message{}, errLabel
+	}
+	msg := s.sentLocked(from, body, "")
+	msg.To = SlackAddress + "@" + canonical
+	out := s.outboundLocked(fromID, from, body)
+	out.DM = canonical
+	s.mu.Unlock()
+	bridge.Post(out)
+	return msg, nil
+}
+
 // Deliver queues a message from an allowed Slack user for a session given by
 // id, name or address, and returns that session's id and the new message's
-// id. Only the Slack bridge calls it, and together with DeliverCommand it is
-// the only way a message gets FromUser.
+// id. Only the Slack bridge calls it, and together with DeliverVia and
+// DeliverCommand it is the only way a message gets FromUser.
 func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string, err error) {
+	return s.DeliverVia(target, body, slackUser, "")
+}
+
+// DeliverVia is Deliver for a message that reached the bridge other than in
+// the channel: via is ViaDM for a direct message, or empty. Only the Slack
+// bridge calls it, and it is the only way a message gets Via.
+func (s *Store) DeliverVia(target, body, slackUser, via string) (sessionID, msgID string, err error) {
+	if via != "" && via != ViaDM {
+		return "", "", ErrInvalidVia
+	}
 	if strings.TrimSpace(body) == "" {
 		return "", "", ErrEmptyBody
 	}
@@ -102,6 +192,7 @@ func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string
 		return "", "", err
 	}
 	msg := s.fromSlackLocked(sess, body, slackUser)
+	msg.Via = via
 	s.enqueueLocked(sess, msg)
 	return id, msg.ID, nil
 }
@@ -109,11 +200,11 @@ func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string
 // deliverTargetLocked finds the session the bridge addresses as target (id,
 // name or address). The caller holds s.mu.
 func (s *Store) deliverTargetLocked(target string) (string, *session, error) {
-	if isSlackAddress(target) {
+	if isReservedTarget(target) {
 		// A session id is whatever the client sends in /hello, so a client
-		// could register "slack" as its own session id and otherwise reach
-		// this through the byID fast path below. Reject it the same way
-		// resolveLocked rejects the name/address forms.
+		// could register "slack" (or "slack@alex") as its own session id and
+		// otherwise reach this through the byID fast path below. Reject it
+		// the same way resolveLocked rejects the name/address forms.
 		return "", nil, ErrUnknownTarget
 	}
 	id := strings.TrimSpace(target)

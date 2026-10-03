@@ -12,6 +12,7 @@ import (
 const (
 	defaultWaitTimeout = 50 * time.Second
 	waitRecheckEvery   = time.Second
+	slackUserNotFound  = "no allowed Slack user with that label (or Slack is off); slack@<label> takes a label the agentbus note lists"
 )
 
 // Register mounts the agentbus endpoints on group (mounted under
@@ -48,6 +49,8 @@ func (s *Store) handleSend(c *gin.Context) {
 	switch {
 	case err == nil:
 		c.JSON(http.StatusOK, gin.H{"id": msg.ID, "to": msg.To})
+	case errors.Is(err, ErrUnknownSlackUser):
+		c.JSON(http.StatusNotFound, gin.H{"error": slackUserNotFound})
 	case errors.Is(err, ErrUnknownTarget):
 		c.JSON(http.StatusNotFound, gin.H{"error": "no session with that name or address; list peers first"})
 	case errors.Is(err, ErrUnknownSender):

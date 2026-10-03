@@ -43,6 +43,7 @@ type uploadForm struct {
 	session  string
 	caption  string
 	replyTo  string
+	to       string
 	filename string
 	data     []byte
 	hasFile  bool
@@ -56,12 +57,15 @@ type uploadError struct {
 
 // handleSlackUpload posts an image into the sending session's Slack thread:
 // its own, or, with a reply_to the bridge delivered to that session, the
-// thread that message came from. The client never names a thread or channel.
-// The body is multipart/form-data (streamed part by part into memory, never
-// spooled to disk) or application/json with the image in base64; both go
-// through the same checks.
+// thread that message came from. With to = "slack@<label>" it goes to that
+// allowed user's DM instead (the same rule as Send; reply_to is ignored).
+// The client never names a thread or channel. The body is
+// multipart/form-data (streamed part by part into memory, never spooled to
+// disk) or application/json with the image in base64; both go through the
+// same checks.
 func (s *Store) handleSlackUpload(c *gin.Context) {
-	poster, ok := s.currentBridge().(ImagePoster)
+	bridge := s.currentBridge()
+	poster, ok := bridge.(ImagePoster)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "slack is not enabled"})
 		return
@@ -96,6 +100,10 @@ func (s *Store) handleSlackUpload(c *gin.Context) {
 		return
 	}
 	out.ReplyTo = cleanReplyTo(form.replyTo)
+	if errTo := uploadTarget(bridge, &out, form.to); errTo != nil {
+		c.JSON(errTo.status, gin.H{"error": errTo.msg})
+		return
+	}
 	if !form.hasFile {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
 		return
@@ -113,8 +121,28 @@ func (s *Store) handleSlackUpload(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// readUploadForm streams the multipart body: session, caption and reply_to up
-// to maxFieldBytes each, the file up to maxImageBytes. Other parts are
+// uploadTarget applies an upload's to field: empty or "slack" keeps the
+// session's thread, "slack@<label>" makes out a DM to that allowed user
+// (dropping its reply_to), and anything else is refused. It calls the
+// bridge's Users, so the caller must not hold s.mu.
+func uploadTarget(bridge Bridge, out *Outbound, to string) *uploadError {
+	if to == "" || isSlackAddress(to) {
+		return nil
+	}
+	label, dm := slackDMLabel(to)
+	if !dm {
+		return &uploadError{http.StatusBadRequest, `to must be "slack" or "slack@<label>"`}
+	}
+	canonical, errLabel := slackDMTarget(bridge, label)
+	if errLabel != nil {
+		return &uploadError{http.StatusNotFound, slackUserNotFound}
+	}
+	out.DM, out.ReplyTo = canonical, ""
+	return nil
+}
+
+// readUploadForm streams the multipart body: session, caption, reply_to and
+// to up to maxFieldBytes each, the file up to maxImageBytes. Other parts are
 // skipped. A repeated field keeps its last value; a second file is refused.
 func readUploadForm(r *http.Request) (uploadForm, *uploadError) {
 	var form uploadForm
@@ -131,7 +159,7 @@ func readUploadForm(r *http.Request) (uploadForm, *uploadError) {
 			return form, readFailure(errPart)
 		}
 		switch name := part.FormName(); name {
-		case "session", "caption", "reply_to":
+		case "session", "caption", "reply_to", "to":
 			value, errRead := io.ReadAll(io.LimitReader(part, maxFieldBytes+1))
 			if errRead != nil {
 				return form, readFailure(errRead)
@@ -145,6 +173,8 @@ func readUploadForm(r *http.Request) (uploadForm, *uploadError) {
 				form.session = v
 			case "caption":
 				form.caption = v
+			case "to":
+				form.to = v
 			default:
 				form.replyTo = v
 			}
@@ -177,6 +207,7 @@ type uploadJSON struct {
 	Session    string  `json:"session"`
 	Caption    string  `json:"caption"`
 	ReplyTo    string  `json:"reply_to"`
+	To         string  `json:"to"`
 	Filename   string  `json:"filename"`
 	DataBase64 *string `json:"data_base64"`
 }
@@ -190,7 +221,7 @@ func readUploadJSON(r *http.Request) (uploadForm, *uploadError) {
 		return form, bodyFailure(errDecode, "invalid JSON body")
 	}
 	for _, field := range []struct{ name, value string }{
-		{"session", req.Session}, {"caption", req.Caption}, {"reply_to", req.ReplyTo}, {"filename", req.Filename},
+		{"session", req.Session}, {"caption", req.Caption}, {"reply_to", req.ReplyTo}, {"to", req.To}, {"filename", req.Filename},
 	} {
 		if len(field.value) > maxFieldBytes {
 			return form, &uploadError{http.StatusBadRequest, field.name + " exceeds 4 KiB"}
@@ -199,6 +230,7 @@ func readUploadJSON(r *http.Request) (uploadForm, *uploadError) {
 	form.session = strings.TrimSpace(req.Session)
 	form.caption = strings.TrimSpace(req.Caption)
 	form.replyTo = strings.TrimSpace(req.ReplyTo)
+	form.to = strings.TrimSpace(req.To)
 	form.filename = strings.TrimSpace(req.Filename)
 	if req.DataBase64 == nil {
 		return form, nil
