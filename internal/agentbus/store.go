@@ -77,6 +77,7 @@ type session struct {
 	FirstSeen   time.Time `json:"first_seen"`
 	LastRequest time.Time `json:"last_request"`
 	WaiterSeen  time.Time `json:"waiter_seen"`
+	Mod         bool      `json:"mod,omitempty"`
 	NoteSent    bool      `json:"note_sent,omitempty"`
 	NotedPeers  string    `json:"noted_peers,omitempty"`
 	Inbox       []Message `json:"inbox,omitempty"`
@@ -148,7 +149,9 @@ func (s *Store) EndRequest(id string) {
 }
 
 // Hello records what a client reports: machine, cwd and an optional friendly
-// name. A name already used by another session is ignored.
+// name. A name already used by another session is ignored. Hello is only
+// ever called by the agentbus mod (POST /hello at session start, GET /wait
+// on every long-poll), so reaching it marks the session as running the mod.
 func (s *Store) Hello(id, machine, cwd, name string) {
 	if id == "" {
 		return
@@ -156,6 +159,7 @@ func (s *Store) Hello(id, machine, cwd, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := s.get(id)
+	sess.Mod = true
 	if machine = strings.TrimSpace(machine); machine != "" {
 		sess.Machine = machine
 	}

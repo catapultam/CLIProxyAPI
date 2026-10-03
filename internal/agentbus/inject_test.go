@@ -213,3 +213,58 @@ func TestInjectIgnoresRequestsWithoutSession(t *testing.T) {
 	}
 	_ = io.EOF
 }
+
+// bodyText un-escapes the JSON string content under test so assertions can
+// use plain text (appendToLastUser's JSON encoding escapes <, >, and &).
+func bodyText(t *testing.T, body string) string {
+	t.Helper()
+	texts := lastUserTexts(body)
+	if len(texts) == 0 {
+		t.Fatalf("no text blocks in body: %s", body)
+	}
+	return texts[len(texts)-1]
+}
+
+func TestInjectModSessionGetsListAgentsInstructions(t *testing.T) {
+	s, r, got := newInjectServer(t, &fakeClock{now: t0})
+	s.Hello(sidA, "pc", "/a", "")
+	post(r, sidA, "", stringContentBody)
+	text := bodyText(t, got.body)
+	if !strings.Contains(text, "ListAgents") || !strings.Contains(text, `SendMessage, to: "agentbus:<address>"`) {
+		t.Fatalf("mod instructions missing: %s", text)
+	}
+	if strings.Contains(text, "curl") {
+		t.Fatalf("mod session still told to curl: %s", text)
+	}
+}
+
+func TestInjectNoModSessionGetsInstallInstructions(t *testing.T) {
+	_, r, got := newInjectServer(t, &fakeClock{now: t0})
+	post(r, sidA, "", stringContentBody)
+	text := bodyText(t, got.body)
+	if !strings.Contains(text, "/v1/agentbus/send") {
+		t.Fatalf("curl instructions missing: %s", text)
+	}
+	want := "claude plugin marketplace add https://example.com/plugins/marketplace.json && claude plugin install agentbus@homelab"
+	if !strings.Contains(text, want) {
+		t.Fatalf("install instructions missing: %s", text)
+	}
+	assertNoHookMention(t, text)
+}
+
+func TestInjectResendsNoteWhenModStarts(t *testing.T) {
+	s, r, got := newInjectServer(t, &fakeClock{now: t0})
+	post(r, sidA, "", stringContentBody)
+	if !strings.Contains(got.body, "curl") {
+		t.Fatalf("first note should use curl instructions: %s", got.body)
+	}
+
+	s.Hello(sidA, "pc", "/a", "")
+	post(r, sidA, "", stringContentBody)
+	if strings.Contains(got.body, "curl") {
+		t.Fatalf("note not re-sent after mod started: %s", got.body)
+	}
+	if !strings.Contains(got.body, "ListAgents") {
+		t.Fatalf("mod instructions missing after flip: %s", got.body)
+	}
+}

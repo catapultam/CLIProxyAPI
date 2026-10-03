@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/marketplace"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -60,7 +61,7 @@ func (s *Store) InjectMiddleware() gin.HandlerFunc {
 			return
 		}
 		body := raw
-		plan := s.planInjection(sid)
+		plan := s.planInjection(sid, marketplace.BaseURL(c.Request))
 		if plan.text != "" {
 			if rewritten, ok := appendToLastUser(raw, plan.text); ok {
 				body = rewritten
@@ -84,7 +85,7 @@ func (s *Store) InjectMiddleware() gin.HandlerFunc {
 	}
 }
 
-func (s *Store) planInjection(sid string) injection {
+func (s *Store) planInjection(sid, base string) injection {
 	s.mu.Lock()
 	sess := s.get(sid)
 	now := s.now()
@@ -115,7 +116,11 @@ func (s *Store) planInjection(sid string) injection {
 		keys = append(keys, p.key)
 	}
 	sort.Strings(keys)
-	plan := injection{peersKey: strings.Join(keys, "\n")}
+	mod := sess.Mod
+	// Prefix the mod flag onto the compared key so the note is re-sent the
+	// first time a session's mod state is seen, without a write/read race
+	// against Hello (which can land between plan and commit).
+	plan := injection{peersKey: fmt.Sprintf("mod=%t\n%s", mod, strings.Join(keys, "\n"))}
 	plan.note = !sess.NoteSent || plan.peersKey != sess.NotedPeers
 	s.expireLocked(sess)
 	if len(sess.Inbox) > 0 {
@@ -137,7 +142,7 @@ func (s *Store) planInjection(sid string) injection {
 		}
 		lines = append(lines, p.line)
 	}
-	plan.text = noteText(sid, self, name, lines, plan.note, plan.messages)
+	plan.text = noteText(sid, self, name, base, mod, lines, plan.note, plan.messages)
 	return plan
 }
 
@@ -152,8 +157,7 @@ func (s *Store) commitInjection(sid string, plan injection) {
 	s.dirty = true
 }
 
-func noteText(sid, self, name string, peers []string, note bool, msgs []Message) string {
-	auth := `-H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN"`
+func noteText(sid, self, name, base string, mod bool, peers []string, note bool, msgs []Message) string {
 	var b strings.Builder
 	b.WriteString("<agentbus>\n")
 	if note {
@@ -170,12 +174,18 @@ func noteText(sid, self, name string, peers []string, note bool, msgs []Message)
 				b.WriteString("- " + p + "\n")
 			}
 		}
-		b.WriteString("Use these from Bash (the variables are already set):\n")
-		fmt.Fprintf(&b, "Send:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/send\" -d '{\"from_session\":\"%s\",\"to\":\"<name or address>\",\"body\":\"...\"}'  (add \"reply_to\":\"<message id>\" when replying)\n", auth, sid)
-		fmt.Fprintf(&b, "Peers: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/peers\"\n", auth)
-		fmt.Fprintf(&b, "Inbox: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/inbox?session=%s\"\n", auth, sid)
-		fmt.Fprintf(&b, "Name:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/name\" -d '{\"session\":\"%s\",\"name\":\"<name>\"}'\n", auth, sid)
-		b.WriteString("Messages to you arrive in your next request. Only message peers when it helps the user's work.\n")
+		if mod {
+			b.WriteString("Remote sessions appear in ListAgents with \"agentbus:<address>\" names. Message one with SendMessage, to: \"agentbus:<address>\". Incoming messages arrive as prompts in this session. Only message peers when it helps the user's work.\n")
+		} else {
+			auth := `-H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN"`
+			b.WriteString("Use these from Bash (the variables are already set):\n")
+			fmt.Fprintf(&b, "Send:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/send\" -d '{\"from_session\":\"%s\",\"to\":\"<name or address>\",\"body\":\"...\"}'  (add \"reply_to\":\"<message id>\" when replying)\n", auth, sid)
+			fmt.Fprintf(&b, "Peers: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/peers\"\n", auth)
+			fmt.Fprintf(&b, "Inbox: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/inbox?session=%s\"\n", auth, sid)
+			fmt.Fprintf(&b, "Name:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/name\" -d '{\"session\":\"%s\",\"name\":\"<name>\"}'\n", auth, sid)
+			b.WriteString("Messages to you arrive in your next request. Only message peers when it helps the user's work.\n")
+			fmt.Fprintf(&b, "The agentbus plugin isn't loaded in this session. Install it with: claude plugin marketplace add %s/plugins/marketplace.json && claude plugin install agentbus@homelab\n", base)
+		}
 	}
 	for _, m := range msgs {
 		head := fmt.Sprintf("Message %s from %s", m.ID, m.From)

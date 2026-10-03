@@ -212,6 +212,21 @@ func TestLoadIgnoresLegacySetupHinted(t *testing.T) {
 	}
 }
 
+func TestModPersistsThroughSaveLoad(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "")
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"mod":true`) {
+		t.Fatalf("saved state missing mod flag: %s", data)
+	}
+}
+
 func TestNotifyFiresOnSend(t *testing.T) {
 	s, _ := newTestStore(t)
 	s.Hello(sidA, "pc", "/a", "")
