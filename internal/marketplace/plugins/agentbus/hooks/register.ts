@@ -654,9 +654,9 @@ export const register: Register = on => {
     return { result: { listing: listed.result.listing + section } }
   })
 
-  // A turn of a subagent's loop raises no turn.start; agentId is checked anyway.
+  // Only the main loop raises turn.start (a subagent's run doesn't).
   on('turn.start', async ($, e, next) => {
-    if (!(e as { agentId?: string }).agentId) turnStarted(e.text)
+    turnStarted(e.text)
     return next(e)
   })
 

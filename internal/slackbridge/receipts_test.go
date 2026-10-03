@@ -136,7 +136,7 @@ func TestReceiptsThroughTheBus(t *testing.T) {
 	root := threadOf(t, b, bus)
 	b.handleEvent("EvR7", msg("UALEX", "run the tests", "20.7", root))
 	drainJobs(t, b)
-	msgs := bus.ClaimForWait(sidA, "0.3.4")
+	msgs := bus.ClaimForWait(sidA, true, "0.3.4")
 	if len(msgs) != 1 {
 		t.Fatalf("msgs = %+v", msgs)
 	}
@@ -153,6 +153,29 @@ func TestReceiptsThroughTheBus(t *testing.T) {
 	drainJobs(t, b)
 	if got := f.reactionsOn("CAGENTS", "20.7"); !reflect.DeepEqual(got, []string{"eyes"}) {
 		t.Fatalf("after /ack = %v", got)
+	}
+}
+
+// A waiter that can't acknowledge (no mod, or a mod before 0.3.4) takes the
+// message straight from queued to read, never showing received.
+func TestReceiptsWaiterThatCannotAckGoesStraightToRead(t *testing.T) {
+	for i, c := range []struct {
+		mod     bool
+		version string
+	}{{false, ""}, {false, "0.3.4"}, {true, "0.3.3"}} {
+		b, f, bus, _ := newCommandBridge(t)
+		root := threadOf(t, b, bus)
+		ts := "20.8" + string(rune('0'+i))
+		b.handleEvent("EvR8"+ts, msg("UALEX", "run the tests", ts, root))
+		drainJobs(t, b)
+		if msgs := bus.ClaimForWait(sidA, c.mod, c.version); len(msgs) != 1 {
+			t.Fatalf("%+v: msgs = %+v", c, msgs)
+		}
+		drainJobs(t, b)
+		want := []string{"+inbox_tray", "+eyes", "-inbox_tray"}
+		if got := reactionCalls(f, "CAGENTS", ts); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%+v: reactions = %v", c, got)
+		}
 	}
 }
 

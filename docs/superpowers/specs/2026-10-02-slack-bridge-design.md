@@ -474,8 +474,12 @@ make them possible.
   "received" after "read" does nothing. DMs work the same way, in the DM.
 - The store reports through the optional `agentbus.Receipts` bridge
   interface (`Received(ids)`, `Read(ids)`), outside its lock, with Slack
-  messages' ids only. `/wait` (`ClaimForWait`) calls `Received` and records
+  messages' ids only. A `/wait` claim (`ClaimForWait`) by a waiter with
+  `mod=1&v=` `MinAckModVersion` (0.3.4) or later calls `Received` and records
   the ids per session as unacknowledged (persisted; 7-day TTL, at most 256).
+  Any other waiter (no `mod=1`, e.g. the legacy wait.sh hook or curl, or an
+  older mod) never acks and has consumed the messages, so its claim calls
+  `Read` at once: 📥 goes straight to 👀.
   `POST /v1/agentbus/ack {session, ids}` (at most 100 ids) calls `Read` for
   the ids `/wait` handed to that session and not yet acknowledged; it
   answers `{"acked": n}`. A successful injection (`commitInjection`, status

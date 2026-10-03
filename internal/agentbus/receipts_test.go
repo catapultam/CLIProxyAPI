@@ -102,6 +102,34 @@ func TestWaitClaimReportsReceivedForSlackMessages(t *testing.T) {
 	}
 }
 
+// A waiter that can't /ack (no mod flag, as the legacy wait.sh hook or curl
+// polls, or a mod older than MinAckModVersion) consumed the message: it is
+// read at claim time, never left at received.
+func TestWaitClaimByWaiterThatCannotAckIsRead(t *testing.T) {
+	for _, query := range []string{"", "&v=0.3.4", "&mod=1", "&mod=1&v=0.3.3", "&mod=1&v=junk"} {
+		t.Run(query, func(t *testing.T) {
+			s, r, b := newReceiptServer(t)
+			capableSession(s, sidA, "/a", "flyer")
+			_, id, err := s.Deliver(sidA, "please rebase", "alex")
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA+query, "")
+			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), id) {
+				t.Fatalf("wait = %d %s", w.Code, w.Body)
+			}
+			received, read := b.receipts()
+			if len(received) != 0 || !reflect.DeepEqual(read, [][]string{{id}}) {
+				t.Fatalf("received = %v, read = %v", received, read)
+			}
+			// Nothing is left for an ack.
+			if code, body := ack(r, sidA, id); code != http.StatusOK || !strings.Contains(body, `"acked":0`) {
+				t.Fatalf("ack = %d %s", code, body)
+			}
+		})
+	}
+}
+
 func TestWaitClaimOfCommandReportsReceived(t *testing.T) {
 	s, r, b := newReceiptServer(t)
 	capableSession(s, sidA, "/a", "flyer")
@@ -259,7 +287,7 @@ func TestUnackedSurvivesSaveLoadAndExpires(t *testing.T) {
 	s := NewStore(filepath.Join(dir, "state.json"), clock.Now)
 	capableSession(s, sidA, "/a", "flyer")
 	_, id, _ := s.Deliver(sidA, "x", "alex")
-	if msgs := s.ClaimForWait(sidA, "0.3.4"); len(msgs) != 1 {
+	if msgs := s.ClaimForWait(sidA, true, "0.3.4"); len(msgs) != 1 {
 		t.Fatalf("msgs = %+v", msgs)
 	}
 	if errSave := s.Save(); errSave != nil {
@@ -277,7 +305,7 @@ func TestUnackedSurvivesSaveLoadAndExpires(t *testing.T) {
 
 	// An entry older than the message TTL is dropped.
 	_, id2, _ := s.Deliver(sidA, "y", "alex")
-	s.ClaimForWait(sidA, "0.3.4")
+	s.ClaimForWait(sidA, true, "0.3.4")
 	clock.Advance(messageTTL + 1)
 	s.Pending(sidA)
 	if n := s.Ack(sidA, []string{id2}); n != 0 {
@@ -292,7 +320,7 @@ func TestUnackedIsCapped(t *testing.T) {
 	for i := 0; i <= maxUnacked; i++ {
 		_, id, _ := s.Deliver(sidA, "x", "alex")
 		ids = append(ids, id)
-		s.ClaimForWait(sidA, "0.3.4")
+		s.ClaimForWait(sidA, true, "0.3.4")
 		clock.Advance(time.Second)
 	}
 	if n := s.Ack(sidA, ids[:1]); n != 0 {

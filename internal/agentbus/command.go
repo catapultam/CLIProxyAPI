@@ -123,12 +123,18 @@ func versionSegment(parts []string, i int) int {
 	return n
 }
 
-// ClaimForWait claims a session's messages for the mod's /wait (claimForWait)
-// and reports the Slack ones as received (Receipts): they await the mod's
-// /ack.
-func (s *Store) ClaimForWait(id, waiterVersion string) []Message {
+// ClaimForWait claims a session's messages for a /wait (claimForWait). mod
+// and waiterVersion are what the waiter reported (mod=1, v); without mod the
+// version is ignored. The Slack messages are reported (Receipts) as received,
+// awaiting the mod's /ack, only to a mod waiter at MinAckModVersion or later.
+// Any other waiter (the legacy wait.sh hook, curl, an older mod) never acks
+// and has consumed them, so they are read at once.
+func (s *Store) ClaimForWait(id string, mod bool, waiterVersion string) []Message {
+	if !mod {
+		waiterVersion = ""
+	}
 	msgs := s.claimForWait(id, waiterVersion)
-	s.received(id, msgs)
+	s.received(id, msgs, versionAtLeast(strings.TrimSpace(waiterVersion), MinAckModVersion))
 	return msgs
 }
 

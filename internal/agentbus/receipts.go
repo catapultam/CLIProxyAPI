@@ -2,6 +2,10 @@ package agentbus
 
 import "time"
 
+// MinAckModVersion is the oldest agentbus mod that acknowledges what it got
+// from /wait (POST /ack).
+const MinAckModVersion = "0.3.4"
+
 const (
 	// maxUnacked caps the ids per session that /wait handed out and the mod
 	// hasn't acknowledged yet; the oldest go first.
@@ -33,22 +37,28 @@ func slackIDs(msgs []Message) []string {
 	return ids
 }
 
-// received records the Slack messages /wait handed to session id as awaiting
-// the mod's /ack, and reports them to the bridge. The caller must not hold
-// s.mu.
-func (s *Store) received(id string, msgs []Message) {
+// received reports the Slack messages /wait handed to session id. When the
+// waiter acks (a mod at MinAckModVersion or later), they are recorded as
+// awaiting its /ack and reported as received; otherwise nothing will ever
+// ack them, and the waiter consumed them, so they are reported as read. The
+// caller must not hold s.mu.
+func (s *Store) received(id string, msgs []Message, acks bool) {
 	ids := slackIDs(msgs)
 	if len(ids) == 0 {
 		return
 	}
 	s.mu.Lock()
-	if sess, ok := s.byID[id]; ok {
+	if sess, ok := s.byID[id]; ok && acks {
 		s.noteUnackedLocked(sess, ids)
 	}
 	r, _ := s.bridge.(Receipts)
 	s.mu.Unlock()
-	if r != nil {
+	switch {
+	case r == nil:
+	case acks:
 		r.Received(ids)
+	default:
+		r.Read(ids)
 	}
 }
 

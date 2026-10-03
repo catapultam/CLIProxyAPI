@@ -175,7 +175,7 @@ func (s *Store) handleWait(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "superseded by a newer waiter"})
 			return
 		}
-		if msgs := s.ClaimForWait(id, version); len(msgs) > 0 {
+		if msgs := s.ClaimForWait(id, mod, version); len(msgs) > 0 {
 			c.JSON(http.StatusOK, gin.H{"messages": msgs})
 			return
 		}
