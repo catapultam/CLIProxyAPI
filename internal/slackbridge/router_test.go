@@ -211,6 +211,40 @@ func TestAllowAndRemoveFromSlack(t *testing.T) {
 	}
 }
 
+func TestAllowThenRemoveAppliedInOrder(t *testing.T) {
+	b, f, _ := newTestBridge(t)
+	b.handleEvent("EvO1", msg("UALEX", "<@UBOT> allow <@UJANE>", "6.0", ""))
+	b.handleEvent("EvO2", msg("UALEX", "<@UBOT> remove <@UJANE>", "6.1", ""))
+	drainJobs(t, b)
+	if _, ok := b.state.user("UJANE"); ok {
+		t.Fatal("the owner's later remove lost to the earlier allow")
+	}
+	if got := lastPostText(f); !strings.Contains(got, "can no longer instruct agents") {
+		t.Fatalf("reply = %q", got)
+	}
+}
+
+func TestDedupWithoutEventID(t *testing.T) {
+	b, _, bus := newTestBridge(t)
+	root := threadOf(t, b, bus)
+	ev := msg("UALEX", "once", "7.1", root)
+	b.handleEvent("", ev)
+	b.handleEvent("", ev)
+	if msgs := bus.Claim(sidA); len(msgs) != 1 {
+		t.Fatalf("msgs = %d", len(msgs))
+	}
+}
+
+func TestUnlinkedThreadAnsweredOnce(t *testing.T) {
+	b, f, _ := newTestBridge(t)
+	b.handleEvent("EvU1", msg("UALEX", "one", "8.2", "8.1"))
+	b.handleEvent("EvU2", msg("UALEX", "two", "8.3", "8.1"))
+	drainJobs(t, b)
+	if n := len(f.callsTo("chat.postMessage")); n != 1 {
+		t.Fatalf("replies = %d", n)
+	}
+}
+
 // TestAllowAndRemoveNoteUnsavedOnSaveFailure covers the Task 5 review carry-over:
 // state.allow/state.remove still change memory when the write-through save
 // fails, so the Slack confirmation must say so.

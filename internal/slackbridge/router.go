@@ -40,11 +40,17 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		ev.Channel != b.channelID || ev.User == "" || ev.User == b.botUserID {
 		return
 	}
-	if b.alreadySeen(eventID) {
-		return
-	}
 	user, ok := b.state.user(ev.User)
 	if !ok {
+		return
+	}
+	// Dedup after the allowlist so strangers can't flush the ring. Without an
+	// event id, fall back to the message identity.
+	key := eventID
+	if key == "" {
+		key = ev.Channel + ":" + ev.TS
+	}
+	if b.alreadySeen(key) {
 		return
 	}
 	if verb, target, isCommand := parseCommand(ev.Text, b.botUserID); isCommand {
@@ -55,7 +61,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
 		sid, linked := b.state.session(ev.ThreadTS)
 		if !linked {
-			b.reply(ev, "This thread isn't linked to an agent. "+howToAddress)
+			// Answer an unlinked thread once, not on every message in it.
+			if !b.alreadySeen("unlinked:" + ev.ThreadTS) {
+				b.reply(ev, "This thread isn't linked to an agent. "+howToAddress)
+			}
 			return
 		}
 		b.deliver(ev, sid, text, user, "That agent's session has ended, so this wasn't delivered.")
@@ -142,13 +151,16 @@ func (b *Bridge) command(ev messageEvent, user allowedUser, verb, target string)
 		b.enqueue(func(ctx context.Context) error {
 			label, isBot, err := b.api.userInfo(ctx, b.cfg.BotToken, target)
 			if err != nil {
+				log.Infof("slack: %s tried to allow %s: lookup failed", user.ID, target)
 				return b.replyNow(ctx, ev, "Couldn't look that user up: "+escape(err.Error()))
 			}
 			if isBot {
+				log.Infof("slack: %s tried to allow %s: refused, it is a bot", user.ID, target)
 				return b.replyNow(ctx, ev, "Bots can't be allowed.")
 			}
 			u, added, errAllow := b.state.allow(target, label)
 			if !added {
+				log.Infof("slack: %s tried to allow %s: already allowed", user.ID, target)
 				return b.replyNow(ctx, ev, fmt.Sprintf("<@%s> is already allowed, as @%s.", u.ID, u.Label))
 			}
 			confirm := fmt.Sprintf("<@%s> can now instruct agents. Agents know them as @%s.", u.ID, u.Label)
@@ -160,23 +172,39 @@ func (b *Bridge) command(ev messageEvent, user allowedUser, verb, target string)
 			return b.replyNow(ctx, ev, confirm)
 		})
 	case "remove":
-		u, _ := b.state.user(target)
-		switch err := b.state.remove(target); {
-		case errors.Is(err, errConfigUser):
-			b.reply(ev, fmt.Sprintf("@%s is set in config.yaml (allowed-emails) and can't be removed from Slack.", u.Label))
-		case errors.Is(err, errNotAllowed):
-			b.reply(ev, fmt.Sprintf("<@%s> isn't on the list.", target))
-		default:
-			confirm := fmt.Sprintf("<@%s> can no longer instruct agents.", target)
-			if err != nil {
-				logSaveError(err)
-				confirm += notSavedNote
+		// Queued like allow so the single FIFO worker applies the owner's
+		// commands in the order they were given. The change is applied once;
+		// a retry after a failed reply only re-sends the reply.
+		var confirm string
+		b.enqueue(func(ctx context.Context) error {
+			if confirm == "" {
+				confirm = b.applyRemove(user, target)
 			}
-			log.Infof("slack: %s removed %s", user.ID, target)
-			b.reply(ev, confirm)
-		}
+			return b.replyNow(ctx, ev, confirm)
+		})
 	default:
 		b.reply(ev, commandHelp)
+	}
+}
+
+// applyRemove removes target and returns the reply text.
+func (b *Bridge) applyRemove(user allowedUser, target string) string {
+	u, _ := b.state.user(target)
+	switch err := b.state.remove(target); {
+	case errors.Is(err, errConfigUser):
+		log.Infof("slack: %s tried to remove %s: set in config.yaml", user.ID, target)
+		return fmt.Sprintf("@%s is set in config.yaml (allowed-emails) and can't be removed from Slack.", u.Label)
+	case errors.Is(err, errNotAllowed):
+		log.Infof("slack: %s tried to remove %s: not on the list", user.ID, target)
+		return fmt.Sprintf("<@%s> isn't on the list.", target)
+	default:
+		confirm := fmt.Sprintf("<@%s> can no longer instruct agents.", target)
+		if err != nil {
+			logSaveError(err)
+			confirm += notSavedNote
+		}
+		log.Infof("slack: %s removed %s", user.ID, target)
+		return confirm
 	}
 }
 
