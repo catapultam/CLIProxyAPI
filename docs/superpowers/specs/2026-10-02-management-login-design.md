@@ -39,33 +39,35 @@ Replace the "paste the management key" prompt in the management panel with a nor
 
 ### Storage
 
-The account lives in `config.yaml` under the existing `management:` block, next to `secret-key`. It therefore persists through every config backend (file, Postgres, git, object store) with no new storage code, and like `secret-key` it is excluded from the JSON config view (`RemoteManagement` is `json:"-"`).
+The account lives in a sidecar file, `management-login.json`, in the same directory as the active config file. The file has mode 0600 and is written atomically (temp file plus rename).
 
-```yaml
-management:
-  login:
-    username: admin
-    password-hash: "$argon2id$v=19$m=65536,t=3,p=4$..."   # plaintext is hashed on load, like secret-key
-    session-secret: "<base64, auto-generated>"            # signs session cookies/tokens
-    user-handle: "<base64url, 32 random bytes>"           # WebAuthn user.id, generated with the account
-    passkey-rp-id: cakebox.wyrm-cat.ts.net                # empty = passkeys disabled
-    passkey-origins: ["https://cakebox.wyrm-cat.ts.net:8443", "https://cakebox.wyrm-cat.ts.net"]
-    passkeys:
-      - id: "<base64url credential id>"
-        public-key: "<base64url COSE key>"
-        attestation-type: "none"
-        transports: ["internal", "hybrid"]
-        aaguid: "<base64url>"
-        backup-eligible: true
-        backup-state: true
-        name: "Pixel 9"
-        created: 2026-10-02T21:00:00Z
+**Revised after review.** The first version stored the account in `config.yaml`, which caused these problems:
+- The v8 config endpoints build their responses from the raw YAML, so the session secret and password hash leaked.
+- Generic config writers could change the password without the account rules.
+- A stale config save resurrected revoked secrets and deleted passkeys.
+- Emptied fields could never be deleted.
+- Hot reloads raced with account changes.
+
+With the sidecar, only the `/account` API reads or writes the account. Config endpoints never see it.
+
+```json
+{
+  "username": "admin",
+  "password_hash": "$argon2id$v=19$m=65536,t=3,p=4$...",
+  "session_secret": "<base64, generated on first setup>",
+  "user_handle": "<base64url, 32 random bytes>",
+  "passkey_rp_id": "cakebox.wyrm-cat.ts.net",
+  "passkey_origins": ["https://cakebox.wyrm-cat.ts.net:8443"],
+  "passkeys": [{"id": "...", "rp_id": "...", "public_key": "...", "attestation_type": "none", "transports": [], "aaguid": "...", "backup_eligible": true, "backup_state": true, "name": "Pixel 9", "created_at": "..."}]
+}
 ```
 
-Store whatever fields go-webauthn's `webauthn.Credential` needs to validate a later assertion (notably the backup-eligible/backup-state flags, which go-webauthn checks for consistency), except the sign counter.
-
-- **Password hashing:** use argon2id (`golang.org/x/crypto/argon2`, already a dependency). A plaintext `password` value written by hand is hashed on load and written back. This is the same mechanism `secret-key` already uses in `config_load.go`.
-- **Passkey sign counters are not persisted.** Synced passkeys (iCloud, Google, 1Password) always report 0, and persisting the counter would rewrite `config.yaml` on every login.
+- **Loading and mutation:** the file is loaded once at startup into an in-memory store with its own lock. Every mutation deep-copies, validates, persists, then publishes, so a failed write leaves the live state unchanged. A missing file means there is no account. A corrupt file is logged and treated as no account; the management key still works.
+- **No hand editing.** There are no config fields for the account; recovery is the management key. Hand edits to the sidecar need a restart.
+- **Other storage backends:** the sidecar is not synced to the Postgres, git or object stores. If it is lost, the account is set up again via the key. On cakebox it sits on the persistent `/data` mount.
+- **Stored credential fields:** everything go-webauthn's `webauthn.Credential` needs to validate a later assertion (notably the backup-eligible/backup-state flags), plus the rp-id the passkey was registered under. The sign counter is not stored. `passkeys_available` counts only passkeys for the current rp-id.
+- **Password hashing:** argon2id (`golang.org/x/crypto/argon2`, already a dependency).
+- **Passkey sign counters are not persisted.** Synced passkeys always report 0, and persisting the counter would mean a file write on every login.
 - **`session-secret`** is generated the first time an account is created. "Sign out all devices" and a password change regenerate it, which invalidates every existing session. On a password change the caller immediately gets a fresh session (cookie + token in the response) so they stay logged in.
 
 ### Sessions
@@ -76,7 +78,7 @@ Store whatever fields go-webauthn's `webauthn.Credential` needs to validate a la
   - Because the token is stateless, no server-side store is needed and restarts don't log anyone out.
 - **Lifetime:** 30 days, sliding. When less than half the lifetime remains, the middleware reissues the token: it sets a fresh cookie, or returns the new value in the `X-CPA-Session-Refresh` header for bearer clients.
 - **Cookie:**
-  - Name `cpa_mgmt_session`, attributes `HttpOnly`, `SameSite=Strict`, `Path=/`.
+  - Name `cpa_mgmt_session`, attributes `HttpOnly`, `SameSite=Strict`, `Path=/v8/management`. The panel only calls v8, and the narrower path keeps the cookie off ordinary proxy requests and out of their request logs. `Cookie`/`Set-Cookie` are also masked in request logging.
   - `Secure` is set when the request is HTTPS: direct TLS, `X-Forwarded-Proto: https` from a trusted proxy, or an `Origin` header with the `https` scheme. The last case matters on cakebox, where `tailscale serve` terminates TLS in front of an nginx that forwards `X-Forwarded-Proto: http`.
   - Max-Age matches the token expiry.
 - **Bearer fallback:** login returns the same token in the response body. The panel uses it as `Authorization: Bearer cpas_...` when its API base is cross-origin. Same-origin panels ignore the body value and rely on the cookie.
@@ -150,11 +152,19 @@ Every client on the tailnet TCP forwards reaches the proxy as localhost or the D
   - `passkey.go`: go-webauthn wrapper plus the challenge cache.
   - `throttle.go`.
 - **Handlers:** live in `internal/api/handlers/management/` as `session.go` and `account.go`, next to the existing management handlers.
-- **Config:** `internal/config` gains the `Login` struct inside `RemoteManagement`, its load-time hashing and `config.example.yaml` docs.
+- **Storage:** the sidecar account store lives in `internal/mgmtauth`. `internal/config` is unchanged apart from a short comment in `config.example.yaml`.
 
 ### Route availability
 
-Today management routes are registered only when a `secret-key`, `MANAGEMENT_PASSWORD` or local password exists. That stays the rule, so creating an account always requires a key first. A configured login account also counts as "management enabled" for hot-reload purposes.
+Today management routes are registered only when a `secret-key`, `MANAGEMENT_PASSWORD` or local password exists. That stays the rule, so creating an account always requires a key first. A login account on its own never enables management.
+
+Hardening added after review:
+- Password verification runs one at a time; concurrent attempts get `429`.
+- At most 256 passkey ceremonies can be pending.
+- A stale `cpas_` credential returns `401 session expired` and never counts toward the per-IP key ban.
+- `/session/login` and `/session/passkey/finish` obey the same `allow-remote` predicate as key auth.
+- For cookie-authenticated requests of any method, `Sec-Fetch-Site: same-site` or `cross-site` is rejected.
+- Sessions require an existing account.
 
 ## Panel design (CPAMC repo)
 
