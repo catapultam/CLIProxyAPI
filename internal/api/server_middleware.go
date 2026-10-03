@@ -28,6 +28,7 @@ var corsExposedResponseHeaders = []string{
 	"Retry-After",
 	"X-Request-Id",
 	"OpenAI-Request-Id",
+	"X-CPA-Session-Refresh",
 }
 
 var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, ", ")

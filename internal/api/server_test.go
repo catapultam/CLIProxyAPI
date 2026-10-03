@@ -1602,6 +1602,38 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	}
 }
 
+// TestCORSExposesSessionRefreshHeader verifies a cross-origin bearer client
+// (the management panel session mode) can read the sliding-session refresh
+// header via fetch()/axios, which requires it in Access-Control-Expose-Headers.
+// ACAO stays "*" and no Access-Control-Allow-Credentials is added.
+func TestCORSExposesSessionRefreshHeader(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:5173")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	exposed := rr.Header().Get("Access-Control-Expose-Headers")
+	found := false
+	for _, headerName := range strings.Split(exposed, ",") {
+		if strings.EqualFold(strings.TrimSpace(headerName), "X-CPA-Session-Refresh") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Access-Control-Expose-Headers = %q, want it to include X-CPA-Session-Refresh", exposed)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want \"*\"", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Fatalf("Access-Control-Allow-Credentials = %q, want unset", got)
+	}
+}
+
 func TestOAuthCallbackRouteSkipsManagementKeyMiddleware(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 
