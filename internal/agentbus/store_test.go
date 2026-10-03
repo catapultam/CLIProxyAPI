@@ -2,6 +2,7 @@ package agentbus
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -191,6 +192,23 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	}
 	if err := NewStore(filepath.Join(t.TempDir(), "missing.json"), clock.Now).Load(); err != nil {
 		t.Fatalf("missing state file: %v", err)
+	}
+}
+
+// TestLoadIgnoresLegacySetupHinted confirms a state file saved by a version
+// that still had the removed setup_hinted field loads without error.
+func TestLoadIgnoresLegacySetupHinted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agentbus-state.json")
+	legacy := `{"version":1,"sessions":[{"id":"` + sidA + `","setup_hinted":true}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := NewStore(path, nil)
+	if err := r.Load(); err != nil {
+		t.Fatalf("load legacy state: %v", err)
+	}
+	if r.Address(sidA) == "" {
+		t.Fatal("session not restored from legacy state")
 	}
 }
 

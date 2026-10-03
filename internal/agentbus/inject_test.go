@@ -160,35 +160,38 @@ func TestInjectNothingWhenNothingNew(t *testing.T) {
 	}
 }
 
-func TestInjectSetupHintOnceWhenNoWaiter(t *testing.T) {
+// TestInjectNeverMentionsTheRetiredHook covers the scenarios that used to
+// produce the setup hint (first request, then an idle request after the old
+// grace period, then a request with a pending message) and asserts none of
+// them mention the retired wait.sh hook or its install endpoint.
+func TestInjectNeverMentionsTheRetiredHook(t *testing.T) {
 	clock := &fakeClock{now: t0}
-	_, r, got := newInjectServer(t, clock)
+	s, r, got := newInjectServer(t, clock)
+
 	post(r, sidA, "", stringContentBody)
-	if strings.Contains(got.body, "/v1/agentbus/setup") {
-		t.Fatal("setup hint before the grace period")
+	assertNoHookMention(t, got.body)
+	if !strings.Contains(got.body, "/v1/agentbus/name") {
+		t.Fatalf("name recipe missing: %s", got.body)
 	}
+
 	clock.Advance(3 * time.Minute)
-	post(r, sidA, "", stringContentBody)
-	if !strings.Contains(got.body, "/v1/agentbus/setup") {
-		t.Fatalf("setup hint missing: %s", got.body)
+	s.Hello(sidB, "pc", "/b", "")
+	if _, err := s.Send(sidB, s.Address(sidA), "nightly build", ""); err != nil {
+		t.Fatal(err)
 	}
 	post(r, sidA, "", stringContentBody)
-	if strings.Contains(got.body, "/v1/agentbus/setup") {
-		t.Fatal("setup hint repeated")
+	assertNoHookMention(t, got.body)
+	if !strings.Contains(got.body, "nightly build") {
+		t.Fatalf("pending message not delivered: %s", got.body)
 	}
 }
 
-func TestInjectNoSetupHintWithWaiter(t *testing.T) {
-	clock := &fakeClock{now: t0}
-	s, r, got := newInjectServer(t, clock)
-	s.Hello(sidA, "pc", "/a", "")
-	post(r, sidA, "", stringContentBody)
-	clock.Advance(time.Minute)
-	s.Hello(sidA, "pc", "/a", "")
-	clock.Advance(2 * time.Minute)
-	post(r, sidA, "", stringContentBody)
-	if strings.Contains(got.body, "/v1/agentbus/setup") {
-		t.Fatalf("setup hint despite a waiter: %s", got.body)
+func assertNoHookMention(t *testing.T, body string) {
+	t.Helper()
+	for _, needle := range []string{"wait.sh", "/setup", "set up", "set it up"} {
+		if strings.Contains(strings.ToLower(body), strings.ToLower(needle)) {
+			t.Fatalf("body mentions retired hook (%q): %s", needle, body)
+		}
 	}
 }
 

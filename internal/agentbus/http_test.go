@@ -128,6 +128,16 @@ func TestHTTPNewerWaiterSupersedesOlder(t *testing.T) {
 	}
 }
 
+func TestHTTPSetupRoutesRemoved(t *testing.T) {
+	_, r := newTestServer(t)
+	if w := do(r, http.MethodGet, "/v1/agentbus/setup", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("setup = %d", w.Code)
+	}
+	if w := do(r, http.MethodGet, "/v1/agentbus/wait.sh", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("wait.sh = %d", w.Code)
+	}
+}
+
 func TestHTTPNameAndHello(t *testing.T) {
 	s, r := newTestServer(t)
 	s.Hello(sidA, "pc", "/a", "")

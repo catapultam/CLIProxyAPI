@@ -1,7 +1,7 @@
 // Package agentbus links Claude Code sessions across machines through the
 // proxy they already send inference to: a registry of sessions learned from
-// traffic and wake hooks, per-session inboxes, and delivery by wake hook,
-// request injection, or explicit read.
+// traffic, per-session inboxes, and delivery by request injection, long-poll
+// (/wait), or explicit read.
 package agentbus
 
 import (
@@ -77,7 +77,6 @@ type session struct {
 	FirstSeen   time.Time `json:"first_seen"`
 	LastRequest time.Time `json:"last_request"`
 	WaiterSeen  time.Time `json:"waiter_seen"`
-	SetupHinted bool      `json:"setup_hinted,omitempty"`
 	NoteSent    bool      `json:"note_sent,omitempty"`
 	NotedPeers  string    `json:"noted_peers,omitempty"`
 	Inbox       []Message `json:"inbox,omitempty"`
@@ -148,9 +147,8 @@ func (s *Store) EndRequest(id string) {
 	}
 }
 
-// Hello records what a wake hook reports: machine, cwd and an optional name
-// (from Claude Code's /rename). A name already used by another session is
-// ignored.
+// Hello records what a client reports: machine, cwd and an optional friendly
+// name. A name already used by another session is ignored.
 func (s *Store) Hello(id, machine, cwd, name string) {
 	if id == "" {
 		return

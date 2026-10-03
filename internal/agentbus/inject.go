@@ -20,7 +20,6 @@ import (
 const (
 	headerSession   = "X-Claude-Code-Session-Id"
 	headerAgent     = "X-Claude-Code-Agent-Id"
-	setupHintAfter  = 2 * time.Minute
 	notePeerLimit   = 20
 	maxInjectedBody = 32 << 20
 )
@@ -28,11 +27,10 @@ const (
 // injection is what one request will carry, claimed before forwarding and
 // committed only when the request succeeds.
 type injection struct {
-	text      string
-	messages  []Message
-	peersKey  string
-	note      bool
-	setupHint bool
+	text     string
+	messages []Message
+	peersKey string
+	note     bool
 }
 
 // InjectMiddleware wraps POST /v1/messages. It records session activity and,
@@ -119,8 +117,6 @@ func (s *Store) planInjection(sid string) injection {
 	sort.Strings(keys)
 	plan := injection{peersKey: strings.Join(keys, "\n")}
 	plan.note = !sess.NoteSent || plan.peersKey != sess.NotedPeers
-	noWaiter := sess.WaiterSeen.IsZero() || now.Sub(sess.WaiterSeen) > idleWithin
-	plan.setupHint = !sess.SetupHinted && noWaiter && now.Sub(sess.FirstSeen) >= setupHintAfter
 	s.expireLocked(sess)
 	if len(sess.Inbox) > 0 {
 		plan.messages = sess.Inbox
@@ -130,7 +126,7 @@ func (s *Store) planInjection(sid string) injection {
 	name := sess.Name
 	s.mu.Unlock()
 
-	if !plan.note && !plan.setupHint && len(plan.messages) == 0 {
+	if !plan.note && len(plan.messages) == 0 {
 		return injection{}
 	}
 	lines := make([]string, 0, len(peers))
@@ -141,7 +137,7 @@ func (s *Store) planInjection(sid string) injection {
 		}
 		lines = append(lines, p.line)
 	}
-	plan.text = noteText(sid, self, name, lines, plan.note, plan.setupHint, plan.messages)
+	plan.text = noteText(sid, self, name, lines, plan.note, plan.messages)
 	return plan
 }
 
@@ -153,13 +149,10 @@ func (s *Store) commitInjection(sid string, plan injection) {
 		sess.NoteSent = true
 		sess.NotedPeers = plan.peersKey
 	}
-	if plan.setupHint {
-		sess.SetupHinted = true
-	}
 	s.dirty = true
 }
 
-func noteText(sid, self, name string, peers []string, note, setupHint bool, msgs []Message) string {
+func noteText(sid, self, name string, peers []string, note bool, msgs []Message) string {
 	auth := `-H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN"`
 	var b strings.Builder
 	b.WriteString("<agentbus>\n")
@@ -181,11 +174,8 @@ func noteText(sid, self, name string, peers []string, note, setupHint bool, msgs
 		fmt.Fprintf(&b, "Send:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/send\" -d '{\"from_session\":\"%s\",\"to\":\"<name or address>\",\"body\":\"...\"}'  (add \"reply_to\":\"<message id>\" when replying)\n", auth, sid)
 		fmt.Fprintf(&b, "Peers: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/peers\"\n", auth)
 		fmt.Fprintf(&b, "Inbox: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/inbox?session=%s\"\n", auth, sid)
-		b.WriteString("Your name follows /rename. Messages to you arrive in your next request, or wake you while idle once this machine is set up. Only message peers when it helps the user's work.\n")
-		b.WriteString("If you are never woken by messages, diagnose this machine with: sh \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/agentbus/wait.sh\" --check\n")
-	}
-	if setupHint {
-		fmt.Fprintf(&b, "This machine cannot yet wake idle sessions when messages arrive. Set it up once with: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/setup\" | sh  (it checks itself at the end; if it reports a problem, fix the cause and run it again)\n", auth)
+		fmt.Fprintf(&b, "Name:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/name\" -d '{\"session\":\"%s\",\"name\":\"<name>\"}'\n", auth, sid)
+		b.WriteString("Messages to you arrive in your next request. Only message peers when it helps the user's work.\n")
 	}
 	for _, m := range msgs {
 		head := fmt.Sprintf("Message %s from %s", m.ID, m.From)

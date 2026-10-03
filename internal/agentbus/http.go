@@ -23,8 +23,6 @@ func (s *Store) Register(group *gin.RouterGroup) {
 	group.GET("/inbox", s.handleInbox)
 	group.POST("/hello", s.handleHello)
 	group.GET("/wait", s.handleWait)
-	group.GET("/setup", s.handleSetup)
-	group.GET("/wait.sh", s.handleWaiterScript)
 }
 
 func (s *Store) handlePeers(c *gin.Context) {
