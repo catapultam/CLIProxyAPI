@@ -90,7 +90,8 @@ func (s *Store) handleName(c *gin.Context) {
 }
 
 // handleInbox returns a session's pending messages, except command messages:
-// those leave the store only through /wait (the mod).
+// those leave the store only through /wait (the mod). Nothing acks what
+// /inbox hands out, so Slack messages in it are reported read at once.
 func (s *Store) handleInbox(c *gin.Context) {
 	id := strings.TrimSpace(c.Query("session"))
 	if id == "" {
@@ -98,6 +99,7 @@ func (s *Store) handleInbox(c *gin.Context) {
 		return
 	}
 	msgs := s.ClaimPlain(id)
+	s.received(id, msgs, false)
 	if msgs == nil {
 		msgs = []Message{}
 	}

@@ -20,6 +20,9 @@ const (
 	// ownersOnlyLinks refuses chat, dm, link and unlink from a non-owner.
 	ownersOnlyLinks = "Only people set in config.yaml (allowed-emails) can open, list, link or unlink conversations."
 	notSavedNote    = " (not saved; this reverts when the proxy restarts)"
+	// shellWhereGuests refuses a shell (or image) command in a linked
+	// conversation that has guests.
+	shellWhereGuests = "Run shell or image commands from your DM or the channel; this conversation has guests."
 	// ownersOnlyCommands refuses a "!" command from a non-owner.
 	ownersOnlyCommands = "Only owners can run commands."
 	sessionEnded       = "That agent's session has ended, so this wasn't delivered."
@@ -437,6 +440,12 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		}
 		cmd = entry.spec.command(rest)
 	}
+	if cmd.Kind == agentbus.CommandShell && b.guestsRead(ev) {
+		// Shell output (text or an image) would be posted where guests read.
+		log.Infof("slack: refused !%s from %s in %s: the conversation has guests", name, user.ID, ev.Channel)
+		b.replyCommand(ev, shellWhereGuests)
+		return
+	}
 	display := target
 	if adopt {
 		display = escape(target)
@@ -465,7 +474,7 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		b.replyCommand(ev, "Not delivered: "+escape(errCapable.Error()))
 		return
 	}
-	b.recordDelivery(ev, msgID, sid, adopt, reactionCommand)
+	b.recordDelivery(ev, msgID, sid, adopt, reactionCommand, cmd.Name)
 	b.syncReceipt(msgID)
 	log.Infof("slack: %s sent !%s (%s) to %s", user.ID, cmd.Name, cmd.Kind, b.bus.Address(sid))
 }
@@ -509,7 +518,7 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 	sid, msgID, err := b.bus.DeliverVia(target, body, user.Label, b.viaOf(ev))
 	switch {
 	case err == nil:
-		b.recordDelivery(ev, msgID, sid, adopt, reactionQueued)
+		b.recordDelivery(ev, msgID, sid, adopt, reactionQueued, "")
 		b.syncReceipt(msgID)
 		return sid, true
 	case errors.Is(err, agentbus.ErrUnknownTarget):
@@ -540,11 +549,13 @@ func (b *Bridge) topLevelOutside(ev messageEvent) bool {
 // replies under it reach sid. Every delivery from a DM also makes sid the
 // user's dmLast.
 //
+// command is the name of the command msgID carries, or empty.
+//
 // queued is the receipt reaction the message starts with; recordDelivery
 // returns the one to put on ev now, which is a later receipt when one beat
 // the record (see state.record).
-func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, queued string) string {
-	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid, TS: ev.TS, Receipt: queued, TopLevel: b.topLevelOutside(ev)}
+func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, queued, command string) string {
+	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid, TS: ev.TS, Receipt: queued, TopLevel: b.topLevelOutside(ev), Command: command}
 	if !isDM(ev) {
 		reaction := b.state.record(r)
 		if adopt {

@@ -205,7 +205,32 @@ var errDMUserGone = errors.New("not an allowed user")
 // Post queues a session's message for its thread, or for an allowed user's
 // DM when o.DM is set. It never blocks.
 func (b *Bridge) Post(o agentbus.Outbound) {
+	b.logCommandOutcome(o)
 	b.enqueue(func(ctx context.Context) error { return b.postOutbound(ctx, o) })
+}
+
+// logCommandOutcome logs a command's outcome when o is the agentbus mod's
+// report on it: an answer to a command message that starts with ✅ or ❌.
+// Only the outcome, the command's name and the machine are logged, never
+// the report's text or the command's output.
+func (b *Bridge) logCommandOutcome(o agentbus.Outbound) {
+	if o.ReplyTo == "" || o.DM != "" {
+		return
+	}
+	r, ok := b.state.replyTarget(o.ReplyTo, o.SessionID)
+	if !ok || r.Command == "" {
+		return
+	}
+	outcome := ""
+	switch {
+	case strings.HasPrefix(o.Body, "✅"):
+		outcome = "✅ ran"
+	case strings.HasPrefix(o.Body, "❌"):
+		outcome = "❌ failed"
+	default:
+		return
+	}
+	log.Infof("slack: %s !%s on %s", outcome, r.Command, o.Machine)
 }
 
 func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
@@ -351,7 +376,12 @@ func (b *Bridge) homeChannelFor(ctx context.Context, sid string) (string, error)
 			return b.channelID, nil
 		}
 	case homeDM:
-		return b.dmChannel(ctx, b.ownerID)
+		// The DM of the owner who moved it there, while they are an owner.
+		owner := b.state.homeOwner(sid)
+		if owner == "" || !b.IsOwner(owner) {
+			owner = b.ownerID
+		}
+		return b.dmChannel(ctx, owner)
 	}
 	return b.homeChannelID, nil
 }

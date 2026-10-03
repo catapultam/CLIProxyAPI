@@ -4,7 +4,7 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.3.6'
+export const VERSION = '0.3.7'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
@@ -624,9 +624,10 @@ async function waitOnce($: EngineInterface) {
   if (status === 200) {
     for (const m of ((json?.messages as BusMessage[]) ?? [])) {
       if (m.command) {
-        // Only the proxy's Slack bridge sets command, always with from_user, for an owner. Any
-        // other command message is dropped: never run, and never shown to the model as text.
-        if (m.from_user === true) void runCommand($, m, m.command)
+        // Only the proxy's Slack bridge sets command, always with from_user, for an owner, never on
+        // a guest's message. Any other command message is dropped: never run, and never shown to
+        // the model as text.
+        if (m.from_user === true && m.guest !== true) void runCommand($, m, m.command)
         continue
       }
       void submitMessage($, m)

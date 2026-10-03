@@ -61,9 +61,13 @@ func (st *state) moveSession(oldID, newID string) {
 	if home, ok := st.homes[oldID]; ok {
 		if _, has := st.homes[newID]; !has {
 			st.homes[newID] = home
+			if owner, dm := st.homeDMs[oldID]; dm {
+				st.homeDMs[newID] = owner
+			}
 		}
 		delete(st.homes, oldID)
 	}
+	delete(st.homeDMs, oldID)
 	for user, e := range st.dmLasts {
 		if e.Session == oldID {
 			e.Session = newID

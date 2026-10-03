@@ -69,6 +69,17 @@ A machine runs shell commands only when it opts in: `AGENTBUS_ALLOW_SHELL=1`
 in the environment Claude Code runs in. Without it the reply is "shell
 commands are disabled".
 
+`AGENTBUS_ALLOW_SHELL` is a guard rail, not a security boundary. It only
+stops registry `shell` commands. An owner's slash passthrough (any `!command`
+the registry doesn't define runs as that Claude Code `/command`) and `prompt`
+commands reach the agent itself, and the agent can run shell commands when
+asked to. Treat being an owner as having a shell on every machine with the
+mod.
+
+In a linked conversation where guests read along, the bridge refuses
+`shell` (and so `image`) commands: run them from your DM with the bot or the
+channel. Slash and prompt commands still work there.
+
 ## Examples
 
 A slash command with a fixed prefix:

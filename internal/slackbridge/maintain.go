@@ -124,6 +124,7 @@ func (st *state) pruneSessions(seen map[string]time.Time) {
 		}
 		delete(st.threads, sid)
 		delete(st.homes, sid)
+		delete(st.homeDMs, sid)
 		for ts, owner := range st.sessions {
 			if owner == sid {
 				delete(st.sessions, ts)

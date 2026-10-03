@@ -64,6 +64,9 @@ type replyRecord struct {
 	// answer to it is posted at the top level there too, not in a thread.
 	// Records saved before it existed keep their ThreadTS routing.
 	TopLevel bool `json:"top_level,omitempty"`
+	// Command is the name of the command the message carried, so the
+	// agent's report on it can be logged; empty for any other message.
+	Command string `json:"command,omitempty"`
 }
 
 // convLink ties a whole Slack conversation other than the main channel (a
@@ -164,6 +167,9 @@ type stateFile struct {
 	// Homes maps a session id to where an owner moved its home thread
 	// (homeChannel or homeDM); without an entry the config's home applies.
 	Homes map[string]string `json:"homes,omitempty"`
+	// HomeOwners maps a session id whose home an owner moved to their DM
+	// (homeDM) to that owner's user ID, so the thread reopens there.
+	HomeOwners map[string]string `json:"home_owners,omitempty"`
 	// Links maps every thread ts linked to a session (not just the first
 	// one in Threads) to its session id.
 	Links   map[string]string `json:"links,omitempty"`
@@ -196,6 +202,7 @@ type state struct {
 	mu       sync.Mutex
 	threads  map[string]threadRef   // session id -> its home thread (agents post there)
 	homes    map[string]string      // session id -> where an owner moved its home thread
+	homeDMs  map[string]string      // session id -> the owner whose DM its home is (homeDM)
 	sessions map[string]string      // thread ts -> session id, for every linked thread
 	replies  []replyRecord          // delivered messages, oldest first, at most maxReplies
 	dmLinks  []dmLink               // top-level DM messages, oldest first, at most maxDMLinks
@@ -216,7 +223,7 @@ type state struct {
 // loadState reads path; a missing file is an empty state. On a corrupt file it
 // returns an empty state and the error.
 func loadState(path string) (*state, error) {
-	st := &state{path: path, now: time.Now, threads: map[string]threadRef{}, homes: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, moved: map[string]movedEntry{}, seen: map[string]time.Time{}, early: map[string]string{}}
+	st := &state{path: path, now: time.Now, threads: map[string]threadRef{}, homes: map[string]string{}, homeDMs: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, moved: map[string]movedEntry{}, seen: map[string]time.Time{}, early: map[string]string{}}
 	if path == "" {
 		return st, nil
 	}
@@ -245,6 +252,11 @@ func loadState(path string) (*state, error) {
 	}
 	for ts, sid := range file.Links {
 		st.sessions[ts] = sid
+	}
+	for sid, owner := range file.HomeOwners {
+		if sid != "" && owner != "" && st.homes[sid] == homeDM {
+			st.homeDMs[sid] = owner
+		}
 	}
 	// Expired entries stay until the next recordReply drops them; lookups
 	// never return them.
@@ -481,6 +493,27 @@ func (st *state) moveThread(sid, channel, ts, home string) {
 		st.homes[sid] = home
 	}
 	st.dirty = true
+}
+
+// setHomeOwner records whose DM session sid's home was moved to (userID),
+// or clears it (empty userID).
+func (st *state) setHomeOwner(sid, userID string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if userID == "" {
+		delete(st.homeDMs, sid)
+	} else {
+		st.homeDMs[sid] = userID
+	}
+	st.dirty = true
+}
+
+// homeOwner returns the owner whose DM session sid's home was moved to, or
+// "" when none was recorded.
+func (st *state) homeOwner(sid string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.homeDMs[sid]
 }
 
 // home returns where an owner moved session sid's home thread (homeChannel
@@ -910,6 +943,9 @@ func (st *state) saveLocked() error {
 	}
 	if len(st.moved) > 0 {
 		file.Moved = st.moved
+	}
+	if len(st.homeDMs) > 0 {
+		file.HomeOwners = st.homeDMs
 	}
 	if len(st.seen) > 0 {
 		file.Seen = st.seen

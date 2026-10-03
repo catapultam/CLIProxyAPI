@@ -279,7 +279,7 @@ test('session.end with clear says bye, then the next tick follows the session to
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
   // The old id goes along, so the bus hands the name, inbox and Slack routing to the new one.
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.6', previous: DEFAULT_SESSION_ID })
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.7', previous: DEFAULT_SESSION_ID })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
@@ -296,11 +296,11 @@ test('both hellos and every wait carry the mod version', async ($, on) => {
 
   const hellos = calls.filter(c => c.url.endsWith('/hello'))
   expect(hellos.length).toBe(2)
-  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.6' })
-  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.6' })
+  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.7' })
+  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.7' })
   const waits = calls.filter(c => c.url.includes('/wait?'))
   expect(waits.length).toBeGreaterThan(0)
-  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.6')
+  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.7')
 })
 
 test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {
@@ -1123,6 +1123,19 @@ test("a guest message is acknowledged after its turn, like an allowed user's", a
   await t.complete('t1')
   await clock.settle()
   expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_96'] }])
+})
+
+test('a command on a guest message is never run, even with from_user', async ($, on) => {
+  let ran = 0
+  on('command.run', () => {
+    ran++
+    return { text: 'ran' }
+  })
+  const msg = commandMessage('m_c21', { name: 'compact', kind: 'slash', command: 'compact' }, { guest: true })
+  const { prompts, sends } = await runMessages($, on, [msg])
+  expect(ran).toBe(0)
+  expect(prompts.length).toBe(0)
+  expect(sends.length).toBe(0)
 })
 
 // Item 11: agents keep the setup to the owner.

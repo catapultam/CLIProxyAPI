@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -278,8 +279,9 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 		}
 		b.WriteString(head + ":\n" + quoteBody(m.Body) + "\n")
 	}
-	// Without the mod, nothing re-surfaces a Slack instruction later.
-	if !mod && len(slackIDs(msgs)) > 0 {
+	// Without the mod, nothing re-surfaces a Slack instruction later. A
+	// guest's message is no instruction, so it gets no hint to keep it.
+	if !mod && slices.ContainsFunc(msgs, func(m Message) bool { return m.FromUser && !m.Guest }) {
 		b.WriteString(oneShotHint + "\n")
 	}
 	b.WriteString("</agentbus>")

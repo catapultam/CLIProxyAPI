@@ -128,6 +128,11 @@ func (b *Bridge) applyMove(ctx context.Context, ev messageEvent, owner allowedUs
 	if reply != "" {
 		return reply
 	}
+	if home == homeDM {
+		b.state.setHomeOwner(sid, owner.ID)
+	} else {
+		b.state.setHomeOwner(sid, "")
+	}
 	pointer := "Moved to " + b.placeLink(target)
 	link, errLink := b.api.permalink(ctx, b.cfg.BotToken, target, ts)
 	if errLink != nil {

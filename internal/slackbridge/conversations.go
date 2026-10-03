@@ -75,6 +75,24 @@ func conversationKind(ev messageEvent) string {
 	return "channel"
 }
 
+// guestsRead reports whether ev's conversation is linked and someone known
+// to be in it isn't an allowed user, so a guest reads what is posted there.
+func (b *Bridge) guestsRead(ev messageEvent) bool {
+	if !isDM(ev) && ev.Channel == b.channelID {
+		return false
+	}
+	l, ok := b.conversationLink(ev.Channel)
+	if !ok {
+		return false
+	}
+	for _, id := range l.Members {
+		if _, allowed := b.state.user(id); !allowed {
+			return true
+		}
+	}
+	return false
+}
+
 // notFoundAgent is the reply in ev's conversation when agent doesn't
 // resolve to a session.
 func (b *Bridge) notFoundAgent(ev messageEvent, agent string) string {
