@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,6 +17,12 @@ const (
 	// replyTTL matches the agentbus message TTL: a message older than this
 	// has left the bus, so an answer to it goes to the session's own thread.
 	replyTTL = 7 * 24 * time.Hour
+	// maxDMLinks caps the remembered top-level DM messages; the oldest go
+	// first. Links expire after replyTTL.
+	maxDMLinks = 1000
+	// dmLastTTL is how long a plain DM still goes to the agent the user last
+	// talked to there.
+	dmLastTTL = 7 * 24 * time.Hour
 )
 
 var (
@@ -26,11 +33,33 @@ var (
 // replyRecord remembers where a message the bridge delivered came from, so
 // the session it went to can answer in that Slack thread.
 type replyRecord struct {
-	ID       string    `json:"id"`
-	Channel  string    `json:"channel"`
-	ThreadTS string    `json:"thread_ts"`
-	Session  string    `json:"session"`
-	At       time.Time `json:"at"`
+	ID       string `json:"id"`
+	Channel  string `json:"channel"`
+	ThreadTS string `json:"thread_ts"`
+	// DMUser is the user whose DM with the bot Channel is, or empty for the
+	// channel. An answer goes there only while they are still allowed.
+	DMUser  string    `json:"dm_user,omitempty"`
+	Session string    `json:"session"`
+	At      time.Time `json:"at"`
+}
+
+// dmLink ties a top-level message in a DM to a session, so a thread reply
+// under it reaches that session.
+type dmLink struct {
+	Channel string `json:"channel"`
+	TS      string `json:"ts"`
+	Session string `json:"session"`
+	// Agent marks a post the session made itself (rather than a user's
+	// message delivered to it). A session's first one in a channel carries
+	// its header line.
+	Agent bool      `json:"agent,omitempty"`
+	At    time.Time `json:"at"`
+}
+
+// dmLastEntry is the agent a user last talked to in their DM with the bot.
+type dmLastEntry struct {
+	Session string    `json:"session"`
+	At      time.Time `json:"at"`
 }
 
 type allowedUser struct {
@@ -49,24 +78,31 @@ type stateFile struct {
 	Allowed []allowedUser     `json:"allowed"`
 	// Replies lists delivered messages, oldest first.
 	Replies []replyRecord `json:"replies,omitempty"`
+	// DMLinks lists top-level DM messages tied to sessions, oldest first.
+	DMLinks []dmLink `json:"dm_links,omitempty"`
+	// DMLast maps a user ID to the agent they last talked to in their DM.
+	DMLast map[string]dmLastEntry `json:"dm_last,omitempty"`
 }
 
-// state holds session threads, delivered messages and the allowlist. Every
-// change is written through to disk; changes are rare (human-paced).
+// state holds session threads, delivered messages, DM routing and the
+// allowlist. Every change is written through to disk; changes are rare
+// (human-paced).
 type state struct {
 	path     string
 	now      func() time.Time
 	mu       sync.Mutex
-	threads  map[string]string // session id -> its first thread ts (agents post there)
-	sessions map[string]string // thread ts -> session id, for every linked thread
-	replies  []replyRecord     // delivered messages, oldest first, at most maxReplies
-	users    []allowedUser     // config users first
+	threads  map[string]string      // session id -> its first thread ts (agents post there)
+	sessions map[string]string      // thread ts -> session id, for every linked thread
+	replies  []replyRecord          // delivered messages, oldest first, at most maxReplies
+	dmLinks  []dmLink               // top-level DM messages, oldest first, at most maxDMLinks
+	dmLasts  map[string]dmLastEntry // user ID -> the agent they last talked to in their DM
+	users    []allowedUser          // config users first
 }
 
 // loadState reads path; a missing file is an empty state. On a corrupt file it
 // returns an empty state and the error.
 func loadState(path string) (*state, error) {
-	st := &state{path: path, now: time.Now, threads: map[string]string{}, sessions: map[string]string{}}
+	st := &state{path: path, now: time.Now, threads: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}}
 	if path == "" {
 		return st, nil
 	}
@@ -90,13 +126,27 @@ func loadState(path string) (*state, error) {
 	}
 	// Expired entries stay until the next recordReply drops them; lookups
 	// never return them.
+	// A record of a top-level DM has no thread, but always a channel.
 	for _, r := range file.Replies {
-		if r.ID != "" && r.ThreadTS != "" && r.Session != "" {
+		if r.ID != "" && r.Session != "" && (r.ThreadTS != "" || r.Channel != "") {
 			st.replies = append(st.replies, r)
 		}
 	}
 	if extra := len(st.replies) - maxReplies; extra > 0 {
 		st.replies = st.replies[extra:]
+	}
+	for _, l := range file.DMLinks {
+		if l.Channel != "" && l.TS != "" && l.Session != "" {
+			st.dmLinks = append(st.dmLinks, l)
+		}
+	}
+	if extra := len(st.dmLinks) - maxDMLinks; extra > 0 {
+		st.dmLinks = st.dmLinks[extra:]
+	}
+	for user, e := range file.DMLast {
+		if user != "" && e.Session != "" {
+			st.dmLasts[user] = e
+		}
 	}
 	st.users = file.Allowed
 	return st, nil
@@ -257,10 +307,10 @@ func (st *state) setThread(sid, ts string) bool {
 	return first
 }
 
-// recordReply remembers that message msgID, from thread threadTS in channel,
-// was delivered to session sid. Expired entries are dropped, and the oldest
+// record remembers delivered message r (stamped now): where it came from
+// and the session it went to. Expired entries are dropped, and the oldest
 // when there are more than maxReplies.
-func (st *state) recordReply(msgID, channel, threadTS, sid string) {
+func (st *state) record(r replyRecord) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	now := st.now()
@@ -271,7 +321,8 @@ func (st *state) recordReply(msgID, channel, threadTS, sid string) {
 			kept = append(kept, r)
 		}
 	}
-	kept = append(kept, replyRecord{ID: msgID, Channel: channel, ThreadTS: threadTS, Session: sid, At: now})
+	r.At = now
+	kept = append(kept, r)
 	if extra := len(kept) - maxReplies; extra > 0 {
 		kept = kept[:copy(kept, kept[extra:])]
 	}
@@ -295,16 +346,17 @@ func (st *state) replyLocked(msgID string) (replyRecord, bool) {
 	return replyRecord{}, false
 }
 
-// replyThread returns the thread msgID came from when it was delivered to sid
-// and hasn't expired.
-func (st *state) replyThread(msgID, sid string) (string, bool) {
+// replyTarget returns the record of msgID when it was delivered to sid and
+// hasn't expired: the conversation and thread it came from. The thread is
+// empty for a top-level DM.
+func (st *state) replyTarget(msgID, sid string) (replyRecord, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	r, ok := st.replyLocked(msgID)
 	if !ok || r.Session != sid {
-		return "", false
+		return replyRecord{}, false
 	}
-	return r.ThreadTS, true
+	return r, true
 }
 
 // replyOwner returns the session an unexpired msgID was delivered to.
@@ -315,11 +367,106 @@ func (st *state) replyOwner(msgID string) (string, bool) {
 	return r.Session, ok
 }
 
+// linkDM ties the top-level message ts in DM channel to session sid; agent
+// marks the session's own post. Expired links are dropped, and the oldest
+// when there are more than maxDMLinks.
+func (st *state) linkDM(channel, ts, sid string, agent bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	now := st.now()
+	cutoff := now.Add(-replyTTL)
+	kept := st.dmLinks[:0]
+	for _, l := range st.dmLinks {
+		if l.At.After(cutoff) {
+			kept = append(kept, l)
+		}
+	}
+	kept = append(kept, dmLink{Channel: channel, TS: ts, Session: sid, Agent: agent, At: now})
+	if extra := len(kept) - maxDMLinks; extra > 0 {
+		kept = kept[:copy(kept, kept[extra:])]
+	}
+	st.dmLinks = kept
+	if errSave := st.saveLocked(); errSave != nil {
+		logSaveError(errSave)
+	}
+}
+
+// dmSession returns the session an unexpired top-level DM message ts in
+// channel is tied to.
+func (st *state) dmSession(channel, ts string) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	cutoff := st.now().Add(-replyTTL)
+	for i := len(st.dmLinks) - 1; i >= 0; i-- {
+		if l := st.dmLinks[i]; l.Channel == channel && l.TS == ts {
+			return l.Session, l.At.After(cutoff)
+		}
+	}
+	return "", false
+}
+
+// dmHeaded reports whether session sid has an unexpired post of its own in
+// DM channel, so its header line went out there.
+func (st *state) dmHeaded(channel, sid string) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	cutoff := st.now().Add(-replyTTL)
+	for _, l := range st.dmLinks {
+		if l.Agent && l.Channel == channel && l.Session == sid && l.At.After(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
+// setDMLast makes sid the agent userID's plain DMs go to.
+func (st *state) setDMLast(userID, sid string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.dmLasts[userID] = dmLastEntry{Session: sid, At: st.now()}
+	if errSave := st.saveLocked(); errSave != nil {
+		logSaveError(errSave)
+	}
+}
+
+// dmLast returns the agent userID last talked to in their DM, unless that
+// was more than dmLastTTL ago.
+func (st *state) dmLast(userID string) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	e, ok := st.dmLasts[userID]
+	if !ok || !e.At.After(st.now().Add(-dmLastTTL)) {
+		return "", false
+	}
+	return e.Session, true
+}
+
+// userByLabel finds an allowed user by label, compared case-insensitively.
+func (st *state) userByLabel(label string) (allowedUser, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, u := range st.users {
+		if strings.EqualFold(u.Label, label) {
+			return u, true
+		}
+	}
+	return allowedUser{}, false
+}
+
 func (st *state) saveLocked() error {
 	if st.path == "" {
 		return nil
 	}
-	file := stateFile{Threads: st.threads, Links: st.sessions, Replies: st.replies}
+	file := stateFile{Threads: st.threads, Links: st.sessions, Replies: st.replies, DMLinks: st.dmLinks}
+	cutoff := st.now().Add(-dmLastTTL)
+	for user, e := range st.dmLasts {
+		if e.At.After(cutoff) {
+			if file.DMLast == nil {
+				file.DMLast = map[string]dmLastEntry{}
+			}
+			file.DMLast[user] = e
+		}
+	}
 	for _, u := range st.users {
 		if !u.config {
 			file.Allowed = append(file.Allowed, u)

@@ -156,6 +156,21 @@ func (a *api) userInfo(ctx context.Context, token, userID string) (string, bool,
 	return label, user.Get("is_bot").Bool(), nil
 }
 
+// openDM opens (or finds) the bot's direct message with userID and returns
+// its channel id. It needs the im:write scope.
+func (a *api) openDM(ctx context.Context, token, userID string) (string, error) {
+	const method = "conversations.open"
+	body, err := a.call(ctx, token, method, url.Values{"users": {userID}})
+	if err != nil {
+		return "", err
+	}
+	channel := body.Get("channel.id").String()
+	if channel == "" {
+		return "", &apiError{method: method, code: "invalid_response"}
+	}
+	return channel, nil
+}
+
 func (a *api) postMessage(ctx context.Context, token, channel, text, threadTS string) (string, error) {
 	params := url.Values{"channel": {channel}, "text": {text}}
 	if threadTS != "" {
@@ -222,14 +237,18 @@ func (a *api) uploadFile(ctx context.Context, uploadURL string, data []byte) err
 	return nil
 }
 
-// completeUpload shares an uploaded file into a channel thread, with an
-// optional comment posted alongside it.
+// completeUpload shares an uploaded file into a channel thread (or, with an
+// empty threadTS, at the top level), with an optional comment posted
+// alongside it.
 func (a *api) completeUpload(ctx context.Context, token, fileID, title, channel, threadTS, comment string) error {
 	files, errJSON := json.Marshal([]map[string]string{{"id": fileID, "title": title}})
 	if errJSON != nil {
 		return fmt.Errorf("slack files.completeUploadExternal: %w", errJSON)
 	}
-	params := url.Values{"files": {string(files)}, "channel_id": {channel}, "thread_ts": {threadTS}}
+	params := url.Values{"files": {string(files)}, "channel_id": {channel}}
+	if threadTS != "" {
+		params.Set("thread_ts", threadTS)
+	}
 	if comment != "" {
 		params.Set("initial_comment", comment)
 	}

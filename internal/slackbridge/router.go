@@ -19,30 +19,41 @@ const (
 	ownersOnlyCommands = "Only owners can run commands."
 	howToCommand       = "Run a command in an agent's thread (`!compact`), or at the top level as `name: !compact`. `!commands` lists them."
 	sessionEnded       = "That agent's session has ended, so this wasn't delivered."
-	onlineLimit        = 10
+	// howToDM answers a DM the bridge can't route.
+	howToDM     = "To reach an agent here, write `name: message` (the name or address from its posts). After that, plain messages go to the agent you last talked to here, and a reply in a thread goes to the agent whose message started it."
+	onlineLimit = 10
 )
 
 type messageEvent struct {
-	Type     string `json:"type"`
-	Subtype  string `json:"subtype"`
-	Channel  string `json:"channel"`
-	User     string `json:"user"`
-	BotID    string `json:"bot_id"`
-	Text     string `json:"text"`
-	TS       string `json:"ts"`
-	ThreadTS string `json:"thread_ts"`
+	Type    string `json:"type"`
+	Subtype string `json:"subtype"`
+	Channel string `json:"channel"`
+	// ChannelType is "im" in a direct message with the bot.
+	ChannelType string `json:"channel_type"`
+	User        string `json:"user"`
+	BotID       string `json:"bot_id"`
+	Text        string `json:"text"`
+	TS          string `json:"ts"`
+	ThreadTS    string `json:"thread_ts"`
 }
 
 // relayedSubtypes are the message subtypes that are a person writing:
 // a plain message, a thread reply also sent to the channel, a message with a file.
 var relayedSubtypes = map[string]bool{"": true, "thread_broadcast": true, "file_share": true}
 
-// handleEvent routes one Slack message. It only touches memory, the state
-// file and the job queues, never the network, so the socket loop can ack as
-// soon as it returns.
+// isDM reports whether ev is in a user's direct message with the bot (Slack
+// gives a DM's channel id a "D" prefix).
+func isDM(ev messageEvent) bool {
+	return ev.ChannelType == "im" || strings.HasPrefix(ev.Channel, "D")
+}
+
+// handleEvent routes one Slack message, from the channel or a DM with the
+// bot. It only touches memory, the state file and the job queues, never the
+// network, so the socket loop can ack as soon as it returns.
 func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
+	dm := isDM(ev)
 	if ev.Type != "message" || !relayedSubtypes[ev.Subtype] || ev.BotID != "" ||
-		ev.Channel != b.channelID || ev.User == "" || ev.User == b.botUserID {
+		ev.Channel == "" || (ev.Channel != b.channelID && !dm) || ev.User == "" || ev.User == b.botUserID {
 		return
 	}
 	user, ok := b.state.user(ev.User)
@@ -63,6 +74,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		return
 	}
 	text := plainText(ev.Text, b.state.idLabels())
+	if dm {
+		b.routeDM(ev, user, text)
+		return
+	}
 	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
 		sid, linked := b.state.session(ev.ThreadTS)
 		if !linked {
@@ -76,7 +91,7 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 			b.runCommand(ev, user, sid, text, sessionEnded, false)
 			return
 		}
-		b.deliver(ev, sid, text, user, sessionEnded)
+		b.deliver(ev, sid, text, user, sessionEnded, false)
 		return
 	}
 	target, body, addressedOK := parseAddressed(text)
@@ -94,19 +109,76 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		b.runCommand(ev, user, target, body, notFound, true)
 		return
 	}
-	if sid, delivered := b.deliver(ev, target, body, user, notFound); delivered {
-		b.state.setThread(sid, ev.TS)
+	b.deliver(ev, target, body, user, notFound, true)
+}
+
+// routeDM routes a message from an allowed user in their DM with the bot:
+//   - a reply in a thread goes to the agent the thread's first message is
+//     tied to;
+//   - a top-level "name: …" goes to that agent;
+//   - any other top-level message goes to the agent the user last talked to
+//     in the DM (dmLast, while it hasn't expired), or gets a help reply.
+//
+// "!" commands take the same routes, with the same owner rule. Every
+// delivery makes its agent the user's dmLast.
+func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string) {
+	b.rememberDM(ev.User, ev.Channel)
+	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
+		sid, linked := b.dmThreadSession(ev)
+		if !linked {
+			if !b.alreadySeen("unlinked:" + ev.Channel + ":" + ev.ThreadTS) {
+				b.reply(ev, "This thread isn't linked to an agent. "+howToDM)
+			}
+			return
+		}
+		if isBang(text) {
+			b.runCommand(ev, user, sid, text, sessionEnded, false)
+			return
+		}
+		b.deliver(ev, sid, text, user, sessionEnded, false)
+		return
 	}
+	if target, body, addressedOK := parseAddressed(text); addressedOK {
+		notFound := fmt.Sprintf("No agent called `%s`. %s", escape(target), b.onlineHint())
+		if isBang(body) {
+			b.runCommand(ev, user, target, body, notFound, true)
+			return
+		}
+		b.deliver(ev, target, body, user, notFound, true)
+		return
+	}
+	sid, ok := b.state.dmLast(ev.User)
+	if isBang(text) {
+		// Without a dmLast the target is empty: runCommand answers !commands
+		// and explains the rest.
+		b.runCommand(ev, user, sid, text, sessionEnded, ok)
+		return
+	}
+	if !ok {
+		b.reply(ev, howToDM+" "+b.onlineHint())
+		return
+	}
+	b.deliver(ev, sid, text, user, sessionEnded, true)
+}
+
+// dmThreadSession is the session a DM thread reply goes to: the one its
+// thread's first message is tied to, or, failing that, a session thread
+// opened there.
+func (b *Bridge) dmThreadSession(ev messageEvent) (string, bool) {
+	if sid, ok := b.state.dmSession(ev.Channel, ev.ThreadTS); ok {
+		return sid, true
+	}
+	return b.state.session(ev.ThreadTS)
 }
 
 // runCommand handles "!name rest" from user for target (a session id, name
 // or address; empty at the top level without "name:"). Only owners may run
 // commands. !commands is answered here; anything else resolves against the
 // registry (falling through to the Claude Code slash command of that name)
-// and is delivered as a command message the target's mod runs. adopt makes
-// the post's thread one of the target's threads, as for a top-level
-// "name: message". notFound is the reply when target is unknown. Replies go
-// on the command queue, so a flood of agent posts can't drop them.
+// and is delivered as a command message the target's mod runs. adopt is as
+// for deliver (a top-level post). notFound is the reply when target is
+// unknown. Replies go on the command queue, so a flood of agent posts can't
+// drop them.
 func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, notFound string, adopt bool) {
 	if !user.config {
 		log.Infof("slack: refused a command from non-owner %s", user.ID)
@@ -144,7 +216,8 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		display = escape(target)
 	}
 	sid, capable, errCapable := b.bus.CommandCapable(target)
-	if errCapable == nil && !adopt {
+	// Name the agent as the user did, unless target is a session id.
+	if errCapable == nil && (!adopt || target == sid) {
 		display = escape(b.bus.Address(sid))
 	}
 	if errCapable == nil && !capable {
@@ -166,10 +239,7 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		b.replyCommand(ev, "Not delivered: "+escape(errCapable.Error()))
 		return
 	}
-	b.state.recordReply(msgID, ev.Channel, replyThread(ev), sid)
-	if adopt {
-		b.state.setThread(sid, ev.TS)
-	}
+	b.recordDelivery(ev, msgID, sid, adopt)
 	b.react(ev, "gear")
 	log.Infof("slack: %s sent !%s (%s) to %s", user.ID, cmd.Name, cmd.Kind, b.bus.Address(sid))
 }
@@ -193,15 +263,19 @@ func (b *Bridge) alreadySeen(eventID string) bool {
 }
 
 // deliver queues body for target; notFound is the reply when the target is
-// unknown. A delivered message's thread is recorded, so the session can answer
-// there.
-func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string) (string, bool) {
-	sid, msgID, err := b.bus.Deliver(target, body, user.Label)
+// unknown. A message from a DM is marked as such. Where it came from is
+// recorded (recordDelivery), so the session can answer there; adopt is true
+// for a top-level post.
+func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string, adopt bool) {
+	via := ""
+	if isDM(ev) {
+		via = agentbus.ViaDM
+	}
+	sid, msgID, err := b.bus.DeliverVia(target, body, user.Label, via)
 	switch {
 	case err == nil:
-		b.state.recordReply(msgID, ev.Channel, replyThread(ev), sid)
+		b.recordDelivery(ev, msgID, sid, adopt)
 		b.react(ev, "inbox_tray")
-		return sid, true
 	case errors.Is(err, agentbus.ErrUnknownTarget):
 		b.reply(ev, notFound)
 	case errors.Is(err, agentbus.ErrBodyTooLarge):
@@ -209,7 +283,29 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 	default:
 		b.reply(ev, "Not delivered: "+escape(err.Error()))
 	}
-	return "", false
+}
+
+// recordDelivery remembers that msgID, delivered to sid, came from ev, so sid
+// can answer in that conversation and thread. With adopt (a top-level post),
+// later messages there reach sid too: in the channel the post's thread
+// becomes one of sid's threads; in a DM the post is linked to sid, so thread
+// replies under it reach sid. Every delivery from a DM also makes sid the
+// user's dmLast.
+func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool) {
+	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid}
+	if !isDM(ev) {
+		b.state.record(r)
+		if adopt {
+			b.state.setThread(sid, ev.TS)
+		}
+		return
+	}
+	r.DMUser = ev.User
+	b.state.record(r)
+	b.state.setDMLast(ev.User, sid)
+	if adopt {
+		b.state.linkDM(ev.Channel, ev.TS, sid, false)
+	}
 }
 
 func (b *Bridge) onlineHint() string {
@@ -328,12 +424,18 @@ func (b *Bridge) applyRemove(user allowedUser, target string) string {
 	}
 }
 
-// replyThread is the thread a reply to ev belongs in.
+// replyThread is the thread a reply to ev belongs in: ev's thread, or for a
+// top-level post a new thread under it, except in a DM, where a reply to a
+// top-level message stays at the top level ("").
 func replyThread(ev messageEvent) string {
-	if ev.ThreadTS != "" {
+	switch {
+	case ev.ThreadTS != "" && ev.ThreadTS != ev.TS:
 		return ev.ThreadTS
+	case isDM(ev):
+		return ""
+	default:
+		return ev.TS
 	}
-	return ev.TS
 }
 
 func (b *Bridge) reply(ev messageEvent, text string) {
@@ -346,12 +448,12 @@ func (b *Bridge) replyCommand(ev messageEvent, text string) {
 }
 
 func (b *Bridge) replyNow(ctx context.Context, ev messageEvent, text string) error {
-	_, err := b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, text, replyThread(ev))
+	_, err := b.api.postMessage(ctx, b.cfg.BotToken, ev.Channel, text, replyThread(ev))
 	return err
 }
 
 func (b *Bridge) react(ev messageEvent, name string) {
 	b.enqueue(func(ctx context.Context) error {
-		return b.api.addReaction(ctx, b.cfg.BotToken, b.channelID, ev.TS, name)
+		return b.api.addReaction(ctx, b.cfg.BotToken, ev.Channel, ev.TS, name)
 	})
 }

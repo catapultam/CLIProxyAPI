@@ -232,6 +232,14 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "ts": ts, "channel": r.PostForm.Get("channel")})
 	case "reactions.add":
 		writeJSON(w, map[string]any{"ok": true})
+	case "conversations.open":
+		// A 1:1 DM with the bot: its id is "D" + the user's id.
+		users := r.PostForm.Get("users")
+		if users == "" || strings.Contains(users, ",") {
+			writeJSON(w, map[string]any{"ok": false, "error": "invalid_users"})
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "channel": map[string]any{"id": "D" + users}})
 	case "files.getUploadURLExternal":
 		f.mu.Lock()
 		f.nextFile++

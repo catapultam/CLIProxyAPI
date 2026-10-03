@@ -83,6 +83,12 @@ type Bridge struct {
 	openMu  sync.Mutex
 	opening map[string]*openGate
 
+	// dmChannels caches user ID -> the bot's DM channel with them, learned
+	// from conversations.open or an inbound DM. dmMu guards it and is never
+	// held across a Slack call or a Store call.
+	dmMu       sync.Mutex
+	dmChannels map[string]string
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	jobsWG sync.WaitGroup
@@ -111,6 +117,7 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 		seen:        map[string]bool{},
 		cmdSeq:      map[string]uint64{},
 		opening:     map[string]*openGate{},
+		dmChannels:  map[string]string{},
 	}, nil
 }
 
@@ -131,62 +138,173 @@ func (b *Bridge) IsOwner(userID string) bool {
 	return ok && u.config
 }
 
-// Post queues a session's message for its thread. It never blocks.
+// errDMUserGone is a DM whose label is no longer an allowed user's.
+var errDMUserGone = errors.New("not an allowed user")
+
+// Post queues a session's message for its thread, or for an allowed user's
+// DM when o.DM is set. It never blocks.
 func (b *Bridge) Post(o agentbus.Outbound) {
 	b.enqueue(func(ctx context.Context) error { return b.postOutbound(ctx, o) })
 }
 
 func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
 	text := withMentions(o.Body, b.state.mentionIDs())
-	ts, opened, err := b.threadFor(ctx, o, text)
+	t, opened, err := b.threadFor(ctx, o, text)
+	if errors.Is(err, errDMUserGone) {
+		log.Warnf("slack: dropped a DM from %s to @%s: not an allowed user", o.Address, o.DM)
+		return nil
+	}
 	if err != nil || opened {
 		return err
 	}
-	_, err = b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, text, ts)
+	ts, err := b.api.postMessage(ctx, b.cfg.BotToken, t.channel, text, t.threadTS)
+	if err == nil && t.threadTS == "" {
+		b.state.linkDM(t.channel, ts, o.SessionID, true)
+	}
 	return err
 }
 
-// threadFor picks the thread a session's post goes to: the thread o.ReplyTo
-// came from when that message was delivered to this session, else its own
-// thread when it has one. Otherwise it opens one by posting the session
-// header, followed by text when text isn't empty, at the top level; opened
-// reports that, so the caller doesn't post text again. Text and image posts
-// both choose their thread here. Only one caller per session checks and opens
-// at a time, so a session never gets two header posts.
-func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string) (ts string, opened bool, err error) {
-	if ts, ok := b.repliedThread(o); ok {
-		return ts, false, nil
+// postTarget is where a post goes: a conversation and a thread in it. An
+// empty threadTS is the conversation's top level, where only DM posts go.
+type postTarget struct{ channel, threadTS string }
+
+// threadFor picks where a session's post goes:
+//   - with o.DM, the top level of that allowed user's DM (errDMUserGone when
+//     the label isn't an allowed user's any more);
+//   - else the conversation and thread o.ReplyTo came from, when that message
+//     was delivered to this session (a top-level DM is answered at the DM's
+//     top level);
+//   - else the session's own thread. When it has none, threadFor opens one
+//     by posting the session header, followed by text when text isn't empty,
+//     at the top level of the channel.
+//
+// A session's first top-level post in a DM also starts with its header (see
+// dmTop). opened reports that text already went out with a header, so the
+// caller doesn't post it again. Text and image posts both choose here. Only
+// one caller per session checks and opens at a time, so a session never gets
+// two header posts in one place.
+func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string) (t postTarget, opened bool, err error) {
+	if o.DM != "" {
+		channel, errDM := b.dmChannelFor(ctx, o)
+		if errDM != nil {
+			return postTarget{}, false, errDM
+		}
+		return b.dmTop(ctx, o, channel, text)
+	}
+	if t, ok := b.repliedThread(o); ok {
+		if t.threadTS == "" {
+			return b.dmTop(ctx, o, t.channel, text)
+		}
+		return t, false, nil
 	}
 	unlock, errLock := b.lockOpening(ctx, o.SessionID)
 	if errLock != nil {
-		return "", false, errLock
+		return postTarget{}, false, errLock
 	}
 	defer unlock()
 	if ts, ok := b.state.thread(o.SessionID); ok {
-		return ts, false, nil
+		return postTarget{channel: b.channelID, threadTS: ts}, false, nil
 	}
 	first := sessionHeader(o)
 	if text != "" {
 		first += "\n" + text
 	}
-	ts, err = b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, first, "")
+	ts, err := b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, first, "")
 	if err != nil {
-		return "", false, err
+		return postTarget{}, false, err
 	}
 	b.state.setThread(o.SessionID, ts)
-	return ts, true, nil
+	return postTarget{channel: b.channelID, threadTS: ts}, true, nil
 }
 
-// repliedThread returns the recorded thread of o.ReplyTo when that message
-// was delivered to o's session. An id delivered to another session is logged
-// (both addresses, never the body) and ignored. It runs without bridge locks
-// held, since it may ask the Store for the other session's address.
-func (b *Bridge) repliedThread(o agentbus.Outbound) (string, bool) {
-	if o.ReplyTo == "" {
-		return "", false
+// dmTop prepares a top-level post by o's session in DM channel. The session's
+// first post there starts with its header line: dmTop posts the header,
+// followed by text when text isn't empty, links it to the session and
+// reports opened. Otherwise it posts nothing, and the caller posts (and, for
+// text, links) itself.
+func (b *Bridge) dmTop(ctx context.Context, o agentbus.Outbound, channel, text string) (postTarget, bool, error) {
+	t := postTarget{channel: channel}
+	unlock, errLock := b.lockOpening(ctx, o.SessionID)
+	if errLock != nil {
+		return t, false, errLock
 	}
-	if ts, ok := b.state.replyThread(o.ReplyTo, o.SessionID); ok {
-		return ts, true
+	defer unlock()
+	if b.state.dmHeaded(channel, o.SessionID) {
+		return t, false, nil
+	}
+	first := sessionHeader(o)
+	if text != "" {
+		first += "\n" + text
+	}
+	ts, err := b.api.postMessage(ctx, b.cfg.BotToken, channel, first, "")
+	if err != nil {
+		return t, false, err
+	}
+	b.state.linkDM(channel, ts, o.SessionID, true)
+	return t, true, nil
+}
+
+// dmChannelFor finds the allowed user o.DM labels (errDMUserGone when there
+// is none now), returns the bot's DM channel with them, and makes o's session
+// the agent their plain DMs go to.
+func (b *Bridge) dmChannelFor(ctx context.Context, o agentbus.Outbound) (string, error) {
+	u, ok := b.state.userByLabel(o.DM)
+	if !ok {
+		return "", errDMUserGone
+	}
+	channel, err := b.dmChannel(ctx, u.ID)
+	if err != nil {
+		return "", err
+	}
+	b.state.setDMLast(u.ID, o.SessionID)
+	return channel, nil
+}
+
+// dmChannel returns the bot's DM channel with userID, calling
+// conversations.open only when it isn't cached yet.
+func (b *Bridge) dmChannel(ctx context.Context, userID string) (string, error) {
+	b.dmMu.Lock()
+	channel, ok := b.dmChannels[userID]
+	b.dmMu.Unlock()
+	if ok {
+		return channel, nil
+	}
+	channel, err := b.api.openDM(ctx, b.cfg.BotToken, userID)
+	if err != nil {
+		return "", err
+	}
+	b.rememberDM(userID, channel)
+	return channel, nil
+}
+
+// rememberDM caches channel as the bot's DM with userID.
+func (b *Bridge) rememberDM(userID, channel string) {
+	b.dmMu.Lock()
+	defer b.dmMu.Unlock()
+	b.dmChannels[userID] = channel
+}
+
+// repliedThread returns where o.ReplyTo came from when that message was
+// delivered to o's session. An id delivered to another session is logged
+// (both addresses, never the body) and ignored, and so is one from the DM of
+// a user who is no longer allowed. It runs without bridge locks held, since
+// it may ask the Store for the other session's address.
+func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool) {
+	if o.ReplyTo == "" {
+		return postTarget{}, false
+	}
+	if r, ok := b.state.replyTarget(o.ReplyTo, o.SessionID); ok {
+		if r.DMUser != "" {
+			if _, allowed := b.state.user(r.DMUser); !allowed {
+				log.Warnf("slack: %s answered message %s from the DM of %s, who is no longer allowed; posting in its own thread instead", o.Address, o.ReplyTo, r.DMUser)
+				return postTarget{}, false
+			}
+		}
+		channel := r.Channel
+		if channel == "" {
+			channel = b.channelID
+		}
+		return postTarget{channel: channel, threadTS: r.ThreadTS}, true
 	}
 	if owner, ok := b.state.replyOwner(o.ReplyTo); ok && owner != o.SessionID {
 		other := b.bus.Address(owner)
@@ -195,7 +313,7 @@ func (b *Bridge) repliedThread(o agentbus.Outbound) (string, bool) {
 		}
 		log.Warnf("slack: %s answered message %s, which went to %s; posting in its own thread instead", o.Address, o.ReplyTo, other)
 	}
-	return "", false
+	return postTarget{}, false
 }
 
 // openGate is a per-session lock that a waiter can give up on. refs counts
@@ -235,19 +353,22 @@ func (b *Bridge) lockOpening(ctx context.Context, sid string) (func(), error) {
 	}
 }
 
-// PostImage uploads an image into the thread threadFor picks (the replied-to
-// thread or the session's own), opening the session's thread first (header
-// plus caption) when it has none. It
-// implements agentbus.ImagePoster and runs in the caller's goroutine, not on
-// the job queue, so the caller gets Slack's answer. The returned error is
-// only a short code (Slack's error code, or request_failed); the details are
-// logged without the upload URL or any token.
+// PostImage uploads an image where threadFor puts o (the DM o.DM names, the
+// replied-to thread or the session's own), first posting the session header
+// plus caption when that place needs one. It implements agentbus.ImagePoster
+// and runs in the caller's goroutine, not on the job queue, so the caller
+// gets Slack's answer. The returned error is only a short code (Slack's
+// error code, user_not_allowed, or request_failed); the details are logged
+// without the upload URL or any token.
 func (b *Bridge) PostImage(ctx context.Context, o agentbus.Outbound, filename string, data []byte) error {
 	errPost := b.postImage(ctx, o, sanitizeFilename(filename), data)
 	if errPost == nil {
 		return nil
 	}
 	log.Warnf("slack: image from %s: %v", o.Address, errPost)
+	if errors.Is(errPost, errDMUserGone) {
+		return errors.New("user_not_allowed")
+	}
 	var apiErr *apiError
 	if errors.As(errPost, &apiErr) && apiErr.code != "" {
 		return errors.New(apiErr.code)
@@ -260,12 +381,12 @@ func (b *Bridge) postImage(ctx context.Context, o agentbus.Outbound, filename st
 	if strings.TrimSpace(o.Body) != "" {
 		caption = withMentions(o.Body, b.state.mentionIDs())
 	}
-	ts, opened, err := b.threadFor(ctx, o, caption)
+	t, opened, err := b.threadFor(ctx, o, caption)
 	if err != nil {
 		return err
 	}
 	if opened {
-		// The caption went out with the header that opened the thread.
+		// The caption went out with the header.
 		caption = ""
 	}
 	uploadURL, fileID, err := b.api.getUploadURL(ctx, b.cfg.BotToken, filename, len(data))
@@ -275,7 +396,7 @@ func (b *Bridge) postImage(ctx context.Context, o agentbus.Outbound, filename st
 	if err = b.api.uploadFile(ctx, uploadURL, data); err != nil {
 		return err
 	}
-	return b.api.completeUpload(ctx, b.cfg.BotToken, fileID, filename, b.channelID, ts, caption)
+	return b.api.completeUpload(ctx, b.cfg.BotToken, fileID, filename, t.channel, t.threadTS, caption)
 }
 
 // enqueue adds a job, dropping the oldest queued job when the queue is full.

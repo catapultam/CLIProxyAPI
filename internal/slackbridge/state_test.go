@@ -21,6 +21,18 @@ func newTestClock() *testClock {
 
 func replyID(i int) string { return fmt.Sprintf("m_%04x", i) }
 
+// recordReply records that msgID, from thread threadTS in channel, went to
+// sid.
+func (st *state) recordReply(msgID, channel, threadTS, sid string) {
+	st.record(replyRecord{ID: msgID, Channel: channel, ThreadTS: threadTS, Session: sid})
+}
+
+// replyTS is the recorded thread of msgID for sid.
+func replyTS(st *state, msgID, sid string) (string, bool) {
+	r, ok := st.replyTarget(msgID, sid)
+	return r.ThreadTS, ok
+}
+
 func TestReplyThreadOwnershipAndExpiry(t *testing.T) {
 	st, err := loadState(filepath.Join(t.TempDir(), "slack-state.json"))
 	if err != nil {
@@ -29,24 +41,24 @@ func TestReplyThreadOwnershipAndExpiry(t *testing.T) {
 	clock := newTestClock()
 	st.now = clock.now
 	st.recordReply("m_aa", "CAGENTS", "1.1", "sid-a")
-	if ts, ok := st.replyThread("m_aa", "sid-a"); !ok || ts != "1.1" {
+	if ts, ok := replyTS(st, "m_aa", "sid-a"); !ok || ts != "1.1" {
 		t.Fatalf("own reply = %q %v", ts, ok)
 	}
-	if ts, ok := st.replyThread("m_aa", "sid-b"); ok || ts != "" {
+	if ts, ok := replyTS(st, "m_aa", "sid-b"); ok || ts != "" {
 		t.Fatalf("another session's reply = %q %v", ts, ok)
 	}
 	if owner, ok := st.replyOwner("m_aa"); !ok || owner != "sid-a" {
 		t.Fatalf("owner = %q %v", owner, ok)
 	}
-	if _, ok := st.replyThread("m_bb", "sid-a"); ok {
+	if _, ok := replyTS(st, "m_bb", "sid-a"); ok {
 		t.Fatal("unknown id resolved")
 	}
 	clock.advance(replyTTL - time.Minute)
-	if _, ok := st.replyThread("m_aa", "sid-a"); !ok {
+	if _, ok := replyTS(st, "m_aa", "sid-a"); !ok {
 		t.Fatal("expired before the TTL")
 	}
 	clock.advance(2 * time.Minute)
-	if _, ok := st.replyThread("m_aa", "sid-a"); ok {
+	if _, ok := replyTS(st, "m_aa", "sid-a"); ok {
 		t.Fatal("resolved after the TTL")
 	}
 	if _, ok := st.replyOwner("m_aa"); ok {
@@ -76,12 +88,12 @@ func TestReplyMapBoundedAndPersisted(t *testing.T) {
 			t.Fatalf("%s: %d entries, want %d", label, n, maxReplies)
 		}
 		for i := 0; i < 5; i++ {
-			if _, ok := s.replyThread(replyID(i), "sid-a"); ok {
+			if _, ok := replyTS(s, replyID(i), "sid-a"); ok {
 				t.Fatalf("%s: %s survived the cap", label, replyID(i))
 			}
 		}
 		for _, i := range []int{5, maxReplies + 4} {
-			if ts, ok := s.replyThread(replyID(i), "sid-a"); !ok || ts != fmt.Sprintf("2.%d", i) {
+			if ts, ok := replyTS(s, replyID(i), "sid-a"); !ok || ts != fmt.Sprintf("2.%d", i) {
 				t.Fatalf("%s: %s = %q %v", label, replyID(i), ts, ok)
 			}
 		}
@@ -106,7 +118,7 @@ func TestReplyMapBoundedAndPersisted(t *testing.T) {
 		t.Fatal(err)
 	}
 	expired.now = clock.now
-	if _, ok := expired.replyThread(replyID(maxReplies+4), "sid-a"); ok {
+	if _, ok := replyTS(expired, replyID(maxReplies+4), "sid-a"); ok {
 		t.Fatal("an expired entry resolved after reload")
 	}
 }

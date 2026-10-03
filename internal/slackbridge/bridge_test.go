@@ -198,8 +198,8 @@ func TestConcurrentOpenersPostOneHeader(t *testing.T) {
 	}
 	results := make(chan result, 2)
 	open := func() {
-		ts, opened, err := b.threadFor(context.Background(), o, "")
-		results <- result{ts, opened, err}
+		target, opened, err := b.threadFor(context.Background(), o, "")
+		results <- result{target.threadTS, opened, err}
 	}
 	timeout := time.After(5 * time.Second)
 	go open()
