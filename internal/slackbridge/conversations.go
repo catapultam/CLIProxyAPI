@@ -526,7 +526,8 @@ func (b *Bridge) deliverGuest(ev messageEvent, sid, text, name string) {
 	switch {
 	case err == nil:
 		r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: nsid, TS: ev.TS, Receipt: reactionQueued, Link: true, TopLevel: b.topLevelOutside(ev)}
-		b.react(ev, b.state.record(r))
+		b.state.record(r)
+		b.syncReceipt(msgID)
 	case errors.Is(err, agentbus.ErrUnknownTarget):
 		b.reply(ev, sessionEnded)
 	case errors.Is(err, agentbus.ErrBodyTooLarge):

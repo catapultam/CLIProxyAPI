@@ -465,7 +465,8 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		b.replyCommand(ev, "Not delivered: "+escape(errCapable.Error()))
 		return
 	}
-	b.react(ev, b.recordDelivery(ev, msgID, sid, adopt, reactionCommand))
+	b.recordDelivery(ev, msgID, sid, adopt, reactionCommand)
+	b.syncReceipt(msgID)
 	log.Infof("slack: %s sent !%s (%s) to %s", user.ID, cmd.Name, cmd.Kind, b.bus.Address(sid))
 }
 
@@ -508,7 +509,8 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 	sid, msgID, err := b.bus.DeliverVia(target, body, user.Label, b.viaOf(ev))
 	switch {
 	case err == nil:
-		b.react(ev, b.recordDelivery(ev, msgID, sid, adopt, reactionQueued))
+		b.recordDelivery(ev, msgID, sid, adopt, reactionQueued)
+		b.syncReceipt(msgID)
 		return sid, true
 	case errors.Is(err, agentbus.ErrUnknownTarget):
 		b.reply(ev, notFound)
@@ -764,10 +766,4 @@ func (b *Bridge) replyCommand(ev messageEvent, text string) {
 func (b *Bridge) replyNow(ctx context.Context, ev messageEvent, text string) error {
 	_, err := b.api.postMessage(ctx, b.cfg.BotToken, ev.Channel, text, replyThread(ev))
 	return err
-}
-
-func (b *Bridge) react(ev messageEvent, name string) {
-	b.enqueue(func(ctx context.Context) error {
-		return b.api.addReaction(ctx, b.cfg.BotToken, ev.Channel, ev.TS, name)
-	})
 }

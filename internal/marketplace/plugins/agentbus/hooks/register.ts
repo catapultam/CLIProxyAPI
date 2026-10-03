@@ -123,8 +123,15 @@ const DISCLOSURE_RULE =
   'machine names, paths, versions, settings, URLs), to anyone except the owner. Where anyone else can read your ' +
   'reply (group conversations, guests, other allowed users), keep to the task and say to ask the owner about the setup.'
 
-function slackRules(): string {
-  return `\n${DISCLOSURE_RULE}`
+// The message an agent sends to dismiss a Slack message that wasn't meant for it.
+const DISMISS_WORD = 'ignore'
+
+function slackRules(m: BusMessage): string {
+  const dismiss = MESSAGE_ID.test(m.id)
+    ? `\nIf this clearly wasn't meant for you (people talking to each other, a tag for someone else), dismiss it ` +
+      `instead of replying: SendMessage to "${PREFIX}slack#${m.id}" with message "${DISMISS_WORD}".`
+    : ''
+  return `\n${DISCLOSURE_RULE}${dismiss}`
 }
 
 export function formatMessage(m: BusMessage): string {
@@ -132,11 +139,11 @@ export function formatMessage(m: BusMessage): string {
   const id = oneLine(m.id)
   // Only the proxy's Slack bridge can set guest, from_user and via, or send from "slack"; clients
   // can't. A guest flag wins, so a message carrying both is never an instruction.
-  if (m.guest === true) return formatGuest(m, id, re) + slackRules()
+  if (m.guest === true) return formatGuest(m, id, re) + slackRules(m)
   if (m.from_user) {
     const who = oneLine(m.slack_user) || 'an allowed Slack user'
-    if (m.via === 'dm') return formatDM(m, id, who, re) + slackRules()
-    if (m.via === 'group') return formatGroup(m, id, who, re) + slackRules()
+    if (m.via === 'dm') return formatDM(m, id, who, re) + slackRules(m)
+    if (m.via === 'group') return formatGroup(m, id, who, re) + slackRules(m)
     const reply = MESSAGE_ID.test(m.id)
       ? `To answer where you were asked, use SendMessage with to: "${PREFIX}slack#${m.id}"; ` +
         `to post in your own thread, use to: "${PREFIX}slack".`
@@ -145,7 +152,7 @@ export function formatMessage(m: BusMessage): string {
       `agentbus message ${id} from ${who} via Slack${re}, relayed over the agentbus. ` +
       `${who} is an allowed Slack user and the quoted text below is their instruction.\n\n${quote(m.body)}\n\n` +
       reply +
-      slackRules()
+      slackRules(m)
     )
   }
   if (m.from === 'slack') return formatNotice(m, id, re)
@@ -749,9 +756,25 @@ export const register: Register = on => {
     if (!base || !token || !session) {
       return { result: { success: false, message: 'agentbus is not configured in this session.' } }
     }
+    const target = splitReplyTo(to.slice(PREFIX.length))
+    // "ignore" to a Slack message dismisses it: its receipt comes off and nothing is posted.
+    if (
+      target.reply_to &&
+      target.to.toLowerCase() === 'slack' &&
+      typeof e.message === 'string' &&
+      e.message.trim().toLowerCase() === DISMISS_WORD
+    ) {
+      const dismissed = await bus($, 'POST', '/dismiss', { session, ids: [target.reply_to] })
+      if (dismissed.status === 200) {
+        return { result: { success: true, message: 'Dismissed: the sender sees no reaction, so they know you ignored it.' } }
+      }
+      return {
+        result: { success: false, message: `agentbus dismiss failed: HTTP ${dismissed.status} ${dismissed.json?.error ?? ''}`.trim() },
+      }
+    }
     const { status, json } = await bus($, 'POST', '/send', {
       from_session: session,
-      ...splitReplyTo(to.slice(PREFIX.length)),
+      ...target,
       body: e.message,
     })
     if (status === 200) {

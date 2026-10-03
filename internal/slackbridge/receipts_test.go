@@ -96,7 +96,9 @@ func TestReceiptsReplaceTheCommandGear(t *testing.T) {
 	b.Received([]string{msgs[0].ID})
 	b.Read([]string{msgs[0].ID})
 	drainJobs(t, b)
-	want := []string{"+gear", "+envelope_with_arrow", "-gear", "+eyes", "-envelope_with_arrow"}
+	// Both receipts landed before the queue ran: the jobs apply only the
+	// latest state, so the gear goes straight to eyes.
+	want := []string{"+gear", "+eyes", "-gear"}
 	if got := reactionCalls(f, "CAGENTS", "20.4"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("reactions = %v", got)
 	}
@@ -193,7 +195,7 @@ func TestReceiptBeforeRecordIsKept(t *testing.T) {
 	if got := st.record(replyRecord{ID: "m_ea", Channel: "C", TS: "1.2", Session: "s", Receipt: reactionQueued}); got != reactionReceived {
 		t.Fatalf("record = %q", got)
 	}
-	if changes := st.advanceReceipts([]string{"m_ea"}, reactionRead); !reflect.DeepEqual(changes, []receiptChange{{channel: "C", ts: "1.2", add: reactionRead, remove: reactionReceived}}) {
+	if changes := st.advanceReceipts([]string{"m_ea"}, reactionRead); !reflect.DeepEqual(changes, []string{"m_ea"}) {
 		t.Fatalf("changes = %+v", changes)
 	}
 	// An early receipt is used once.

@@ -264,6 +264,7 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 				owner = "the owner (" + inline(strings.Join(slack.owners, ", ")) + ")"
 			}
 			fmt.Fprintf(&b, disclosureRule, owner)
+			fmt.Fprintf(&b, "If a Slack message clearly wasn't meant for you (people talking to each other in a linked chat, a tag for someone else), dismiss it instead of replying: SendMessage to \"agentbus:slack#<id>\" with message `ignore` (curl: POST /v1/agentbus/dismiss {\"session\":\"%s\",\"ids\":[\"<id>\"]}).\n", sid)
 			if slack.bot != "" {
 				fmt.Fprintf(&b, "In Slack the bridge's bot is @%s: people write to it, or start a message with \"@%s\", to reach agents.\n", inline(slack.bot), inline(slack.bot))
 			}

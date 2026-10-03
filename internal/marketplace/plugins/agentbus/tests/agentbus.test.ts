@@ -125,6 +125,42 @@ test('SendMessage splits an agentbus:<target>#<id> suffix into reply_to', async 
   expect(send?.body).toEqual({ from_session: DEFAULT_SESSION_ID, to: 'slack', body: 'done', reply_to: 'm_0123abcd' })
 })
 
+// Item 9: "ignore" to a Slack message dismisses it instead of posting.
+test('SendMessage of "ignore" to agentbus:slack#<id> dismisses it and posts nothing', async ($, on) => {
+  const calls = wire($, on, [], undefined, PEERS, { routes: { '/dismiss': { status: 200, text: '{"dismissed":1}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: '  Ignore \n' })
+  expect(out.result).toEqual({ success: true, message: 'Dismissed: the sender sees no reaction, so they know you ignored it.' })
+  expect(calls.some(c => c.url.endsWith('/send'))).toBe(false)
+  const dismiss = calls.find(c => c.url.endsWith('/dismiss'))
+  expect(dismiss?.url).toBe('http://bus.test:8317/v1/agentbus/dismiss')
+  expect(dismiss?.body).toEqual({ session: DEFAULT_SESSION_ID, ids: ['m_0123abcd'] })
+
+  // Anything else, or "ignore" to a peer, is sent as usual.
+  await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'ignore that, done' })
+  await $.tool.call({ tool: 'SendMessage', to: 'agentbus:shoggoth/art-0f7de4', message: 'ignore' })
+  expect(calls.filter(c => c.url.endsWith('/send')).length).toBe(2)
+  expect(calls.filter(c => c.url.endsWith('/dismiss')).length).toBe(1)
+})
+
+test('a subagent cannot dismiss either', async ($, on) => {
+  const calls = wire($, on, [])
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'ignore', agentId: 'sub-1' })
+  expect((out.result as { success: boolean }).success).toBe(false)
+  expect(calls.some(c => c.url.endsWith('/dismiss'))).toBe(false)
+})
+
+test('Slack framings say how to dismiss a message with its real id', async ($, on) => {
+  const prompts = await promptsFor($, on, [
+    { id: 'm_e1', from: 'slack', body: 'a', from_user: true, slack_user: 'jane', via: 'group' },
+    { id: 'm_e2', from: 'slack', body: 'b', guest: true, slack_user: 'bob', via: 'group' },
+  ])
+  expect(at(prompts, 0)).toContain('dismiss it instead of replying: SendMessage to "agentbus:slack#m_e1" with message "ignore".')
+  expect(at(prompts, 1)).toContain('dismiss it instead of replying: SendMessage to "agentbus:slack#m_e2" with message "ignore".')
+})
+
 test('SendMessage drops a malformed #id and sends without reply_to', async ($, on) => {
   const calls = wire($, on, [])
   await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })

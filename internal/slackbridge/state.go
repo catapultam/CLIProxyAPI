@@ -52,6 +52,9 @@ type replyRecord struct {
 	// Receipt is the receipt reaction on TS now: the queued one it was
 	// delivered with, then reactionReceived, then reactionRead.
 	Receipt string `json:"receipt,omitempty"`
+	// Shown is the receipt reaction the bridge last put on TS and hasn't
+	// taken off (syncReceipt); Receipt is where it is headed.
+	Shown string `json:"shown,omitempty"`
 	// Link marks a message that reached Session only because Channel was
 	// linked to it (a guest's message, or the link notice). An answer goes
 	// there only while Channel is still linked to Session.
@@ -248,6 +251,10 @@ func loadState(path string) (*state, error) {
 	// A record of a top-level DM has no thread, but always a channel.
 	for _, r := range file.Replies {
 		if r.ID != "" && r.Session != "" && (r.ThreadTS != "" || r.Channel != "") {
+			if r.Shown == "" && r.Receipt != receiptDismissed {
+				// Saved before Shown: the receipt was applied.
+				r.Shown = r.Receipt
+			}
 			st.replies = append(st.replies, r)
 		}
 	}
@@ -557,46 +564,6 @@ func (st *state) replyIndexLocked(msgID string) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-// receiptChange is a receipt reaction to add to message ts in channel, and
-// the one it replaces (empty for none).
-type receiptChange struct {
-	channel, ts, add, remove string
-}
-
-// advanceReceipts moves each recorded message in ids to receipt reaction
-// when that is further along than its current one, and returns the
-// reactions to change. A receipt never moves back. An id with no record yet
-// is kept in early for record; an expired one, or one recorded before
-// receipts (no TS), is ignored.
-func (st *state) advanceReceipts(ids []string, reaction string) []receiptChange {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	rank := receiptRank(reaction)
-	var out []receiptChange
-	for _, id := range ids {
-		if id == "" {
-			continue
-		}
-		i, ok := st.replyIndexLocked(id)
-		if !ok {
-			if !st.knownLocked(id) {
-				st.noteEarlyLocked(id, reaction)
-			}
-			continue
-		}
-		r := &st.replies[i]
-		if r.TS == "" || rank <= receiptRank(r.Receipt) {
-			continue
-		}
-		out = append(out, receiptChange{channel: r.Channel, ts: r.TS, add: reaction, remove: r.Receipt})
-		r.Receipt = reaction
-	}
-	if len(out) > 0 {
-		st.dirty = true
-	}
-	return out
 }
 
 // knownLocked reports whether msgID has a record, expired or not. The caller

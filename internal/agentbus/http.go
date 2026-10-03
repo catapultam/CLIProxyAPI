@@ -27,6 +27,7 @@ func (s *Store) Register(group *gin.RouterGroup) {
 	group.GET("/wait", s.handleWait)
 	group.POST("/ack", s.handleAck)
 	group.POST("/bye", s.handleBye)
+	group.POST("/dismiss", s.handleDismiss)
 	group.POST("/slack/upload", s.handleSlackUpload)
 }
 
@@ -220,4 +221,21 @@ func (s *Store) handleAck(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"acked": s.Ack(strings.TrimSpace(req.Session), req.IDs)})
+}
+
+// handleDismiss is an agent dismissing Slack messages that weren't meant for
+// it ({"session", "ids"}, like /ack): their receipts come off and stay off.
+// Only ids delivered to that session count (Store.Dismiss). It returns how
+// many did.
+func (s *Store) handleDismiss(c *gin.Context) {
+	var req ackRequest
+	if errBind := c.ShouldBindJSON(&req); errBind != nil || strings.TrimSpace(req.Session) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
+		return
+	}
+	if len(req.IDs) > maxAckIDs {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many ids"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"dismissed": s.Dismiss(strings.TrimSpace(req.Session), req.IDs)})
 }
