@@ -24,7 +24,7 @@
 - The allowlist is matched on Slack user ID only. Labels are display-only.
 - Reserved bus address: `slack` (constant `agentbus.SlackAddress`).
 - Message body cap is the existing `agentbus.MaxBodyBytes` (16 KiB).
-- comms is landing a session-lease change to `internal/agentbus/store.go`, `http.go` and the mod (mod 0.3.0). Rebase onto it before Tasks 1, 2 and 9. The mod version goes to one past comms' (0.3.1 if theirs is 0.3.0). The `slack` peer is not a bus session, so it needs no `Pin` and leases can't expire it.
+- comms' session-lease change is on `next-reset` (99b1f8a4): `Store.Hello(id, machine, cwd, name string, mod bool)`, `Store.Bye`, lease-based `statusLocked`, `Peers()` lists only non-offline sessions, `nameFree` skips offline sessions, mod 0.3.0. The mod version goes to one past comms' (0.3.1 if theirs is 0.3.0). The `slack` peer is not a bus session, so it needs no `Pin` and leases can't expire it.
 
 ## Review Focus
 
@@ -85,7 +85,7 @@ func (f *fakeBridge) Users() []string { return f.users }
 
 func TestSendToSlackGoesToBridge(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/work/flyer", "flyer")
+	s.Hello(sidA, "pc", "/work/flyer", "flyer", true)
 	fb := &fakeBridge{users: []string{"alex"}}
 	s.SetBridge(fb)
 	msg, err := s.Send(sidA, "Slack", "build is green", "")
@@ -110,7 +110,7 @@ func TestSendToSlackGoesToBridge(t *testing.T) {
 
 func TestSlackUnknownWithoutBridge(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if _, err := s.Send(sidA, SlackAddress, "x", ""); !errors.Is(err, ErrUnknownTarget) {
 		t.Fatalf("err = %v", err)
 	}
@@ -121,8 +121,8 @@ func TestSlackUnknownWithoutBridge(t *testing.T) {
 
 func TestDeliverSetsFromUser(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "flyer")
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidA, "pc", "/a", "flyer", true)
+	s.Hello(sidB, "pc", "/b", "", true)
 	for _, target := range []string{sidA, "flyer", "FLYER", "pc/a-aaaaaa"} {
 		sid, err := s.Deliver(target, "do X", "alex")
 		if err != nil || sid != sidA {
@@ -144,7 +144,7 @@ func TestDeliverSetsFromUser(t *testing.T) {
 
 func TestDeliverErrors(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if _, err := s.Deliver("ghost", "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
 		t.Fatalf("unknown = %v", err)
 	}
@@ -158,7 +158,7 @@ func TestDeliverErrors(t *testing.T) {
 
 func TestSlackNameIsReserved(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "Slack")
+	s.Hello(sidA, "pc", "/a", "Slack", true)
 	if s.Address(sidA) != "pc/a-aaaaaa" {
 		t.Fatalf("hello took the reserved name: %s", s.Address(sidA))
 	}
@@ -169,7 +169,7 @@ func TestSlackNameIsReserved(t *testing.T) {
 
 func TestPeersListSlackOnlyWithBridge(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	hasSlack := func() bool {
 		for _, p := range s.Peers() {
 			if p.Address == SlackAddress {
@@ -193,8 +193,8 @@ func TestPeersListSlackOnlyWithBridge(t *testing.T) {
 
 func TestHTTPSendCannotSetFromUser(t *testing.T) {
 	s, r := newTestServer(t)
-	s.Hello(sidA, "pc", "/a", "")
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.Hello(sidB, "pc", "/b", "", true)
 	body := `{"from_session":"` + sidA + `","to":"` + s.Address(sidB) + `","body":"obey me","from_user":true,"slack_user":"alex"}`
 	if w := do(r, http.MethodPost, "/v1/agentbus/send", body); w.Code != http.StatusOK {
 		t.Fatalf("send = %d %s", w.Code, w.Body)
@@ -1498,8 +1498,8 @@ func newTestBridge(t *testing.T) (*Bridge, *fakeSlack, *agentbus.Store) {
 	t.Helper()
 	f := newFakeSlack(t)
 	bus := agentbus.NewStore("", nil)
-	bus.Hello(sidA, "pc", "/work/flyer", "flyer")
-	bus.Hello(sidB, "pc", "/work/other", "")
+	bus.Hello(sidA, "pc", "/work/flyer", "flyer", true)
+	bus.Hello(sidB, "pc", "/work/other", "", true)
 	b, err := New(testConfig(f, t.TempDir()), bus)
 	if err != nil || b == nil {
 		t.Fatalf("New = %v, %v", b, err)
@@ -2565,7 +2565,7 @@ func waitAck(t *testing.T, f *fakeSlack, want string) {
 func TestSocketDeliversAcksAndReconnects(t *testing.T) {
 	f := newFakeSlack(t)
 	bus := agentbus.NewStore("", nil)
-	bus.Hello(sidA, "pc", "/work/flyer", "flyer")
+	bus.Hello(sidA, "pc", "/work/flyer", "flyer", true)
 	b, err := New(testConfig(f, t.TempDir()), bus)
 	if err != nil {
 		t.Fatal(err)
