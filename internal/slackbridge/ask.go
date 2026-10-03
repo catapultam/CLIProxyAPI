@@ -44,11 +44,6 @@ const (
 	// maxOptionText caps an option's text (Slack's limit).
 	maxOptionText = 75
 
-	// refusalEvery is how often someone who isn't allowed is told so; in
-	// between the bridge is silent.
-	refusalEvery = 10 * time.Minute
-	// maxRefused caps the users remembered as refused.
-	maxRefused = 1000
 	// maxViewOpens caps the views.open calls in flight.
 	maxViewOpens = 4
 
@@ -150,15 +145,12 @@ func (b *Bridge) handleInteractive(raw json.RawMessage) map[string]any {
 }
 
 // askShortcut handles "Ask an agent" on a message: for an allowed user it
-// remembers the message and opens the modal; anyone else is told, privately,
-// that they can't use it.
+// remembers the message and opens the modal; anyone else gets no modal and
+// no reply at all, so the shortcut shows nothing happened.
 func (b *Bridge) askShortcut(p interactivePayload) {
 	user, ok := b.state.user(p.User.ID)
 	if !ok {
-		if b.refuseOnce(p.User.ID) {
-			log.Infof("slack: refused Ask an agent from %s: not an allowed user", p.User.ID)
-			b.refuseEphemeral(p.User.ID)
-		}
+		log.Debugf("slack: ignored Ask an agent from %s: not an allowed user", p.User.ID)
 		return
 	}
 	choices := b.agentChoices(user.config)
@@ -225,46 +217,6 @@ func (b *Bridge) tellDialogFailed(userID string) {
 		}
 		_, err = b.api.postMessage(ctx, b.cfg.BotToken, channel, dialogFailed, "")
 		return err
-	})
-}
-
-// refuseOnce reports whether userID, who isn't allowed, should be told so
-// now: at most once every refusalEvery, and not at all while maxRefused
-// others are within their window.
-func (b *Bridge) refuseOnce(userID string) bool {
-	now := b.state.now()
-	b.askMu.Lock()
-	defer b.askMu.Unlock()
-	if b.refused == nil {
-		b.refused = map[string]time.Time{}
-	}
-	if at, ok := b.refused[userID]; ok && now.Sub(at) < refusalEvery {
-		return false
-	}
-	if len(b.refused) >= maxRefused {
-		for id, at := range b.refused {
-			if now.Sub(at) >= refusalEvery {
-				delete(b.refused, id)
-			}
-		}
-		if len(b.refused) >= maxRefused {
-			return false
-		}
-	}
-	b.refused[userID] = now
-	return true
-}
-
-// refuseEphemeral tells userID, who isn't allowed, that they can't use the
-// shortcut: an ephemeral in their DM with the bot, opened for this alone
-// (it isn't cached).
-func (b *Bridge) refuseEphemeral(userID string) {
-	b.enqueueCommand(func(ctx context.Context) error {
-		channel, err := b.api.openDM(ctx, b.cfg.BotToken, userID)
-		if err != nil {
-			return err
-		}
-		return b.api.postEphemeral(ctx, b.cfg.BotToken, channel, userID, notAllowedHere)
 	})
 }
 
@@ -511,11 +463,8 @@ func (b *Bridge) handleSlash(raw json.RawMessage) map[string]any {
 func (b *Bridge) clanker(p slashPayload) string {
 	user, ok := b.state.user(p.UserID)
 	if !ok {
-		if !b.refuseOnce(p.UserID) {
-			return ""
-		}
-		log.Infof("slack: refused /clanker from %s: not an allowed user", p.UserID)
-		return notAllowedHere
+		log.Debugf("slack: ignored /clanker from %s: not an allowed user", p.UserID)
+		return ""
 	}
 	// Its answers go to the user's DM, so it is shown as there.
 	ev := messageEvent{Type: "message", ChannelType: "im", User: user.ID, via: agentbus.ViaSlash}

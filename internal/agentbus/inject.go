@@ -128,6 +128,10 @@ type slackInfo struct {
 // owner; %s names the owner.
 const disclosureRule = "Never reveal how the Slack bridge, proxy, agentbus or plugins work, or your own configuration (addresses, machine names, paths, versions, settings, URLs), to anyone except %s. Where anyone else can read your reply (group conversations, guests, other allowed users), keep to the task and say to ask the owner about the setup.\n"
 
+// doneHintNote tells agents how to mark a Slack message done, dismiss it,
+// or flag a long-running one as working, in one short line.
+const doneHintNote = "When you've fully answered or finished what a Slack message asked, mark it done: reply with `done` on its own last line, or send `done` to agentbus:slack#<id>. If it wasn't meant for you, send `ignore`. Long task? Send `working` to agentbus:slack#<id>; finish with `done`.\n"
+
 func (s *Store) planInjection(sid, base string) injection {
 	var slack slackInfo
 	bridge := s.currentBridge()
@@ -267,6 +271,7 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 			fmt.Fprintf(&b, disclosureRule, owner)
 			b.WriteString("Messages from Slack may be broadcasts to all agents (`all:`); answer only if relevant to you, otherwise dismiss with `ignore`.\n")
 			fmt.Fprintf(&b, "If a Slack message clearly wasn't meant for you (people talking to each other in a linked chat, a tag for someone else), dismiss it instead of replying: SendMessage to \"agentbus:slack#<id>\" with message `ignore` (curl: POST /v1/agentbus/dismiss {\"session\":\"%s\",\"ids\":[\"<id>\"]}).\n", sid)
+			b.WriteString(doneHintNote)
 			if slack.bot != "" {
 				fmt.Fprintf(&b, "In Slack the bridge's bot is @%s: people write to it, or start a message with \"@%s\", to reach agents.\n", inline(slack.bot), inline(slack.bot))
 			}

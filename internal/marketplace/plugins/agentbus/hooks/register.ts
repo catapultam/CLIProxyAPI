@@ -4,7 +4,7 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.3.8'
+export const VERSION = '0.3.9'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
@@ -79,6 +79,28 @@ async function bus($: EngineInterface, method: string, path: string, body?: obje
   return { status: res.status, json }
 }
 
+// markWord posts {session, ids:[replyTo]} to path (/done or /working) for a bare control word to a
+// Slack message: nothing is posted either way. The proxy counts only ids delivered to this
+// session, under countKey in the response ("done" or "working").
+async function markWord(
+  $: EngineInterface,
+  path: string,
+  countKey: string,
+  replyTo: string,
+  okMessage: string,
+): Promise<{ result: { success: boolean; message: string } }> {
+  const res = await bus($, 'POST', path, { session, ids: [replyTo] })
+  if (res.status === 200) {
+    if (Number(res.json?.[countKey] ?? 0) < 1) {
+      return { result: { success: false, message: "Nothing to mark (that message wasn't delivered to you)" } }
+    }
+    return { result: { success: true, message: okMessage } }
+  }
+  return {
+    result: { success: false, message: `agentbus ${countKey} failed: HTTP ${res.status} ${res.json?.error ?? ''}`.trim() },
+  }
+}
+
 export function remotePeers(peers: Peer[], localMachine: string, self: string): Peer[] {
   return peers.filter(
     p =>
@@ -113,6 +135,19 @@ export function quote(body: string | undefined): string {
     .join('\n')
 }
 
+// Splits body at a trailing "done" line, trimmed and lowercased, when there is other non-empty
+// content above it, and returns body with that line (and any blank lines after it) removed.
+// Returns undefined when body has no such line, or is only that line (the bare case, handled
+// separately).
+export function stripTrailingDone(body: string): string | undefined {
+  const lines = body.split(LINE_BREAKS)
+  let last = lines.length - 1
+  while (last >= 0 && lines[last].trim() === '') last--
+  if (last < 0 || lines[last].trim().toLowerCase() !== DONE_WORD) return undefined
+  const rest = lines.slice(0, last).join('\n').replace(/\n+$/, '')
+  return rest.trim() ? rest : undefined
+}
+
 // SendMessage has no reply_to field, so "<target>#<message id>" carries one. Names and addresses
 // never contain "#". An id that isn't a message id is dropped, not an error.
 export function splitReplyTo(target: string): { to: string; reply_to?: string } {
@@ -131,13 +166,27 @@ const DISCLOSURE_RULE =
 
 // The message an agent sends to dismiss a Slack message that wasn't meant for it.
 const DISMISS_WORD = 'ignore'
+// The message an agent sends, or ends a reply with on its own last line, to mark a Slack message
+// done: it believes it fully answered it.
+const DONE_WORD = 'done'
+// The message an agent sends to flag a long task as still running on a Slack message.
+const WORKING_WORD = 'working'
 
 function slackRules(m: BusMessage): string {
-  const dismiss = MESSAGE_ID.test(m.id)
+  const validID = MESSAGE_ID.test(m.id)
+  const dismiss = validID
     ? `\nIf this clearly wasn't meant for you (people talking to each other, a tag for someone else), dismiss it ` +
       `instead of replying: SendMessage to "${PREFIX}slack#${m.id}" with message "${DISMISS_WORD}".`
     : ''
-  return `\n${DISCLOSURE_RULE}${dismiss}`
+  // One short line telling agents how to mark it done, or flag a long task as working, merged
+  // with the dismiss hint above; needs a real id, like dismiss does.
+  const done = validID
+    ? `\nWhen you've fully answered or finished what a Slack message asked, mark it done: reply with ` +
+      `"${DONE_WORD}" on its own last line, or send "${DONE_WORD}" to "${PREFIX}slack#${m.id}". If it wasn't ` +
+      `meant for you, send "${DISMISS_WORD}". Long task? Send "${WORKING_WORD}" to "${PREFIX}slack#${m.id}"; ` +
+      `finish with "${DONE_WORD}".`
+    : ''
+  return `\n${DISCLOSURE_RULE}${dismiss}${done}`
 }
 
 export function formatMessage(m: BusMessage): string {
@@ -610,6 +659,48 @@ async function ack($: EngineInterface, sid: string, ids: string[]) {
   }
 }
 
+// How long a turn can run on a delivered message before the mod flags it as still working.
+const WORKING_AFTER_MS = 15000
+
+// The pending "still working" timer for the main loop's current turn, if any; at most one is ever
+// outstanding (see scheduleWorking).
+let workingTimer: { cancel: () => void } | undefined
+
+// working tells the proxy a turn handling these messages, delivered to session sid, is still
+// running 15s after it started. Best effort.
+async function working($: EngineInterface, sid: string, ids: string[]) {
+  if (!base || !token || !sid || ids.length === 0) return
+  try {
+    await bus($, 'POST', '/working', { session: sid, ids })
+  } catch {
+    // The proxy is unreachable; the receipt stays at its last state.
+  }
+}
+
+// Cancels any pending "still working" timer. A turn ending, however it ends, clears it so a quick
+// answer never shows ⏳; a turn starting replaces it with a fresh one (scheduleWorking).
+function cancelWorking() {
+  workingTimer?.cancel()
+  workingTimer = undefined
+}
+
+// Starts a fresh "still working" timer, 15s out, for every message the main loop's current turn
+// carries (whatever turnStarted just marked started); nothing if it carries none. A turn that ends
+// first cancels it (cancelWorking), so only a turn still running at the deadline posts /working.
+function scheduleWorking($: EngineInterface) {
+  cancelWorking()
+  const bySession = new Map<string, string[]>()
+  for (const [workId, pending] of pendingReads) {
+    if (!pending.started) continue
+    bySession.set(pending.session, [...(bySession.get(pending.session) ?? []), workId])
+  }
+  if (bySession.size === 0) return
+  workingTimer = $.clock.after(WORKING_AFTER_MS, () => {
+    workingTimer = undefined
+    for (const [sid, ids] of bySession) void working($, sid, ids)
+  })
+}
+
 // Submits a waited message as a prompt; a Slack user's or guest's message is tracked for its read
 // receipt.
 async function submitMessage($: EngineInterface, m: BusMessage) {
@@ -773,12 +864,14 @@ export const register: Register = on => {
   // Only the main loop raises turn.start (a subagent's run doesn't).
   on('turn.start', async ($, e, next) => {
     turnStarted(e.text)
+    scheduleWorking($)
     return next(e)
   })
 
   // Only the main loop's turns count, and one that died on an API error leaves its messages for the
-  // next turn to complete.
+  // next turn to complete (and schedules a fresh working timer once it's retried, in turn.start).
   on('turn.complete', async ($, e, next) => {
+    cancelWorking()
     if (!e.agentId && e.reason !== 'error') void turnCompleted($)
     return next(e)
   })
@@ -792,14 +885,10 @@ export const register: Register = on => {
       return { result: { success: false, message: 'agentbus is not configured in this session.' } }
     }
     const target = splitReplyTo(to.slice(PREFIX.length))
+    const toSlackReplyTo = Boolean(target.reply_to) && target.to.toLowerCase() === 'slack'
     // "ignore" to a Slack message dismisses it: its receipt comes off and nothing is posted.
-    if (
-      target.reply_to &&
-      target.to.toLowerCase() === 'slack' &&
-      typeof e.message === 'string' &&
-      e.message.trim().toLowerCase() === DISMISS_WORD
-    ) {
-      const dismissed = await bus($, 'POST', '/dismiss', { session, ids: [target.reply_to] })
+    if (toSlackReplyTo && typeof e.message === 'string' && e.message.trim().toLowerCase() === DISMISS_WORD) {
+      const dismissed = await bus($, 'POST', '/dismiss', { session, ids: [target.reply_to as string] })
       if (dismissed.status === 200) {
         // The proxy counts only messages delivered to this session.
         if (Number(dismissed.json?.dismissed ?? 0) < 1) {
@@ -811,12 +900,39 @@ export const register: Register = on => {
         result: { success: false, message: `agentbus dismiss failed: HTTP ${dismissed.status} ${dismissed.json?.error ?? ''}`.trim() },
       }
     }
+    // "done" to a Slack message marks it done: its receipt becomes ✅ and nothing is posted.
+    if (toSlackReplyTo && typeof e.message === 'string' && e.message.trim().toLowerCase() === DONE_WORD) {
+      return markWord($, '/done', 'done', target.reply_to as string, 'Marked done ✅')
+    }
+    // "working" to a Slack message flags it as still running: its receipt becomes ⏳ and nothing
+    // is posted.
+    if (toSlackReplyTo && typeof e.message === 'string' && e.message.trim().toLowerCase() === WORKING_WORD) {
+      return markWord($, '/working', 'working', target.reply_to as string, 'Marked working ⏳')
+    }
+    // A reply whose last non-empty line is a bare "done", with other content above it, posts the
+    // rest without that line, then marks the message done once the post succeeds.
+    let body = e.message
+    let markDoneAfterSend = false
+    if (toSlackReplyTo && typeof e.message === 'string') {
+      const stripped = stripTrailingDone(e.message)
+      if (stripped !== undefined) {
+        body = stripped
+        markDoneAfterSend = true
+      }
+    }
     const { status, json } = await bus($, 'POST', '/send', {
       from_session: session,
       ...target,
-      body: e.message,
+      body,
     })
     if (status === 200) {
+      if (markDoneAfterSend) {
+        try {
+          await bus($, 'POST', '/done', { session, ids: [target.reply_to as string] })
+        } catch {
+          // Best effort: the post already succeeded; the receipt stays wherever it was.
+        }
+      }
       return {
         result: {
           success: true,

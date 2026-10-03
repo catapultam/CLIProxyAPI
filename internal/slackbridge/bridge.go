@@ -147,9 +147,6 @@ type Bridge struct {
 	// across a Slack or Store call.
 	askMu sync.Mutex
 	asks  map[askKey]askEntry
-	// refused maps a user who isn't allowed to when they were last told so
-	// (see refuseOnce); askMu guards it too.
-	refused map[string]time.Time
 	// viewSlots bounds the views.open calls in flight; viewsWG tracks them,
 	// and Stop waits for them.
 	viewSlots chan struct{}

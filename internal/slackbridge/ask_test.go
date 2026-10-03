@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
 	"github.com/tidwall/gjson"
@@ -181,6 +180,8 @@ func TestAskShortcutWhereLabels(t *testing.T) {
 	}
 }
 
+// Task 9: a non-allowed user's shortcut gets no modal and no reply at all:
+// no ephemeral, no DM, nothing posted. Only a Debug log notes it.
 func TestAskShortcutRefusesNonAllowed(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	if ack := b.handleInteractive(json.RawMessage(shortcutPayload("UBOB", "hi"))); ack != nil {
@@ -190,9 +191,8 @@ func TestAskShortcutRefusesNonAllowed(t *testing.T) {
 	if n := len(f.callsTo("views.open")); n != 0 {
 		t.Fatalf("views.open = %d", n)
 	}
-	eph := f.callsTo("chat.postEphemeral")
-	if len(eph) != 1 || eph[0].Form.Get("channel") != "DUBOB" || eph[0].Form.Get("user") != "UBOB" || eph[0].Form.Get("text") != notAllowedHere {
-		t.Fatalf("ephemeral = %+v", eph)
+	if n := len(f.callsTo("chat.postEphemeral")); n != 0 {
+		t.Fatalf("ephemerals = %d", n)
 	}
 	if n := len(f.callsTo("chat.postMessage")); n != 0 {
 		t.Fatalf("posts = %d", n)
@@ -291,7 +291,7 @@ func TestClankerHelpAndRefusal(t *testing.T) {
 			t.Fatalf("help for alex (%q) = %q", text, got)
 		}
 	}
-	if got := slash(t, b, "UBOB", "flyer: hi"); got != notAllowedHere {
+	if got := slash(t, b, "UBOB", "flyer: hi"); got != "" {
 		t.Fatalf("stranger = %q", got)
 	}
 	if got := slash(t, b, "UJANE", "nobody: hi"); !strings.HasPrefix(got, "No agent called `nobody`.") || strings.Contains(got, "pc/") {
@@ -360,29 +360,16 @@ func TestSlashEnvelopeAckCarriesTheAnswer(t *testing.T) {
 	}
 }
 
-// Someone not allowed is told at most once every refusalEvery, whichever of
-// the shortcut and /clanker they use; then the bridge is silent.
-func TestRefusalsAreRateLimited(t *testing.T) {
+// Task 9: a non-allowed /clanker is silent too: an empty ack (Slack shows
+// nothing) and nothing posted.
+func TestClankerRefusesNonAllowedSilently(t *testing.T) {
 	b, f, _ := newTestBridge(t)
-	clock := newTestClock()
-	b.state.now = clock.now
-	b.handleInteractive(json.RawMessage(shortcutPayload("UBOB", "hi")))
-	drainJobs(t, b)
 	if got := slash(t, b, "UBOB", "flyer: hi"); got != "" {
-		t.Fatalf("second refusal = %q", got)
+		t.Fatalf("ack = %q", got)
 	}
-	b.handleInteractive(json.RawMessage(shortcutPayload("UBOB", "hi")))
 	drainJobs(t, b)
-	if n := len(f.callsTo("chat.postEphemeral")); n != 1 {
-		t.Fatalf("ephemerals = %d", n)
-	}
-	clock.advance(refusalEvery + time.Second)
-	if got := slash(t, b, "UBOB", "flyer: hi"); got != notAllowedHere {
-		t.Fatalf("refusal after the window = %q", got)
-	}
-	// Another stranger has their own window.
-	if got := slash(t, b, "UCAROL", "flyer: hi"); got != notAllowedHere {
-		t.Fatalf("other stranger = %q", got)
+	if n := len(f.callsTo("chat.postEphemeral")) + len(f.callsTo("chat.postMessage")) + len(f.callsTo("views.open")); n != 0 {
+		t.Fatalf("Slack calls = %d", n)
 	}
 }
 

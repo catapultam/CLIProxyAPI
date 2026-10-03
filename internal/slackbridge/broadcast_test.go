@@ -208,6 +208,62 @@ func TestBroadcastAggregateReceipts(t *testing.T) {
 	}
 }
 
+// Task 9 addendum: the aggregate shows ⏳ while any recipient is working and
+// none is done yet, and ✅ once every recipient has marked it done or
+// dismissed it, with at least one done.
+func TestBroadcastAggregateWithWorkingAndDone(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	const ts = "1700011500.000003"
+	b.handleEvent("EvBr3", msg("UALEX", "all: status", ts, ""))
+	idA := claimBroadcast(t, bus, sidA, "status", "").ID
+	idB := claimBroadcast(t, bus, sidB, "status", "").ID
+	step := func(want string, change func()) {
+		t.Helper()
+		change()
+		drainJobs(t, b)
+		if got := f.reactionsOn("CAGENTS", ts); !reflect.DeepEqual(got, []string{want}) {
+			t.Fatalf("reactions = %v, want %s", got, want)
+		}
+	}
+	step(reactionQueued, func() {})
+	step(reactionWorking, func() { b.Working(sidA, []string{idA}) })
+	// One received, one still working: still ⏳.
+	step(reactionWorking, func() { b.Received([]string{idB}) })
+	// idA finishes and marks done, idB is still only received: 📨 (the
+	// existing rules apply once nobody is working any more).
+	step(reactionReceived, func() { bus.Done(sidA, []string{idA}) })
+	// idB marks done too: now every recipient is done.
+	step(reactionDone, func() { bus.Done(sidB, []string{idB}) })
+}
+
+// Task 9: when every recipient dismisses a broadcast and none marks it
+// done, the aggregate shows no reaction at all.
+func TestBroadcastAggregateAllDismissedShowsNoReaction(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	const ts = "1700011500.000004"
+	b.handleEvent("EvBr4", msg("UALEX", "all: noise", ts, ""))
+	idA := claimBroadcast(t, bus, sidA, "noise", "").ID
+	idB := claimBroadcast(t, bus, sidB, "noise", "").ID
+	drainJobs(t, b)
+	if n := bus.Dismiss(sidA, []string{idA}); n != 1 {
+		t.Fatalf("dismiss A = %d", n)
+	}
+	drainJobs(t, b)
+	// One recipient dismissed, the other hasn't yet: a dismissal alone
+	// counts as received, same as before this counted toward "done or
+	// dismissed" too.
+	if got := f.reactionsOn("CAGENTS", ts); !reflect.DeepEqual(got, []string{reactionReceived}) {
+		t.Fatalf("one dismissed: %v", got)
+	}
+	if n := bus.Dismiss(sidB, []string{idB}); n != 1 {
+		t.Fatalf("dismiss B = %d", n)
+	}
+	drainJobs(t, b)
+	if got := f.reactionsOn("CAGENTS", ts); len(got) != 0 {
+		t.Fatalf("all dismissed: %v", got)
+	}
+}
+
 func TestBroadcastCommand(t *testing.T) {
 	b, f, bus, dir := newCommandBridge(t)
 	writeCommand(t, dir, "screenshot.yaml", shellYAML, mtime0)

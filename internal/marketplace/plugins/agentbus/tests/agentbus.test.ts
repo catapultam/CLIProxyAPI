@@ -119,10 +119,10 @@ test('SendMessage splits an agentbus:<target>#<id> suffix into reply_to', async 
   const calls = wire($, on, [])
   await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
 
-  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'done' })
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'noted' })
   expect((out.result as { success: boolean }).success).toBe(true)
   const send = calls.find(c => c.url.endsWith('/send'))
-  expect(send?.body).toEqual({ from_session: DEFAULT_SESSION_ID, to: 'slack', body: 'done', reply_to: 'm_0123abcd' })
+  expect(send?.body).toEqual({ from_session: DEFAULT_SESSION_ID, to: 'slack', body: 'noted', reply_to: 'm_0123abcd' })
 })
 
 // Item 9: "ignore" to a Slack message dismisses it instead of posting.
@@ -166,6 +166,81 @@ test('Slack framings say how to dismiss a message with its real id', async ($, o
   ])
   expect(at(prompts, 0)).toContain('dismiss it instead of replying: SendMessage to "agentbus:slack#m_e1" with message "ignore".')
   expect(at(prompts, 1)).toContain('dismiss it instead of replying: SendMessage to "agentbus:slack#m_e2" with message "ignore".')
+})
+
+// Task 9: bare "done" to agentbus:slack#<id> marks it done and posts nothing.
+test('SendMessage of "done" to agentbus:slack#<id> marks it done and posts nothing', async ($, on) => {
+  const calls = wire($, on, [], undefined, PEERS, { routes: { '/done': { status: 200, text: '{"done":1}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: '  Done  ' })
+  expect(out.result).toEqual({ success: true, message: 'Marked done ✅' })
+  expect(calls.some(c => c.url.endsWith('/send'))).toBe(false)
+  const done = calls.find(c => c.url.endsWith('/done'))
+  expect(done?.url).toBe('http://bus.test:8317/v1/agentbus/done')
+  expect(done?.body).toEqual({ session: DEFAULT_SESSION_ID, ids: ['m_0123abcd'] })
+})
+
+test('"done" to a message that was not delivered to this session says there was nothing to mark', async ($, on) => {
+  wire($, on, [], undefined, PEERS, { routes: { '/done': { status: 200, text: '{"done":0}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'done' })
+  expect(out.result).toEqual({ success: false, message: "Nothing to mark (that message wasn't delivered to you)" })
+})
+
+// Task 9 addendum: bare "working" to agentbus:slack#<id> marks it working and posts nothing.
+test('SendMessage of "working" to agentbus:slack#<id> marks it working and posts nothing', async ($, on) => {
+  const calls = wire($, on, [], undefined, PEERS, { routes: { '/working': { status: 200, text: '{"working":1}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'Working' })
+  expect(out.result).toEqual({ success: true, message: 'Marked working ⏳' })
+  expect(calls.some(c => c.url.endsWith('/send'))).toBe(false)
+  const working = calls.find(c => c.url.endsWith('/working'))
+  expect(working?.body).toEqual({ session: DEFAULT_SESSION_ID, ids: ['m_0123abcd'] })
+})
+
+test('a subagent cannot mark done or working either', async ($, on) => {
+  const calls = wire($, on, [])
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  for (const message of ['done', 'working']) {
+    const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message, agentId: 'sub-1' })
+    expect((out.result as { success: boolean }).success).toBe(false)
+  }
+  expect(calls.some(c => c.url.endsWith('/done') || c.url.endsWith('/working'))).toBe(false)
+})
+
+// Task 9: a reply whose last non-empty line is a bare "done", with other content above it, posts
+// the rest without that line, then marks it done once the post succeeds.
+test('a reply ending in a bare "done" line posts the rest, then marks it done', async ($, on) => {
+  const calls = wire($, on, [], undefined, PEERS, { routes: { '/done': { status: 200, text: '{"done":1}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'Rebased and pushed.\n\ndone\n' })
+  expect((out.result as { success: boolean }).success).toBe(true)
+  const send = calls.find(c => c.url.endsWith('/send'))
+  expect(send?.body).toEqual({ from_session: DEFAULT_SESSION_ID, to: 'slack', body: 'Rebased and pushed.', reply_to: 'm_0123abcd' })
+  const done = calls.find(c => c.url.endsWith('/done'))
+  expect(done?.body).toEqual({ session: DEFAULT_SESSION_ID, ids: ['m_0123abcd'] })
+})
+
+// A body that is only the "done" line (ignoring blank lines) counts as the bare case: no post.
+test('a reply that is only blank lines and "done" marks done without posting', async ($, on) => {
+  const calls = wire($, on, [], undefined, PEERS, { routes: { '/done': { status: 200, text: '{"done":1}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: '\n\ndone\n' })
+  expect(out.result).toEqual({ success: true, message: 'Marked done ✅' })
+  expect(calls.some(c => c.url.endsWith('/send'))).toBe(false)
+})
+
+// Task 9 addendum: the done hint is merged with a short line about flagging a long task working.
+test('Slack framings say how to mark a message done, or flag it working, with its real id', async ($, on) => {
+  const prompts = await promptsFor($, on, [{ id: 'm_e9', from: 'slack', body: 'a', from_user: true, slack_user: 'jane', via: 'group' }])
+  expect(at(prompts, 0)).toContain(
+    'mark it done: reply with "done" on its own last line, or send "done" to "agentbus:slack#m_e9". ' +
+      'If it wasn\'t meant for you, send "ignore". Long task? Send "working" to "agentbus:slack#m_e9"; finish with "done".',
+  )
 })
 
 test('SendMessage drops a malformed #id and sends without reply_to', async ($, on) => {
@@ -286,7 +361,7 @@ test('session.end with clear says bye, then the next tick follows the session to
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
   // The old id goes along, so the bus hands the name, inbox and Slack routing to the new one.
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.8', previous: DEFAULT_SESSION_ID })
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.9', previous: DEFAULT_SESSION_ID })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
@@ -303,11 +378,11 @@ test('both hellos and every wait carry the mod version', async ($, on) => {
 
   const hellos = calls.filter(c => c.url.endsWith('/hello'))
   expect(hellos.length).toBe(2)
-  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.8' })
-  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.8' })
+  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.9' })
+  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.9' })
   const waits = calls.filter(c => c.url.includes('/wait?'))
   expect(waits.length).toBeGreaterThan(0)
-  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.8')
+  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.9')
 })
 
 test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {
@@ -978,6 +1053,13 @@ function acks(calls: Call[]) {
   return calls.filter(c => c.url.endsWith('/ack')).map(c => c.body as { session: string; ids: string[] })
 }
 
+function workings(calls: Call[]) {
+  return calls.filter(c => c.url.endsWith('/working')).map(c => c.body as { session: string; ids: string[] })
+}
+
+// How long a turn can run before the mod flags it as still working (register.ts WORKING_AFTER_MS).
+const WORKING_AFTER_MS = 15000
+
 const SLACK_MSG = { id: 'm_a1', from: 'slack', body: 'please rebase', from_user: true, slack_user: 'jane' }
 
 test('a Slack message is acknowledged when the main-loop turn that carried it completes', async ($, on) => {
@@ -1000,6 +1082,39 @@ test('a Slack message is acknowledged when the main-loop turn that carried it co
   await t.complete('t2')
   await clock.settle()
   expect(acks(calls).length).toBe(1)
+})
+
+// Task 9 addendum: a turn still running 15s after it started on a delivered message posts
+// /working for it; the existing /ack moves it on to read once the turn completes.
+test('a turn still running 15s after it started marks the message working, then read when it completes', async ($, on) => {
+  const t = turns($, on)
+  const { calls, prompts, clock } = await runMessages($, on, [SLACK_MSG], { routes: { '/working': { status: 200, text: '{"working":1}' } } })
+  await t.start(at(prompts, 0), 't1')
+  await clock.advance(WORKING_AFTER_MS)
+  await clock.settle()
+  expect(workings(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+  expect(acks(calls)).toEqual([])
+
+  await t.complete('t1')
+  await clock.settle()
+  expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+  // The timer was canceled on complete: it doesn't fire again later.
+  await clock.advance(WORKING_AFTER_MS)
+  await clock.settle()
+  expect(workings(calls).length).toBe(1)
+})
+
+// A turn that completes well before 15s never shows working at all.
+test('a turn under 15s never marks the message working', async ($, on) => {
+  const t = turns($, on)
+  const { calls, prompts, clock } = await runMessages($, on, [SLACK_MSG], { routes: { '/working': { status: 200, text: '{"working":1}' } } })
+  await t.start(at(prompts, 0), 't1')
+  await clock.advance(1000)
+  await t.complete('t1')
+  await clock.advance(WORKING_AFTER_MS)
+  await clock.settle()
+  expect(workings(calls)).toEqual([])
+  expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
 })
 
 test('a Slack message queued behind a running turn is acknowledged after its own turn', async ($, on) => {

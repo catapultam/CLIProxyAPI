@@ -28,6 +28,8 @@ func (s *Store) Register(group *gin.RouterGroup) {
 	group.POST("/ack", s.handleAck)
 	group.POST("/bye", s.handleBye)
 	group.POST("/dismiss", s.handleDismiss)
+	group.POST("/done", s.handleDone)
+	group.POST("/working", s.handleWorking)
 	group.POST("/slack/upload", s.handleSlackUpload)
 }
 
@@ -42,13 +44,74 @@ type sendRequest struct {
 	ReplyTo     string `json:"reply_to"`
 }
 
+// controlWords are the bodies handleSend treats specially when sent with a
+// reply_to to Slack, so a bare "ignore", "working" or "done" (and a trailing
+// "done" line) is never posted as text: it guards curl and plugins that
+// predate the mod's own handling of them (register.ts, the SendMessage
+// hook), for the same effect either way.
+const (
+	ignoreWord  = "ignore"
+	doneWord    = "done"
+	workingWord = "working"
+)
+
 func (s *Store) handleSend(c *gin.Context) {
 	var req sendRequest
 	if errBind := c.ShouldBindJSON(&req); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
 		return
 	}
-	msg, err := s.Send(strings.TrimSpace(req.FromSession), req.To, req.Body, req.ReplyTo)
+	from := strings.TrimSpace(req.FromSession)
+	if replyTo := cleanReplyTo(req.ReplyTo); replyTo != "" && isSlackAddress(req.To) {
+		switch strings.ToLower(strings.TrimSpace(req.Body)) {
+		case ignoreWord:
+			c.JSON(http.StatusOK, gin.H{"dismissed": s.Dismiss(from, []string{replyTo})})
+			return
+		case doneWord:
+			c.JSON(http.StatusOK, gin.H{"done": s.Done(from, []string{replyTo})})
+			return
+		case workingWord:
+			c.JSON(http.StatusOK, gin.H{"working": s.Working(from, []string{replyTo})})
+			return
+		}
+		if rest, ok := trailingDoneLine(req.Body); ok {
+			msg, err := s.Send(from, req.To, rest, req.ReplyTo)
+			if err == nil {
+				s.Done(from, []string{replyTo})
+			}
+			s.writeSendResult(c, msg, err)
+			return
+		}
+	}
+	msg, err := s.Send(from, req.To, req.Body, req.ReplyTo)
+	s.writeSendResult(c, msg, err)
+}
+
+// trailingDoneLine reports whether body's last non-empty line, trimmed and
+// lowercased, is exactly "done", with other non-empty content above it, and
+// returns body with that line (and any blank lines after it) removed. ok is
+// false when body is only that line, or has no such line.
+func trailingDoneLine(body string) (rest string, ok bool) {
+	lines := strings.Split(body, "\n")
+	last := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			last = i
+			break
+		}
+	}
+	if last < 0 || strings.ToLower(strings.TrimSpace(lines[last])) != doneWord {
+		return "", false
+	}
+	rest = strings.TrimRight(strings.Join(lines[:last], "\n"), "\n")
+	if strings.TrimSpace(rest) == "" {
+		return "", false
+	}
+	return rest, true
+}
+
+// writeSendResult writes handleSend's response for what Send returned.
+func (s *Store) writeSendResult(c *gin.Context, msg Message, err error) {
 	switch {
 	case err == nil:
 		c.JSON(http.StatusOK, gin.H{"id": msg.ID, "to": msg.To})
@@ -240,4 +303,38 @@ func (s *Store) handleDismiss(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"dismissed": s.Dismiss(strings.TrimSpace(req.Session), req.IDs)})
+}
+
+// handleDone is an agent marking Slack messages done, believing it fully
+// answered them ({"session", "ids"}, like /ack): the reaction becomes ✅,
+// for good, and never moves back to an earlier state. Only ids delivered to
+// that session count (Store.Done). It returns how many did.
+func (s *Store) handleDone(c *gin.Context) {
+	var req ackRequest
+	if errBind := c.ShouldBindJSON(&req); errBind != nil || strings.TrimSpace(req.Session) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
+		return
+	}
+	if len(req.IDs) > maxAckIDs {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many ids"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"done": s.Done(strings.TrimSpace(req.Session), req.IDs)})
+}
+
+// handleWorking is a turn still running on Slack messages 15s after it
+// started ({"session", "ids"}, like /ack): the reaction becomes ⏳ until the
+// turn completes and /ack moves it on. Only ids delivered to that session
+// count (Store.Working). It returns how many did.
+func (s *Store) handleWorking(c *gin.Context) {
+	var req ackRequest
+	if errBind := c.ShouldBindJSON(&req); errBind != nil || strings.TrimSpace(req.Session) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
+		return
+	}
+	if len(req.IDs) > maxAckIDs {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many ids"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"working": s.Working(strings.TrimSpace(req.Session), req.IDs)})
 }

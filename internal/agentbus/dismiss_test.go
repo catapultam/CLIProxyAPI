@@ -46,6 +46,21 @@ func TestInjectNoteExplainsDismiss(t *testing.T) {
 	}
 }
 
+// Task 9: the note also tells agents how to mark a message done, and how to
+// flag a long task as working, in one short line merged with the done hint.
+func TestInjectNoteExplainsDoneAndWorking(t *testing.T) {
+	s, r, seen := newInjectServer(t, &fakeClock{now: t0})
+	s.Touch(sidA)
+	s.SetBridge(&fakeBridge{users: []string{"alex"}})
+	got := injectedText(t, r, seen)
+	if !strings.Contains(got, "mark it done: reply with `done` on its own last line, or send `done` to agentbus:slack#<id>") {
+		t.Fatalf("note lacks the done hint:\n%s", got)
+	}
+	if !strings.Contains(got, "Long task? Send `working` to agentbus:slack#<id>; finish with `done`.") {
+		t.Fatalf("note lacks the working hint:\n%s", got)
+	}
+}
+
 // Item 9: POST /dismiss (the curl path) hands the session's ids to the
 // bridge, which counts only those delivered to it, and the ids no longer
 // count for /ack.
