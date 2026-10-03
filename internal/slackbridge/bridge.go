@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	jobQueueSize = 256
-	maxBackoff   = 5 * time.Minute
-	seenEvents   = 512
+	jobQueueSize     = 256
+	commandQueueSize = 64
+	maxBackoff       = 5 * time.Minute
+	seenEvents       = 512
 )
 
 // Config is what the bridge needs from config.yaml plus where to keep state.
@@ -39,12 +40,15 @@ type job func(ctx context.Context) error
 // Bridge links the agentbus to one Slack channel. It implements
 // agentbus.Bridge.
 type Bridge struct {
-	cfg        Config
-	bus        *agentbus.Store
-	api        *api
-	dialer     *websocket.Dialer
-	state      *state
-	jobs       chan job
+	cfg    Config
+	bus    *agentbus.Store
+	api    *api
+	dialer *websocket.Dialer
+	state  *state
+	jobs   chan job
+	// commands holds allow jobs and command replies. runJobs drains it
+	// first, and enqueue's drop-oldest never touches it.
+	commands   chan job
 	backoff    func(attempt int) time.Duration
 	retryDelay time.Duration
 
@@ -56,8 +60,15 @@ type Bridge struct {
 	seen     map[string]bool
 	seenRing []string
 
+	// cmdSeq counts allow/remove commands per target user, so a queued allow
+	// applies only if no later command for that user came in. cmdMu also
+	// makes checking the count and changing the allowlist one step.
+	cmdMu  sync.Mutex
+	cmdSeq map[string]uint64
+
 	cancel context.CancelFunc
 	done   chan struct{}
+	jobsWG sync.WaitGroup
 }
 
 // New builds a bridge, or returns nil, nil when cfg is incomplete (Slack off).
@@ -76,9 +87,11 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 		dialer:     websocket.DefaultDialer,
 		state:      st,
 		jobs:       make(chan job, jobQueueSize),
+		commands:   make(chan job, commandQueueSize),
 		backoff:    defaultBackoff,
 		retryDelay: 2 * time.Second,
 		seen:       map[string]bool{},
+		cmdSeq:     map[string]uint64{},
 	}, nil
 }
 
@@ -127,26 +140,54 @@ func (b *Bridge) enqueue(j job) {
 	}
 }
 
-// runJobs runs queued jobs one at a time, retrying a failed job once.
+// enqueueCommand adds a command job. It never drops a queued one: when even
+// the command queue is full, the new job is dropped (a remove has already
+// been applied by then; only its reply is lost).
+func (b *Bridge) enqueueCommand(j job) {
+	select {
+	case b.commands <- j:
+	default:
+		log.Warn("slack: command queue full, dropped a command job")
+	}
+}
+
+// runJobs runs queued jobs one at a time, command jobs first, retrying a
+// failed job once.
 func (b *Bridge) runJobs(ctx context.Context) {
 	for {
+		var j job
 		select {
 		case <-ctx.Done():
 			return
-		case j := <-b.jobs:
-			err := j(ctx)
-			if err == nil || ctx.Err() != nil {
-				continue
-			}
-			log.Warnf("slack: %v (retrying once)", err)
-			if !b.sleep(ctx, b.retryDelay) {
+		case j = <-b.commands:
+		default:
+			select {
+			case <-ctx.Done():
 				return
-			}
-			if errRetry := j(ctx); errRetry != nil && ctx.Err() == nil {
-				log.Warnf("slack: %v (dropped)", errRetry)
+			case j = <-b.commands:
+			case j = <-b.jobs:
 			}
 		}
+		if !b.runJob(ctx, j) {
+			return
+		}
 	}
+}
+
+// runJob runs j, retrying once on failure; it reports whether ctx is live.
+func (b *Bridge) runJob(ctx context.Context, j job) bool {
+	err := j(ctx)
+	if err == nil || ctx.Err() != nil {
+		return ctx.Err() == nil
+	}
+	log.Warnf("slack: %v (retrying once)", err)
+	if !b.sleep(ctx, b.retryDelay) {
+		return false
+	}
+	if errRetry := j(ctx); errRetry != nil && ctx.Err() == nil {
+		log.Warnf("slack: %v (dropped)", errRetry)
+	}
+	return ctx.Err() == nil
 }
 
 // sleep waits d or until ctx ends; it reports whether ctx is still live.
@@ -219,18 +260,25 @@ func (b *Bridge) Start() {
 		}
 		b.bus.SetBridge(b)
 		log.Infof("slack: bridge on, channel %s, allowed users %s", b.cfg.Channel, strings.Join(b.Users(), ", "))
-		go b.runJobs(ctx)
+		b.jobsWG.Add(1)
+		go func() {
+			defer b.jobsWG.Done()
+			b.runJobs(ctx)
+		}()
 		b.runSocket(ctx)
 	}()
 }
 
-// Stop detaches from the bus and closes the connection.
+// Stop closes the connection, waits for the bridge's goroutines, then
+// detaches from the bus. Detaching last means a resolve that finishes while
+// Stop runs can't re-attach the bridge afterwards.
 func (b *Bridge) Stop() {
 	if b.cancel == nil {
 		return
 	}
-	b.bus.SetBridge(nil)
 	b.cancel()
 	<-b.done
+	b.jobsWG.Wait()
+	b.bus.SetBridge(nil)
 	b.cancel = nil
 }

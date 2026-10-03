@@ -7,6 +7,14 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
 )
 
+func TestStopWithoutStartIsSafe(t *testing.T) {
+	f := newFakeSlack(t)
+	bus := agentbus.NewStore("", nil)
+	b, _ := New(testConfig(f, t.TempDir()), bus)
+	b.Stop()
+	b.Stop()
+}
+
 func waitAck(t *testing.T, f *fakeSlack, want string) {
 	t.Helper()
 	select {

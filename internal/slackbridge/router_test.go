@@ -219,8 +219,78 @@ func TestAllowThenRemoveAppliedInOrder(t *testing.T) {
 	if _, ok := b.state.user("UJANE"); ok {
 		t.Fatal("the owner's later remove lost to the earlier allow")
 	}
-	if got := lastPostText(f); !strings.Contains(got, "can no longer instruct agents") {
-		t.Fatalf("reply = %q", got)
+	var allowReply string
+	for _, p := range f.callsTo("chat.postMessage") {
+		if p.Form.Get("thread_ts") == "6.0" {
+			allowReply = p.Form.Get("text")
+		}
+	}
+	if !strings.Contains(allowReply, "superseded") || strings.Contains(allowReply, "can now instruct") {
+		t.Fatalf("allow reply = %q", allowReply)
+	}
+}
+
+func TestRemoveTakesEffectBeforeQueuedJobsRun(t *testing.T) {
+	b, _, bus := newTestBridge(t)
+	root := threadOf(t, b, bus)
+	b.handleEvent("EvR1", msg("UALEX", "<@UBOT> allow <@UJANE>", "6.5", ""))
+	drainJobs(t, b)
+	if _, ok := b.state.user("UJANE"); !ok {
+		t.Fatal("allow did not apply")
+	}
+	// Posts queued ahead of the remove must not delay it.
+	for i := 0; i < 10; i++ {
+		b.Post(agentbus.Outbound{SessionID: sidA, Body: "busy"})
+	}
+	b.handleEvent("EvR2", msg("UALEX", "<@UBOT> remove <@UJANE>", "6.6", ""))
+	if _, ok := b.state.user("UJANE"); ok {
+		t.Fatal("remove waited for the job queue")
+	}
+	b.handleEvent("EvR3", msg("UJANE", "still here?", "6.7", root))
+	if bus.Pending(sidA) {
+		t.Fatal("a removed user's message was delivered")
+	}
+}
+
+func TestFullPostQueueKeepsCommandJobs(t *testing.T) {
+	b, f, _ := newTestBridge(t)
+	b.handleEvent("EvQ1", msg("UALEX", "<@UBOT> allow <@UJANE>", "6.8", ""))
+	for i := 0; i < jobQueueSize+20; i++ {
+		b.Post(agentbus.Outbound{SessionID: sidA, Body: "flood"})
+	}
+	if len(b.commands) != 1 {
+		t.Fatalf("command jobs = %d, want the pending allow", len(b.commands))
+	}
+	drainJobs(t, b)
+	if _, ok := b.state.user("UJANE"); !ok {
+		t.Fatal("the queued allow was dropped by the flood")
+	}
+	if posts := f.callsTo("chat.postMessage"); !strings.Contains(posts[0].Form.Get("text"), "can now instruct agents") {
+		t.Fatalf("command reply did not run first: %q", posts[0].Form.Get("text"))
+	}
+}
+
+func TestFollowUpTopLevelThreadReachesTheAgent(t *testing.T) {
+	b, _, bus := newTestBridge(t)
+	b.handleEvent("EvF1", msg("UALEX", "flyer: first task", "7.10", ""))
+	b.handleEvent("EvF2", msg("UALEX", "flyer: second task", "7.20", ""))
+	if msgs := bus.Claim(sidA); len(msgs) != 2 {
+		t.Fatalf("msgs = %+v", msgs)
+	}
+	if ts, _ := b.state.thread(sidA); ts != "7.10" {
+		t.Fatalf("agent posts moved to %q, want the first thread", ts)
+	}
+	b.handleEvent("EvF3", msg("UALEX", "and also this", "7.21", "7.20"))
+	msgs := bus.Claim(sidA)
+	if len(msgs) != 1 || msgs[0].Body != "and also this" || !msgs[0].FromUser {
+		t.Fatalf("reply in the second thread = %+v", msgs)
+	}
+	reloaded, err := loadState(b.state.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sid, ok := reloaded.session("7.20"); !ok || sid != sidA {
+		t.Fatalf("second thread link not persisted: %q %v", sid, ok)
 	}
 }
 

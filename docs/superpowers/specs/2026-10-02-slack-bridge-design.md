@@ -148,8 +148,13 @@ New package `internal/slackbridge`:
 - **Web API client** — `chat.postMessage` and `reactions.add` with the bot
   token. Outgoing posts go through a bounded queue drained by one goroutine, so
   an agentbus `Send` never blocks on Slack. When the queue is full the oldest
-  post is dropped with a warning.
-- **State** — session id ↔ thread `ts` and the Slack-added allowed users
+  post is dropped with a warning. `remove` applies to the allowlist at once;
+  `allow` jobs and command replies go on a separate small queue that the
+  worker drains first and that drop-oldest never touches. A queued `allow`
+  applies only if no later `allow`/`remove` for the same user came in.
+- **State** — session id ↔ thread `ts` (a session posts in its first thread;
+  every top-level `name:` thread that reached it stays linked, so replies
+  there reach it too) and the Slack-added allowed users
   (ID + frozen label), persisted to `slack-state.json` next to
   `agentbus-state.json` (same save cadence and shutdown save), so threads and
   allowlist changes survive restarts.

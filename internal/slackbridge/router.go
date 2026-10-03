@@ -33,8 +33,9 @@ type messageEvent struct {
 // a plain message, a thread reply also sent to the channel, a message with a file.
 var relayedSubtypes = map[string]bool{"": true, "thread_broadcast": true, "file_share": true}
 
-// handleEvent routes one Slack message. It only touches memory and the job
-// queue, so the socket loop can ack as soon as it returns.
+// handleEvent routes one Slack message. It only touches memory, the state
+// file and the job queues, never the network, so the socket loop can ack as
+// soon as it returns.
 func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	if ev.Type != "message" || !relayedSubtypes[ev.Subtype] || ev.BotID != "" ||
 		ev.Channel != b.channelID || ev.User == "" || ev.User == b.botUserID {
@@ -140,51 +141,75 @@ func (b *Bridge) onlineHint() string {
 // command runs allow/remove. Only users seeded from config (owners) may run
 // them, so access granted from Slack can't chain. The check happens before
 // any lookup or enqueue, so a non-owner's attempt never calls users.info.
+//
+// remove applies at once, so revoking access never waits behind queued
+// posts. allow needs a users.info lookup, so it is a queued command job; it
+// records the target's command count now and applies only if no later
+// allow/remove for the same user came in meanwhile.
 func (b *Bridge) command(ev messageEvent, user allowedUser, verb, target string) {
 	if (verb == "allow" || verb == "remove") && !user.config {
 		log.Infof("slack: refused %s of %s by non-owner %s", verb, target, user.ID)
-		b.reply(ev, ownersOnly)
+		b.replyCommand(ev, ownersOnly)
 		return
 	}
 	switch verb {
 	case "allow":
-		b.enqueue(func(ctx context.Context) error {
-			label, isBot, err := b.api.userInfo(ctx, b.cfg.BotToken, target)
-			if err != nil {
-				log.Infof("slack: %s tried to allow %s: lookup failed", user.ID, target)
-				return b.replyNow(ctx, ev, "Couldn't look that user up: "+escape(err.Error()))
+		b.cmdMu.Lock()
+		b.cmdSeq[target]++
+		seq := b.cmdSeq[target]
+		b.cmdMu.Unlock()
+		// The outcome is decided once; a retry after a failed reply only
+		// re-sends the reply.
+		var confirm string
+		b.enqueueCommand(func(ctx context.Context) error {
+			if confirm == "" {
+				confirm = b.applyAllow(ctx, user, target, seq)
 			}
-			if isBot {
-				log.Infof("slack: %s tried to allow %s: refused, it is a bot", user.ID, target)
-				return b.replyNow(ctx, ev, "Bots can't be allowed.")
-			}
-			u, added, errAllow := b.state.allow(target, label)
-			if !added {
-				log.Infof("slack: %s tried to allow %s: already allowed", user.ID, target)
-				return b.replyNow(ctx, ev, fmt.Sprintf("<@%s> is already allowed, as @%s.", u.ID, u.Label))
-			}
-			confirm := fmt.Sprintf("<@%s> can now instruct agents. Agents know them as @%s.", u.ID, u.Label)
-			if errAllow != nil {
-				logSaveError(errAllow)
-				confirm += notSavedNote
-			}
-			log.Infof("slack: %s allowed %s as @%s", user.ID, u.ID, u.Label)
 			return b.replyNow(ctx, ev, confirm)
 		})
 	case "remove":
-		// Queued like allow so the single FIFO worker applies the owner's
-		// commands in the order they were given. The change is applied once;
-		// a retry after a failed reply only re-sends the reply.
-		var confirm string
-		b.enqueue(func(ctx context.Context) error {
-			if confirm == "" {
-				confirm = b.applyRemove(user, target)
-			}
-			return b.replyNow(ctx, ev, confirm)
-		})
+		b.cmdMu.Lock()
+		b.cmdSeq[target]++
+		confirm := b.applyRemove(user, target)
+		b.cmdMu.Unlock()
+		b.replyCommand(ev, confirm)
 	default:
-		b.reply(ev, commandHelp)
+		b.replyCommand(ev, commandHelp)
 	}
+}
+
+// applyAllow looks target up and allows them unless a later command for
+// target superseded this one (seq is no longer current). It returns the
+// reply text.
+func (b *Bridge) applyAllow(ctx context.Context, user allowedUser, target string, seq uint64) string {
+	label, isBot, err := b.api.userInfo(ctx, b.cfg.BotToken, target)
+	if err != nil {
+		log.Infof("slack: %s tried to allow %s: lookup failed", user.ID, target)
+		return "Couldn't look that user up: " + escape(err.Error())
+	}
+	if isBot {
+		log.Infof("slack: %s tried to allow %s: refused, it is a bot", user.ID, target)
+		return "Bots can't be allowed."
+	}
+	b.cmdMu.Lock()
+	if b.cmdSeq[target] != seq {
+		b.cmdMu.Unlock()
+		log.Infof("slack: %s's allow of %s superseded by a later command", user.ID, target)
+		return fmt.Sprintf("A later command for <@%s> superseded this allow, so it wasn't applied.", target)
+	}
+	u, added, errAllow := b.state.allow(target, label)
+	b.cmdMu.Unlock()
+	if !added {
+		log.Infof("slack: %s tried to allow %s: already allowed", user.ID, target)
+		return fmt.Sprintf("<@%s> is already allowed, as @%s.", u.ID, u.Label)
+	}
+	confirm := fmt.Sprintf("<@%s> can now instruct agents. Agents know them as @%s.", u.ID, u.Label)
+	if errAllow != nil {
+		logSaveError(errAllow)
+		confirm += notSavedNote
+	}
+	log.Infof("slack: %s allowed %s as @%s", user.ID, u.ID, u.Label)
+	return confirm
 }
 
 // applyRemove removes target and returns the reply text.
@@ -218,6 +243,11 @@ func replyThread(ev messageEvent) string {
 
 func (b *Bridge) reply(ev messageEvent, text string) {
 	b.enqueue(func(ctx context.Context) error { return b.replyNow(ctx, ev, text) })
+}
+
+// replyCommand queues a reply to a command on the command queue.
+func (b *Bridge) replyCommand(ev messageEvent, text string) {
+	b.enqueueCommand(func(ctx context.Context) error { return b.replyNow(ctx, ev, text) })
 }
 
 func (b *Bridge) replyNow(ctx context.Context, ev messageEvent, text string) error {

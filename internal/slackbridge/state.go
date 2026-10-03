@@ -24,6 +24,9 @@ type allowedUser struct {
 
 type stateFile struct {
 	Threads map[string]string `json:"threads"`
+	// Links maps every thread ts linked to a session (not just the first
+	// one in Threads) to its session id.
+	Links   map[string]string `json:"links,omitempty"`
 	Allowed []allowedUser     `json:"allowed"`
 }
 
@@ -32,8 +35,8 @@ type stateFile struct {
 type state struct {
 	path     string
 	mu       sync.Mutex
-	threads  map[string]string // session id -> thread ts
-	sessions map[string]string // thread ts -> session id
+	threads  map[string]string // session id -> its first thread ts (agents post there)
+	sessions map[string]string // thread ts -> session id, for every linked thread
 	users    []allowedUser     // config users first
 }
 
@@ -57,6 +60,9 @@ func loadState(path string) (*state, error) {
 	}
 	for sid, ts := range file.Threads {
 		st.threads[sid] = ts
+		st.sessions[ts] = sid
+	}
+	for ts, sid := range file.Links {
 		st.sessions[ts] = sid
 	}
 	st.users = file.Allowed
@@ -197,26 +203,32 @@ func (st *state) session(ts string) (string, bool) {
 	return sid, ok
 }
 
-// setThread links a session to a thread unless it already has one.
+// setThread links thread ts to a session, so replies in it reach the
+// session. The session's first thread stays the one its posts go to;
+// setThread reports whether ts became that thread.
 func (st *state) setThread(sid, ts string) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if _, ok := st.threads[sid]; ok {
+	first := false
+	if _, ok := st.threads[sid]; !ok {
+		st.threads[sid] = ts
+		first = true
+	}
+	if !first && st.sessions[ts] == sid {
 		return false
 	}
-	st.threads[sid] = ts
 	st.sessions[ts] = sid
 	if errSave := st.saveLocked(); errSave != nil {
 		logSaveError(errSave)
 	}
-	return true
+	return first
 }
 
 func (st *state) saveLocked() error {
 	if st.path == "" {
 		return nil
 	}
-	file := stateFile{Threads: st.threads}
+	file := stateFile{Threads: st.threads, Links: st.sessions}
 	for _, u := range st.users {
 		if !u.config {
 			file.Allowed = append(file.Allowed, u)

@@ -43,7 +43,13 @@ func TestStateSeedAllowRemove(t *testing.T) {
 		t.Fatal("still allowed after remove")
 	}
 	if !st.setThread("sid-a", "1.1") || st.setThread("sid-a", "2.2") {
-		t.Fatal("setThread must only set once")
+		t.Fatal("only the first thread is the session's posting thread")
+	}
+	if ts, _ := st.thread("sid-a"); ts != "1.1" {
+		t.Fatalf("posting thread moved to %q", ts)
+	}
+	if sid, ok := st.session("2.2"); !ok || sid != "sid-a" {
+		t.Fatalf("second thread not linked: %q %v", sid, ok)
 	}
 
 	reloaded, err := loadState(path)
@@ -56,6 +62,9 @@ func TestStateSeedAllowRemove(t *testing.T) {
 	}
 	if sid, ok := reloaded.session("1.1"); !ok || sid != "sid-a" {
 		t.Fatalf("session = %q %v", sid, ok)
+	}
+	if sid, ok := reloaded.session("2.2"); !ok || sid != "sid-a" {
+		t.Fatalf("second thread link not persisted: %q %v", sid, ok)
 	}
 	if u, ok := reloaded.user("UJANE"); !ok || u.Label != "jane" || !u.config {
 		t.Fatalf("config must win over a persisted Slack-added entry: %+v", u)

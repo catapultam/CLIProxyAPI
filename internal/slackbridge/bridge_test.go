@@ -47,16 +47,22 @@ func newTestBridge(t *testing.T) (*Bridge, *fakeSlack, *agentbus.Store) {
 	return b, f, bus
 }
 
+// drainJobs runs queued jobs the way runJobs picks them: command jobs first.
 func drainJobs(t *testing.T, b *Bridge) {
 	t.Helper()
 	for {
+		var j job
 		select {
-		case j := <-b.jobs:
-			if err := j(context.Background()); err != nil {
-				t.Fatalf("job: %v", err)
-			}
+		case j = <-b.commands:
 		default:
-			return
+			select {
+			case j = <-b.jobs:
+			default:
+				return
+			}
+		}
+		if err := j(context.Background()); err != nil {
+			t.Fatalf("job: %v", err)
 		}
 	}
 }
