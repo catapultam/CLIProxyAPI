@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -111,6 +112,9 @@ type helloRequest struct {
 	// Version is the mod's version; with mod set, empty means a mod older
 	// than commands.
 	Version string `json:"version"`
+	// Previous is the session id this one replaced after /clear, /resume or
+	// /branch; see Store.HandOff.
+	Previous string `json:"previous"`
 }
 
 func (s *Store) handleHello(c *gin.Context) {
@@ -123,6 +127,11 @@ func (s *Store) handleHello(c *gin.Context) {
 	if req.Mod {
 		// A mod without a version is older than commands: clear the record.
 		s.SetModVersion(strings.TrimSpace(req.Session), req.Version)
+	}
+	if prev := strings.TrimSpace(req.Previous); prev != "" {
+		if errHandOff := s.HandOff(prev, req.Session); errHandOff != nil {
+			log.Infof("agentbus: %s can't take over %s: %v", s.Address(strings.TrimSpace(req.Session)), s.Address(prev), errHandOff)
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"address": s.Address(strings.TrimSpace(req.Session))})
 }

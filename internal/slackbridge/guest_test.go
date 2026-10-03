@@ -252,11 +252,16 @@ func TestLinkRelinkAndUnlinkInPlace(t *testing.T) {
 		t.Fatalf("unlink notice = %+v", n)
 	}
 	// After the unlink the agent can't post there through the notice or a
-	// guest's message: its answer goes to its own thread.
+	// guest's message: its answer is dropped (never posted in its own thread
+	// instead), and it is told.
 	for _, id := range []string{bNotice.ID, guest.ID} {
+		before := len(f.callsTo("chat.postMessage"))
 		sendReply(t, b, bus, sidB, "still here?", id)
-		if got := lastPost(t, f); got["channel"] != "CAGENTS" {
-			t.Fatalf("answer to %s after unlink = %+v", id, got)
+		if got := postsSince(f, before); len(got) != 0 {
+			t.Fatalf("answer to %s after unlink posted: %+v", id, got)
+		}
+		if n := claimNotice(t, bus, sidB); !strings.Contains(n.Body, "no longer reachable") {
+			t.Fatalf("notice = %+v", n)
 		}
 	}
 	// Guests no longer reach it.

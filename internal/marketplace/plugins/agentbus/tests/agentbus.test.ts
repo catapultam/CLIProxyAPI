@@ -242,7 +242,8 @@ test('session.end with clear says bye, then the next tick follows the session to
   calls.length = 0
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.6' })
+  // The old id goes along, so the bus hands the name, inbox and Slack routing to the new one.
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.6', previous: DEFAULT_SESSION_ID })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })

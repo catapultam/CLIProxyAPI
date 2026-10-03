@@ -382,16 +382,17 @@ func TestBotMentionThenTagIsATag(t *testing.T) {
 		t.Fatalf("sidA got %+v", bus.Claim(sidA))
 	}
 	drainJobs(t, b)
-	// Only receipts went out: no help replies.
-	if n := len(f.callsTo("chat.postMessage")); n != posts {
-		t.Fatalf("posts %d -> %d", posts, n)
+	// Only receipts went out, and the in-thread tag's "sent to": no help
+	// replies.
+	if n := len(f.callsTo("chat.postMessage")); n != posts+1 || lastPostText(f) != "→ sent to `bridge`" {
+		t.Fatalf("posts %d -> %d: %q", posts, n, lastPostText(f))
 	}
 	// A mention that isn't a command or a tag still gets help in the
 	// channel, and nothing in a group the bot was only added to.
 	b.handleEvent("EvBMh", msg("UALEX", "<@UBOT> what now", "1700003100.000005", ""))
 	b.handleEvent("EvBMg", foreignMsg("UALEX", "<@UBOT> what now", "1700003100.000006", ""))
 	drainJobs(t, b)
-	if n := len(f.callsTo("chat.postMessage")); n != posts+1 || !strings.Contains(lastPostText(f), "allow @person") {
+	if n := len(f.callsTo("chat.postMessage")); n != posts+2 || !strings.Contains(lastPostText(f), "allow @person") {
 		t.Fatalf("posts %d -> %d: %q", posts, n, lastPostText(f))
 	}
 }
@@ -432,9 +433,13 @@ func TestUnlinkedThreadReplyAfterTagGoesToTheTaggedAgent(t *testing.T) {
 	b.handleEvent("EvTR8", foreignMsg("UALEX", "<@UBOT> unlink", "1700003200.000010", ""))
 	drainJobs(t, b)
 	claimOne(t, bus, sidB) // the unlink notice
+	before := len(f.callsTo("chat.postMessage"))
 	sendReply(t, b, bus, sidB, "posting at the top", notice.ID)
-	if got := lastPost(t, f); got["channel"] != "CAGENTS" {
+	if got := postsSince(f, before); len(got) != 0 {
 		t.Fatalf("answer to the notice after unlink = %+v", got)
+	}
+	if n := claimNotice(t, bus, sidB); !strings.Contains(n.Body, "no longer reachable") {
+		t.Fatalf("notice = %+v", n)
 	}
 }
 

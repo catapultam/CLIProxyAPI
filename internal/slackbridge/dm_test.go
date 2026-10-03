@@ -141,7 +141,7 @@ func TestInboundDMFromAllowedUserIsDelivered(t *testing.T) {
 	}
 }
 
-func TestAnswerToRemovedUsersDMGoesToOwnThread(t *testing.T) {
+func TestAnswerToRemovedUsersDMIsDroppedWithNotice(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	if _, _, err := b.state.allow("UJANE", "jane"); err != nil {
 		t.Fatal(err)
@@ -152,15 +152,15 @@ func TestAnswerToRemovedUsersDMGoesToOwnThread(t *testing.T) {
 	if err := b.state.remove("UJANE"); err != nil {
 		t.Fatal(err)
 	}
+	before := len(f.callsTo("chat.postMessage"))
 	sendReply(t, b, bus, sidA, "all done", id)
-	for _, p := range f.callsTo("chat.postMessage") {
-		if p.Form.Get("channel") == "DUJANE" {
-			t.Fatalf("posted into a removed user's DM: %+v", p.Form)
-		}
+	// Never posted in the removed user's DM, and never in the home thread
+	// instead: a private answer must not leak to the channel.
+	if got := postsSince(f, before); len(got) != 0 {
+		t.Fatalf("posted: %+v", got)
 	}
-	own, ok := b.state.thread(sidA)
-	if got := lastPost(t, f); !ok || got["channel"] != "CAGENTS" || got["thread_ts"] != "" || !strings.HasSuffix(got["text"], "\nall done") || own == "" {
-		t.Fatalf("answer = %+v (own thread %q)", got, own)
+	if n := claimNotice(t, bus, sidA); !strings.Contains(n.Body, "no longer reachable") {
+		t.Fatalf("notice = %+v", n)
 	}
 }
 
@@ -332,9 +332,10 @@ func TestDMCommandFromOwnerIsDelivered(t *testing.T) {
 		t.Fatalf("report = %+v", got)
 	}
 
-	// A plain !command goes to dmLast; !commands lists, in the DM.
+	// A bare top-level !command never goes to dmLast: it needs "name: !cmd".
+	// !commands lists, in the DM.
 	b.handleEvent("EvK2", dmMsg("UALEX", "!clear", "1700001000.000002", ""))
-	if msgs := bus.Claim(sidA); len(msgs) != 1 || msgs[0].Command == nil || msgs[0].Command.Command != "clear" {
+	if msgs := bus.Claim(sidA); len(msgs) != 0 {
 		t.Fatalf("msgs = %+v", msgs)
 	}
 	b.handleEvent("EvK3", dmMsg("UALEX", "!commands", "1700001000.000003", ""))

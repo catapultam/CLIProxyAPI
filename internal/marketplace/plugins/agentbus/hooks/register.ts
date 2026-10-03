@@ -633,12 +633,14 @@ export const register: Register = on => {
         $.clock.every(1000, async () => {
           if (ended) return
           // /clear, /resume, and /branch don't fire session.start again, so catch the id change
-          // here and re-register with the bus under the new session.
+          // here and re-register with the bus under the new session. previous lets the bus hand the
+          // old session's name, queued messages and Slack threads to the new one.
           const current = await $.session.id()
           if (current && current !== session) {
+            const previous = session
             session = current
             try {
-              const { json } = await bus($, 'POST', '/hello', { session, machine, mod: true, version: VERSION })
+              const { json } = await bus($, 'POST', '/hello', { session, machine, mod: true, version: VERSION, previous })
               address = (json?.address as string) ?? ''
             } catch {
               address = ''

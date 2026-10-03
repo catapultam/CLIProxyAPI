@@ -101,8 +101,9 @@ func (s *Store) expireUnackedLocked(sess *session) {
 }
 
 // Ack marks messages the mod got from /wait for session id as read and
-// reports them to the bridge. Only ids /wait handed to that session and not
-// yet acknowledged count; the rest are ignored. It returns how many counted.
+// reports them to the bridge. Only ids /wait handed to that session (or, after
+// a handoff, passed on to its successor) and not yet acknowledged count; the
+// rest are ignored. It returns how many counted.
 func (s *Store) Ack(id string, ids []string) int {
 	s.mu.Lock()
 	sess, ok := s.byID[id]
@@ -110,19 +111,29 @@ func (s *Store) Ack(id string, ids []string) int {
 		s.mu.Unlock()
 		return 0
 	}
-	s.expireUnackedLocked(sess)
 	var acked []string
-	for _, msgID := range ids {
-		if _, pending := sess.Unacked[msgID]; pending {
-			delete(sess.Unacked, msgID)
-			acked = append(acked, msgID)
+	// A session that handed off (HandOff) passed its unacknowledged ids on;
+	// the mod still acks them under the id it captured, so follow it.
+	rest := ids
+	for hop := 0; sess != nil && hop < maxMoveHops && len(rest) > 0; hop++ {
+		s.expireUnackedLocked(sess)
+		var left []string
+		for _, msgID := range rest {
+			if _, pending := sess.Unacked[msgID]; pending {
+				delete(sess.Unacked, msgID)
+				acked = append(acked, msgID)
+			} else {
+				left = append(left, msgID)
+			}
 		}
+		if len(sess.Unacked) == 0 {
+			sess.Unacked = nil
+		}
+		rest = left
+		sess = s.byID[sess.MovedTo]
 	}
 	if len(acked) > 0 {
 		s.dirty = true
-	}
-	if len(sess.Unacked) == 0 {
-		sess.Unacked = nil
 	}
 	r, _ := s.bridge.(Receipts)
 	s.mu.Unlock()

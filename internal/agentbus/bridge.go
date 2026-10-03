@@ -240,7 +240,8 @@ func (s *Store) deliverFromSlack(target, body, via string, fill func(*Message)) 
 }
 
 // deliverTargetLocked finds the session the bridge addresses as target (id,
-// name or address). The caller holds s.mu.
+// name or address). A closed session is ErrUnknownTarget. The caller holds
+// s.mu.
 func (s *Store) deliverTargetLocked(target string) (string, *session, error) {
 	if isReservedTarget(target) {
 		// A session id is whatever the client sends in /hello, so a client
@@ -257,7 +258,13 @@ func (s *Store) deliverTargetLocked(target string) (string, *session, error) {
 		}
 		id = resolved
 	}
-	return id, s.byID[id], nil
+	sess := s.byID[id]
+	if sess.Closed {
+		// The session said bye: nothing would ever read it. After /clear,
+		// /resume or /branch its successor took over its name (HandOff).
+		return "", nil, ErrUnknownTarget
+	}
+	return id, sess, nil
 }
 
 // fromSlackLocked builds a message from an allowed Slack user to sess. The

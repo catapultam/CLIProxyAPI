@@ -168,6 +168,9 @@ type stateFile struct {
 	DMLast map[string]dmLastEntry `json:"dm_last,omitempty"`
 	// Conversations maps a linked conversation's channel ID to its link.
 	Conversations map[string]convLink `json:"conversations,omitempty"`
+	// Moved maps a session id that handed off (/clear, /resume, /branch) to
+	// the session that took it over.
+	Moved map[string]movedEntry `json:"moved,omitempty"`
 }
 
 // state holds session threads, delivered messages, DM routing and the
@@ -185,6 +188,7 @@ type state struct {
 	dmLasts  map[string]dmLastEntry // user ID -> the agent they last talked to in their DM
 	convs    map[string]convLink    // channel ID -> the session the conversation is linked to
 	users    []allowedUser          // config users first
+	moved    map[string]movedEntry  // old session id -> the session that took it over
 	// early holds receipts for message ids not recorded yet (a waiter can
 	// claim a message before deliver records it); record applies them. Not
 	// persisted; earlyRing evicts the oldest past maxEarlyReceipts.
@@ -195,7 +199,7 @@ type state struct {
 // loadState reads path; a missing file is an empty state. On a corrupt file it
 // returns an empty state and the error.
 func loadState(path string) (*state, error) {
-	st := &state{path: path, now: time.Now, threads: map[string]threadRef{}, homes: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, early: map[string]string{}}
+	st := &state{path: path, now: time.Now, threads: map[string]threadRef{}, homes: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, moved: map[string]movedEntry{}, early: map[string]string{}}
 	if path == "" {
 		return st, nil
 	}
@@ -254,6 +258,11 @@ func loadState(path string) (*state, error) {
 	for channel, l := range file.Conversations {
 		if channel != "" && l.Session != "" {
 			st.convs[channel] = l
+		}
+	}
+	for old, e := range file.Moved {
+		if old != "" && e.To != "" && old != e.To {
+			st.moved[old] = e
 		}
 	}
 	st.users = file.Allowed
@@ -596,14 +605,15 @@ func (st *state) noteEarlyLocked(msgID, reaction string) {
 	}
 }
 
-// replyTarget returns the record of msgID when it was delivered to sid and
+// replyTarget returns the record of msgID when it was delivered to sid (or
+// to a session sid took over, or that took sid over; see moveSession) and
 // hasn't expired: the conversation and thread it came from. The thread is
 // empty for a top-level DM.
 func (st *state) replyTarget(msgID, sid string) (replyRecord, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	r, ok := st.replyLocked(msgID)
-	if !ok || r.Session != sid {
+	if !ok || !st.sameSessionLocked(r.Session, sid) {
 		return replyRecord{}, false
 	}
 	return r, true
@@ -655,15 +665,18 @@ func (st *state) dmSession(channel, ts string) (string, bool) {
 	return "", false
 }
 
-// dmHeaded reports whether session sid has an unexpired post of its own in
-// DM channel, so its header line went out there.
+// dmHeaded reports whether the newest unexpired top-level post by an agent
+// in DM channel (its own post, its header, or the header of its home thread
+// there) is session sid's, so a post by sid there needs no header line. A
+// post by another agent in between means sid's next one carries its header
+// again.
 func (st *state) dmHeaded(channel, sid string) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	cutoff := st.now().Add(-replyTTL)
-	for _, l := range st.dmLinks {
-		if l.Agent && l.Channel == channel && l.Session == sid && l.At.After(cutoff) {
-			return true
+	for i := len(st.dmLinks) - 1; i >= 0; i-- {
+		if l := st.dmLinks[i]; l.Agent && l.Channel == channel && l.At.After(cutoff) {
+			return l.Session == sid
 		}
 	}
 	return false
@@ -750,16 +763,26 @@ func (st *state) linkConversation(channel, sid, by, kind string, members []strin
 	return prev, st.saveLocked()
 }
 
-// unlinkConversation removes channel's link. It returns the link, whether
-// there was a live one, and the save error.
+// unlinkConversation removes channel's link. For a DM, the person whose DM
+// it is no longer has their plain messages sent to the unlinked agent: a
+// dm_last pointing at it is cleared. It returns the link, whether there was
+// a live one, and the save error.
 func (st *state) unlinkConversation(channel string) (convLink, bool, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	l, ok := st.liveConvLocked(channel)
-	if _, present := st.convs[channel]; !present {
+	raw, present := st.convs[channel]
+	if !present {
 		return convLink{}, false, nil
 	}
 	delete(st.convs, channel)
+	if raw.Kind == kindDM || strings.HasPrefix(channel, "D") {
+		for _, member := range raw.Members {
+			if e, has := st.dmLasts[member]; has && e.Session == raw.Session {
+				delete(st.dmLasts, member)
+			}
+		}
+	}
 	return l, ok, st.saveLocked()
 }
 
@@ -799,11 +822,46 @@ func (st *state) conversations() []linkedConv {
 }
 
 // conversation returns channel's link, unless its session has been absent
-// for more than linkAbsentTTL.
+// for more than linkAbsentTTL by its recorded Seen. Callers that decide on
+// routing use Bridge.conversationLink, which refreshes Seen from the bus
+// first.
 func (st *state) conversation(channel string) (convLink, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.liveConvLocked(channel)
+}
+
+// convSession returns the session channel is linked to, live or not.
+func (st *state) convSession(channel string) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	l, ok := st.convs[channel]
+	return l.Session, ok
+}
+
+// refreshConversation moves channel's Seen up to seen when known (the bus
+// knows the session) and it is later, then returns the link if it is live.
+// A link that is not live is dropped. Only sid's link is refreshed, so a
+// relink since the caller asked the bus isn't touched.
+func (st *state) refreshConversation(channel, sid string, seen time.Time, known bool) (convLink, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	l, ok := st.convs[channel]
+	if !ok {
+		return convLink{}, false
+	}
+	if known && l.Session == sid && seen.After(l.Seen) {
+		l.Seen = seen
+		st.convs[channel] = l
+	}
+	if live, isLive := st.liveConvLocked(channel); isLive {
+		return live, true
+	}
+	delete(st.convs, channel)
+	if errSave := st.saveLocked(); errSave != nil {
+		logSaveError(errSave)
+	}
+	return convLink{}, false
 }
 
 func (st *state) liveConvLocked(channel string) (convLink, bool) {
@@ -862,10 +920,15 @@ func (st *state) saveLocked() error {
 	if st.path == "" {
 		return nil
 	}
-	st.pruneConvsLocked()
+	// Links are pruned only after their Seen was refreshed from the bus
+	// (touchConversations, refreshConversation), never here: the bus can't
+	// be asked under st.mu.
 	file := stateFile{Threads: st.threads, Links: st.sessions, Replies: st.replies, DMLinks: st.dmLinks}
 	if len(st.homes) > 0 {
 		file.Homes = st.homes
+	}
+	if len(st.moved) > 0 {
+		file.Moved = st.moved
 	}
 	if len(st.convs) > 0 {
 		file.Conversations = st.convs

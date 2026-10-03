@@ -200,6 +200,10 @@ func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
 		log.Warnf("slack: dropped a DM from %s to @%s: not an allowed user", o.Address, o.DM)
 		return nil
 	}
+	if errors.Is(err, errReplyUnreachable) {
+		b.noticeUnreachable(o)
+		return nil
+	}
 	if err != nil || opened {
 		return err
 	}
@@ -238,7 +242,11 @@ func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string
 		}
 		return b.dmTop(ctx, o, channel, text)
 	}
-	if t, ok := b.repliedThread(o); ok {
+	t, ok, errGone := b.repliedThread(o)
+	if errGone != nil {
+		return postTarget{}, false, errGone
+	}
+	if ok {
 		if t.threadTS == "" {
 			return b.dmTop(ctx, o, t.channel, text)
 		}
@@ -265,7 +273,33 @@ func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string
 		return postTarget{}, false, err
 	}
 	b.state.moveThread(o.SessionID, channel, ts, "")
+	b.noteHomeHeader(channel, ts, o.SessionID)
 	return postTarget{channel: channel, threadTS: ts}, true, nil
+}
+
+// noteHomeHeader records a home thread's header post in a DM as the
+// session's own top-level post there, so a later DM post from the session
+// knows its header is the newest there (dmHeaded).
+func (b *Bridge) noteHomeHeader(channel, ts, sid string) {
+	if channel != "" && channel != b.channelID {
+		b.state.linkDM(channel, ts, sid, true)
+	}
+}
+
+// errReplyUnreachable is an answer (reply_to) to a message from a private
+// or linked conversation the session can't post in any more: the DM's user
+// was removed, or the conversation was unlinked, relinked or pruned.
+var errReplyUnreachable = errors.New("conversation no longer reachable")
+
+// unreachableNotice is what the agent is told when its answer was dropped.
+const unreachableNotice = "That conversation is no longer reachable; your message was not posted."
+
+// noticeUnreachable tells o's session its answer was dropped. A session that
+// has left the bus is skipped.
+func (b *Bridge) noticeUnreachable(o agentbus.Outbound) {
+	if _, _, err := b.bus.DeliverNotice(o.SessionID, unreachableNotice); err != nil && !errors.Is(err, agentbus.ErrUnknownTarget) {
+		log.Warnf("slack: unreachable notice for %s not delivered: %v", o.Address, err)
+	}
 }
 
 // ownThread returns session sid's home thread. A thread with no channel
@@ -376,27 +410,29 @@ func (b *Bridge) rememberDM(userID, channel string) {
 
 // repliedThread returns where o.ReplyTo came from when that message was
 // delivered to o's session. An id delivered to another session is logged
-// (both addresses, never the body) and ignored, and so is one from the DM of
-// a user who is no longer allowed. It runs without bridge locks held, since
-// it may ask the Store for the other session's address.
-func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool) {
+// (both addresses, never the body) and ignored. An answer to a message from
+// the DM of a user who is no longer allowed, or from a conversation no
+// longer linked to the session, is errReplyUnreachable: it is dropped, never
+// posted in the home thread instead, where a private answer would leak. It
+// runs without bridge locks held, since it may ask the Store.
+func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool, error) {
 	if o.ReplyTo == "" {
-		return postTarget{}, false
+		return postTarget{}, false, nil
 	}
 	if r, ok := b.state.replyTarget(o.ReplyTo, o.SessionID); ok {
 		if r.DMUser != "" {
 			if _, allowed := b.state.user(r.DMUser); !allowed {
-				log.Warnf("slack: %s answered message %s from the DM of %s, who is no longer allowed; posting in its own thread instead", o.Address, o.ReplyTo, r.DMUser)
-				return postTarget{}, false
+				log.Warnf("slack: dropped %s's answer to message %s from the DM of %s, who is no longer allowed", o.Address, o.ReplyTo, r.DMUser)
+				return postTarget{}, false, errReplyUnreachable
 			}
 		}
 		// A guest's message or the link notice reached the session only
 		// through the conversation's link; once that is gone, so is the
 		// session's way in.
 		if r.Link {
-			if l, linked := b.conversationLink(r.Channel); !linked || l.Session != o.SessionID {
-				log.Warnf("slack: %s answered message %s from conversation %s, which is no longer linked to it; posting in its own thread instead", o.Address, o.ReplyTo, r.Channel)
-				return postTarget{}, false
+			if l, linked := b.conversationLink(r.Channel); !linked || !b.state.sameSession(l.Session, o.SessionID) {
+				log.Warnf("slack: dropped %s's answer to message %s from conversation %s, which is no longer linked to it", o.Address, o.ReplyTo, r.Channel)
+				return postTarget{}, false, errReplyUnreachable
 			}
 		}
 		channel := r.Channel
@@ -404,7 +440,7 @@ func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool) {
 			// An old record from the main channel.
 			channel = b.channelID
 		}
-		return postTarget{channel: channel, threadTS: r.ThreadTS}, channel != ""
+		return postTarget{channel: channel, threadTS: r.ThreadTS}, channel != "", nil
 	}
 	if owner, ok := b.state.replyOwner(o.ReplyTo); ok && owner != o.SessionID {
 		other := b.bus.Address(owner)
@@ -413,7 +449,7 @@ func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool) {
 		}
 		log.Warnf("slack: %s answered message %s, which went to %s; posting in its own thread instead", o.Address, o.ReplyTo, other)
 	}
-	return postTarget{}, false
+	return postTarget{}, false, nil
 }
 
 // openGate is a per-session lock that a waiter can give up on. refs counts
@@ -458,7 +494,8 @@ func (b *Bridge) lockOpening(ctx context.Context, sid string) (func(), error) {
 // plus caption when that place needs one. It implements agentbus.ImagePoster
 // and runs in the caller's goroutine, not on the job queue, so the caller
 // gets Slack's answer. The returned error is only a short code (Slack's
-// error code, user_not_allowed, or request_failed); the details are logged
+// error code, user_not_allowed, conversation_unreachable, or
+// request_failed); the details are logged
 // without the upload URL or any token.
 func (b *Bridge) PostImage(ctx context.Context, o agentbus.Outbound, filename string, data []byte) error {
 	errPost := b.postImage(ctx, o, sanitizeFilename(filename), data)
@@ -468,6 +505,9 @@ func (b *Bridge) PostImage(ctx context.Context, o agentbus.Outbound, filename st
 	log.Warnf("slack: image from %s: %v", o.Address, errPost)
 	if errors.Is(errPost, errDMUserGone) {
 		return errors.New("user_not_allowed")
+	}
+	if errors.Is(errPost, errReplyUnreachable) {
+		return errors.New("conversation_unreachable")
 	}
 	var apiErr *apiError
 	if errors.As(errPost, &apiErr) && apiErr.code != "" {

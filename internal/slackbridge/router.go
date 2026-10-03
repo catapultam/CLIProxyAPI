@@ -171,7 +171,43 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		b.runCommand(ev, user, target, body, notFound, true)
 		return
 	}
-	b.deliver(ev, target, body, user, notFound, true)
+	b.deliverAddressed(ev, target, body, user, notFound)
+}
+
+// deliverAddressed delivers a top-level "name: message". Unlike a tag, the
+// name may be an offline session's, so a message can wait for an agent that
+// is away; the reply then says it is offline.
+func (b *Bridge) deliverAddressed(ev messageEvent, target, body string, user allowedUser, notFound string) {
+	sid, ok := b.deliver(ev, target, body, user, notFound, true)
+	if ok && b.bus.SessionStatus(sid) == agentbus.StatusOffline {
+		b.replyInThread(ev, fmt.Sprintf("`%s` is offline; it gets this when it's back.", escape(b.agentLabel(sid))))
+	}
+}
+
+// agentLabel names session sid as people address it: its name, else its
+// address.
+func (b *Bridge) agentLabel(sid string) string {
+	o, err := b.bus.SessionOutbound(sid)
+	switch {
+	case err != nil:
+		return sid
+	case o.Name != "":
+		return o.Name
+	}
+	return o.Address
+}
+
+// replyInThread replies in ev's thread, or in a new thread under ev when it
+// is a top-level post (also in a DM, where reply keeps to the top level).
+func (b *Bridge) replyInThread(ev messageEvent, text string) {
+	thread := ev.ThreadTS
+	if thread == "" {
+		thread = ev.TS
+	}
+	b.enqueue(func(ctx context.Context) error {
+		_, err := b.api.postMessage(ctx, b.cfg.BotToken, ev.Channel, text, thread)
+		return err
+	})
 }
 
 // routeForeign handles a message from an allowed user in a conversation
@@ -212,8 +248,8 @@ func (b *Bridge) foreignThreadSession(ev messageEvent) (string, bool) {
 }
 
 // tagged finds the agent text tags: "name: message" or "@name message" (see
-// parseAtTagged), where name resolves to a bus session (never "slack"). It
-// returns that session's id and the message.
+// parseAtTagged), where name resolves to a bus session that isn't offline
+// (never "slack"). It returns that session's id and the message.
 func (b *Bridge) tagged(ev messageEvent, text string) (string, string, bool) {
 	name, body, ok := parseAddressed(text)
 	if !ok {
@@ -222,7 +258,7 @@ func (b *Bridge) tagged(ev messageEvent, text string) (string, string, bool) {
 	if !ok {
 		return "", "", false
 	}
-	sid, found := b.bus.Resolve(name)
+	sid, found := b.bus.ResolveLive(name)
 	if !found {
 		return "", "", false
 	}
@@ -233,14 +269,21 @@ func (b *Bridge) tagged(ev messageEvent, text string) (string, string, bool) {
 // own (the session this conversation or thread already goes to; empty for
 // none), and reports whether it did. The delivery adopts nothing: the reply
 // map sends the agent's answer back to this conversation and thread, which
-// stay own's. A name that doesn't resolve is no tag ("note: …"), and a tag
-// of own itself leaves text whole for own.
+// stay own's. A name that doesn't resolve to a live session is no tag
+// ("note: …"), and a tag of own itself leaves text whole for own. A message
+// delivered by a tag in a thread says where it went.
 func (b *Bridge) sendTagged(ev messageEvent, user allowedUser, text, own string) bool {
 	sid, body, ok := b.tagged(ev, text)
 	if !ok || sid == own {
 		return false
 	}
-	b.send(ev, user, sid, body, false)
+	if _, isMove := parseMove(body); isMove || isBang(body) {
+		b.send(ev, user, sid, body, false)
+		return true
+	}
+	if _, delivered := b.deliver(ev, sid, body, user, sessionEnded, false); delivered && ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
+		b.replyInThread(ev, "→ sent to `"+escape(b.agentLabel(sid))+"`")
+	}
 	return true
 }
 
@@ -302,7 +345,7 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 			b.runCommand(ev, user, target, body, notFound, true)
 			return
 		}
-		b.deliver(ev, target, body, user, notFound, true)
+		b.deliverAddressed(ev, target, body, user, notFound)
 		return
 	}
 	if sid, body, ok := b.tagged(ev, text); ok {
@@ -314,21 +357,25 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 		b.move(ev, user, "", home, "")
 		return
 	}
+	if isBang(text) {
+		// A top-level command names its agent ("name: !cmd"); dm_last never
+		// carries one. runCommand answers !commands and explains the rest.
+		b.runCommand(ev, user, "", text, sessionEnded, false)
+		return
+	}
 	sid, ok := b.state.dmLast(ev.User)
+	viaLast := ok
 	if !ok && linkedDM {
 		sid, ok = link.Session, true
-	}
-	if isBang(text) {
-		// Without a dmLast the target is empty: runCommand answers !commands
-		// and explains the rest.
-		b.runCommand(ev, user, sid, text, sessionEnded, ok)
-		return
 	}
 	if !ok {
 		b.reply(ev, howToDM+" "+b.onlineHint())
 		return
 	}
-	b.deliver(ev, sid, text, user, sessionEnded, true)
+	if _, delivered := b.deliver(ev, sid, text, user, sessionEnded, true); delivered && viaLast {
+		// dm_last may be stale: say which agent got it.
+		b.replyInThread(ev, "→ sent to `"+escape(b.agentLabel(sid))+"`")
+	}
 }
 
 // dmThreadSession is the session a DM thread reply goes to: the one its
@@ -446,12 +493,14 @@ func (b *Bridge) viaOf(ev messageEvent) string {
 // deliver queues body for target; notFound is the reply when the target is
 // unknown. A message from a DM or a group conversation is marked as such.
 // Where it came from is recorded (recordDelivery), so the session can
-// answer there; adopt is true for a top-level post.
-func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string, adopt bool) {
+// answer there; adopt is true for a top-level post. It returns the session
+// it delivered to and whether it did.
+func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string, adopt bool) (string, bool) {
 	sid, msgID, err := b.bus.DeliverVia(target, body, user.Label, b.viaOf(ev))
 	switch {
 	case err == nil:
 		b.react(ev, b.recordDelivery(ev, msgID, sid, adopt, reactionQueued))
+		return sid, true
 	case errors.Is(err, agentbus.ErrUnknownTarget):
 		b.reply(ev, notFound)
 	case errors.Is(err, agentbus.ErrBodyTooLarge):
@@ -459,6 +508,7 @@ func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser,
 	default:
 		b.reply(ev, "Not delivered: "+escape(err.Error()))
 	}
+	return "", false
 }
 
 // recordDelivery remembers that msgID, delivered to sid, came from ev, so sid
@@ -540,6 +590,10 @@ func (b *Bridge) command(ev messageEvent, user allowedUser, cmd botCommand) {
 	var target string
 	if len(cmd.users) == 1 {
 		target = cmd.users[0]
+	}
+	if cmd.opensLink() || cmd.verb == "links" {
+		// Judge which links are live by the bus, not by stale Seen times.
+		b.refreshLinks()
 	}
 	switch cmd.verb {
 	case "chat", "dm":

@@ -186,6 +186,7 @@ func (b *Bridge) openMovedThread(ctx context.Context, o agentbus.Outbound, targe
 		return old, hasOld, "", "Couldn't open the new thread."
 	}
 	b.state.moveThread(o.SessionID, target, ts, home)
+	b.noteHomeHeader(target, ts, o.SessionID)
 	return old, hasOld, ts, ""
 }
 

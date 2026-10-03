@@ -30,22 +30,27 @@ const (
 )
 
 // conversationLink returns channel's link while its session hasn't been
-// absent from the bus for more than linkAbsentTTL, first noting when the
-// session was last seen there.
+// absent from the bus for more than linkAbsentTTL. It first notes when the
+// session was last seen on the bus, so a quiet conversation keeps its link
+// while its agent is live; a link found dead is dropped. The bus is asked
+// without any state lock held.
 func (b *Bridge) conversationLink(channel string) (convLink, bool) {
-	l, ok := b.state.conversation(channel)
+	sid, ok := b.state.convSession(channel)
 	if !ok {
 		return convLink{}, false
 	}
-	if at, known := b.bus.SessionSeen(l.Session); known && at.After(l.Seen) {
-		b.state.touchConversations(map[string]time.Time{l.Session: at})
+	var at time.Time
+	known := false
+	if b.bus != nil {
+		at, known = b.bus.SessionSeen(sid)
 	}
-	return l, true
+	return b.state.refreshConversation(channel, sid, at, known)
 }
 
 // refreshLinks notes when each linked session was last on the bus and
 // drops the links of sessions absent for more than linkAbsentTTL. New runs
-// it after loading the state.
+// it after loading the state, the maintenance pass runs it, and so do the
+// commands that list or change links, before they judge which are live.
 func (b *Bridge) refreshLinks() {
 	if b.bus == nil {
 		return

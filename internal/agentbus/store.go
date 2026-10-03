@@ -163,7 +163,9 @@ type session struct {
 	Inbox       []Message `json:"inbox,omitempty"`
 	// Unacked holds the Slack messages /wait handed out that the mod hasn't
 	// acknowledged (/ack) yet, with when; see Receipts.
-	Unacked   map[string]time.Time `json:"unacked,omitempty"`
+	Unacked map[string]time.Time `json:"unacked,omitempty"`
+	// MovedTo is the session that took this one over (HandOff), or empty.
+	MovedTo   string `json:"moved_to,omitempty"`
 	inflight  int
 	waiterGen uint64
 	notify    chan struct{}
