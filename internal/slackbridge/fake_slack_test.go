@@ -46,6 +46,21 @@ type fakeSlack struct {
 	// uploadMode makes /upload/<id> answer with an HTTP status ("" is 200)
 	// or, with "hangup", close the connection without answering.
 	uploadMode string
+	// postHold, when set, makes chat.postMessage report on postEntered once
+	// it is recorded, then wait until postHold is closed before answering.
+	postHold    chan struct{}
+	postEntered chan struct{}
+}
+
+// holdPosts makes every chat.postMessage block until the returned release is
+// called; entered receives once per post that reached the fake.
+func (f *fakeSlack) holdPosts() (entered <-chan struct{}, release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.postHold = make(chan struct{})
+	f.postEntered = make(chan struct{}, 16)
+	hold := f.postHold
+	return f.postEntered, func() { close(hold) }
 }
 
 // fakeUpload is one raw POST to a pre-signed upload URL.
@@ -203,6 +218,13 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"ok": false, "error": "user_not_found"})
 	case "chat.postMessage":
+		f.mu.Lock()
+		hold, entered := f.postHold, f.postEntered
+		f.mu.Unlock()
+		if hold != nil {
+			entered <- struct{}{}
+			<-hold
+		}
 		f.mu.Lock()
 		f.nextTS++
 		ts := "1700000000." + strconv.Itoa(100000+f.nextTS)

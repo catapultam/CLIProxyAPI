@@ -3,6 +3,7 @@ package slackbridge
 import (
 	"context"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -167,5 +168,102 @@ func TestRunJobsRetriesOnce(t *testing.T) {
 	cancel()
 	if calls != 2 {
 		t.Fatalf("calls = %d", calls)
+	}
+}
+
+// openersFor counts the callers holding or waiting for sid's opening lock.
+func openersFor(b *Bridge, sid string) int {
+	b.openMu.Lock()
+	defer b.openMu.Unlock()
+	if g := b.opening[sid]; g != nil {
+		return g.refs
+	}
+	return 0
+}
+
+func TestConcurrentOpenersPostOneHeader(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	entered, release := f.holdPosts()
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+	o := outboundFor(bus, sidB, "", "")
+	type result struct {
+		ts     string
+		opened bool
+		err    error
+	}
+	results := make(chan result, 2)
+	open := func() {
+		ts, opened, err := b.threadFor(context.Background(), o, "")
+		results <- result{ts, opened, err}
+	}
+	timeout := time.After(5 * time.Second)
+	go open()
+	select {
+	case <-entered:
+	case <-timeout:
+		t.Fatal("the first opener never posted its header")
+	}
+	// The first opener is inside chat.postMessage. Start the second and wait
+	// until it queues behind the first, failing if it posts a header too.
+	go open()
+	for openersFor(b, sidB) < 2 {
+		select {
+		case <-entered:
+			t.Fatal("a second opener posted its own header")
+		case <-timeout:
+			t.Fatal("the second opener never queued for the lock")
+		default:
+			runtime.Gosched()
+		}
+	}
+	release()
+	released = true
+	r1, r2 := <-results, <-results
+	if r1.err != nil || r2.err != nil {
+		t.Fatalf("errors: %v, %v", r1.err, r2.err)
+	}
+	if r1.ts == "" || r1.ts != r2.ts || r1.opened == r2.opened {
+		t.Fatalf("results = %+v, %+v (want one thread, opened once)", r1, r2)
+	}
+	if posts := f.callsTo("chat.postMessage"); len(posts) != 1 {
+		t.Fatalf("header posts = %d, want 1", len(posts))
+	}
+	if n := openersFor(b, sidB); n != 0 {
+		t.Fatalf("opening lock still held or leaked: refs %d", n)
+	}
+}
+
+func TestOpenerWaitingForLockHonorsContext(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	entered, release := f.holdPosts()
+	o := outboundFor(bus, sidB, "", "")
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		_, _, _ = b.threadFor(context.Background(), o, "")
+	}()
+	// Let the first opener finish (it writes the state file) before the
+	// test's temp dir is removed.
+	defer func() {
+		release()
+		<-firstDone
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first opener never posted its header")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := b.threadFor(ctx, o, ""); err == nil {
+		t.Fatal("a canceled opener waited for the lock and returned no error")
+	}
+	if n := openersFor(b, sidB); n != 1 {
+		t.Fatalf("refs after the canceled waiter = %d, want 1", n)
 	}
 }

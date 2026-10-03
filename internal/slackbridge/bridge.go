@@ -71,6 +71,12 @@ type Bridge struct {
 	cmdMu  sync.Mutex
 	cmdSeq map[string]uint64
 
+	// opening holds one gate per session whose thread is being picked, so
+	// the job goroutine and concurrent image uploads open a session's thread
+	// once. openMu guards the map; neither is held while calling the Store.
+	openMu  sync.Mutex
+	opening map[string]*openGate
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	jobsWG sync.WaitGroup
@@ -97,6 +103,7 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 		retryDelay: 2 * time.Second,
 		seen:       map[string]bool{},
 		cmdSeq:     map[string]uint64{},
+		opening:    map[string]*openGate{},
 	}, nil
 }
 
@@ -129,8 +136,14 @@ func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
 // has one. Otherwise it opens one by posting the session header, followed by
 // text when text isn't empty, at the top level; opened reports that, so the
 // caller doesn't post text again. Text and image posts both choose their
-// thread here.
+// thread here. Only one caller per session checks and opens at a time, so a
+// session never gets two header posts.
 func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string) (ts string, opened bool, err error) {
+	unlock, errLock := b.lockOpening(ctx, o.SessionID)
+	if errLock != nil {
+		return "", false, errLock
+	}
+	defer unlock()
 	if ts, ok := b.state.thread(o.SessionID); ok {
 		return ts, false, nil
 	}
@@ -144,6 +157,43 @@ func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string
 	}
 	b.state.setThread(o.SessionID, ts)
 	return ts, true, nil
+}
+
+// openGate is a per-session lock that a waiter can give up on. refs counts
+// its holder and waiters, so the gate leaves the map with the last of them.
+type openGate struct {
+	held chan struct{}
+	refs int
+}
+
+// lockOpening takes sid's gate, or returns ctx's error if ctx ends first.
+// The returned func releases it.
+func (b *Bridge) lockOpening(ctx context.Context, sid string) (func(), error) {
+	b.openMu.Lock()
+	g := b.opening[sid]
+	if g == nil {
+		g = &openGate{held: make(chan struct{}, 1)}
+		b.opening[sid] = g
+	}
+	g.refs++
+	b.openMu.Unlock()
+	drop := func() {
+		b.openMu.Lock()
+		if g.refs--; g.refs == 0 {
+			delete(b.opening, sid)
+		}
+		b.openMu.Unlock()
+	}
+	select {
+	case g.held <- struct{}{}:
+		return func() {
+			<-g.held
+			drop()
+		}, nil
+	case <-ctx.Done():
+		drop()
+		return nil, ctx.Err()
+	}
 }
 
 // PostImage uploads an image into the session's own thread, opening the

@@ -122,6 +122,8 @@ type Store struct {
 	bridge Bridge
 	// waitTimeout bounds one /wait long-poll (defaultWaitTimeout when zero).
 	waitTimeout time.Duration
+	// uploadSlots holds one token per image upload in progress.
+	uploadSlots chan struct{}
 }
 
 // NewStore returns an empty store persisted at path (empty disables saving).
@@ -129,7 +131,7 @@ func NewStore(path string, now func() time.Time) *Store {
 	if now == nil {
 		now = time.Now
 	}
-	return &Store{path: path, now: now, byID: make(map[string]*session)}
+	return &Store{path: path, now: now, byID: make(map[string]*session), uploadSlots: make(chan struct{}, maxUploads)}
 }
 
 func (s *Store) get(id string) *session {

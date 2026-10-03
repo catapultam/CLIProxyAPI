@@ -18,6 +18,9 @@ const (
 	uploadFormHeadroom = 64 << 10
 	// maxFieldBytes caps the session and caption fields.
 	maxFieldBytes = 4 << 10
+	// maxUploads caps the image uploads in progress at once; each holds up
+	// to maxImageBytes in memory.
+	maxUploads = 4
 
 	errImageTooLarge = "image exceeds 10 MiB"
 )
@@ -51,6 +54,13 @@ func (s *Store) handleSlackUpload(c *gin.Context) {
 	poster, ok := s.currentBridge().(ImagePoster)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "slack is not enabled"})
+		return
+	}
+	select {
+	case s.uploadSlots <- struct{}{}:
+		defer func() { <-s.uploadSlots }()
+	default:
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many image uploads in progress"})
 		return
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImageBytes+uploadFormHeadroom)
@@ -87,6 +97,7 @@ func (s *Store) handleSlackUpload(c *gin.Context) {
 
 // readUploadForm streams the multipart body: session and caption up to
 // maxFieldBytes each, the file up to maxImageBytes. Other parts are skipped.
+// A repeated field keeps its last value; a second file is refused.
 func readUploadForm(r *http.Request) (uploadForm, *uploadError) {
 	var form uploadForm
 	mr, errReader := r.MultipartReader()

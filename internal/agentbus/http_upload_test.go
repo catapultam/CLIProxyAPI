@@ -242,3 +242,101 @@ func TestHTTPSlackUploadReportsSlackFailure(t *testing.T) {
 		t.Fatalf("upload = %d %s", w.Code, w.Body)
 	}
 }
+
+func TestHTTPSlackUploadConcurrencyCap(t *testing.T) {
+	s, r, fb := newUploadServer(t)
+	// Hold every slot, as maxUploads uploads in progress would.
+	for i := 0; i < maxUploads; i++ {
+		s.uploadSlots <- struct{}{}
+	}
+	w := serve(r, uploadRequest(t, []uploadField{{"session", sidA}}, "a.png", tinyPNG(t)))
+	if w.Code != http.StatusTooManyRequests || strings.TrimSpace(w.Body.String()) != `{"error":"too many image uploads in progress"}` {
+		t.Fatalf("upload with every slot held = %d %s", w.Code, w.Body)
+	}
+	if n := len(fb.posted()); n != 0 {
+		t.Fatalf("posted %d uploads over the cap", n)
+	}
+	<-s.uploadSlots
+	if w = serve(r, uploadRequest(t, []uploadField{{"session", sidA}}, "a.png", tinyPNG(t))); w.Code != http.StatusOK {
+		t.Fatalf("upload with a free slot = %d %s", w.Code, w.Body)
+	}
+	if n := len(s.uploadSlots); n != maxUploads-1 {
+		t.Fatalf("slots in use after the upload = %d, want %d", n, maxUploads-1)
+	}
+}
+
+func TestHTTPSlackUploadReleasesSlotOnEveryPath(t *testing.T) {
+	s, r, fb := newUploadServer(t)
+	data := tinyPNG(t)
+	reqs := []*http.Request{
+		uploadRequest(t, []uploadField{{"session", sidA}}, "a.png", data),
+		uploadRequest(t, nil, "a.png", data),
+		uploadRequest(t, []uploadField{{"session", sidB}}, "a.png", data),
+		uploadRequest(t, []uploadField{{"session", sidA}}, "", nil),
+		uploadRequest(t, []uploadField{{"session", sidA}}, "a.txt", []byte("plain text")),
+		uploadRequest(t, []uploadField{{"session", sidA}}, "big.png", append(tinyPNG(t), make([]byte, maxImageBytes)...)),
+		httptest.NewRequest(http.MethodPost, uploadPath, strings.NewReader("not multipart")),
+	}
+	for i := 0; i < 2*maxUploads; i++ {
+		reqs = append(reqs, uploadRequest(t, []uploadField{{"session", sidA}}, "a.png", data))
+	}
+	for i, req := range reqs {
+		// The first request fails in the bridge, the rest succeed or are refused.
+		if i == 0 {
+			fb.err = errors.New("invalid_channel")
+		} else {
+			fb.err = nil
+		}
+		if w := serve(r, req); w.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d got 429: a slot leaked", i)
+		}
+		if n := len(s.uploadSlots); n != 0 {
+			t.Fatalf("after request %d, %d slots still held", i, n)
+		}
+	}
+}
+
+func TestHTTPSlackUploadTwoFilesRejected(t *testing.T) {
+	_, r, fb := newUploadServer(t)
+	data := tinyPNG(t)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("session", sidA)
+	for _, name := range []string{"a.png", "b.png"} {
+		part, err := mw.CreateFormFile("file", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = part.Write(data)
+	}
+	_ = mw.Close()
+	req := httptest.NewRequest(http.MethodPost, uploadPath, &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if w := serve(r, req); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "send one file per upload") {
+		t.Fatalf("two files = %d %s", w.Code, w.Body)
+	}
+	if n := len(fb.posted()); n != 0 {
+		t.Fatalf("posted %d images from a two-file upload", n)
+	}
+}
+
+// A repeated field keeps its last value, so the last session field decides
+// which session the image is from.
+func TestHTTPSlackUploadRepeatedSessionLastWins(t *testing.T) {
+	_, r, fb := newUploadServer(t)
+	data := tinyPNG(t)
+	w := serve(r, uploadRequest(t, []uploadField{{"session", sidB}, {"session", sidA}}, "a.png", data))
+	if w.Code != http.StatusOK {
+		t.Fatalf("unknown then known session = %d %s", w.Code, w.Body)
+	}
+	if got := fb.posted(); len(got) != 1 || got[0].out.SessionID != sidA {
+		t.Fatalf("posted = %+v", got)
+	}
+	w = serve(r, uploadRequest(t, []uploadField{{"session", sidA}, {"session", sidB}}, "a.png", data))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "session is not a known session") {
+		t.Fatalf("known then unknown session = %d %s", w.Code, w.Body)
+	}
+	if n := len(fb.posted()); n != 1 {
+		t.Fatalf("posted = %d", n)
+	}
+}
