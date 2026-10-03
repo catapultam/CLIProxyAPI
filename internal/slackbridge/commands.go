@@ -296,78 +296,74 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 	return nil
 }
 
-// unsafeShellArgv refuses an argv that would hand {args} or {out} to an
-// interpreter as script text: a placeholder after a script flag (-c,
-// -Command, -e, /c, ...) once an interpreter has appeared (as the program or
-// behind a wrapper such as env or sudo), or anywhere after cmd, which parses
-// its whole command line. A .bat or .cmd program is refused outright:
-// Windows runs it through cmd. Env variables are the way to hand a value to
-// a script.
+// unsafeShellArgv refuses an argv that could hand {args} or {out} to an
+// interpreter as code. An interpreter picks its script from its arguments
+// (powershell's first bare argument is -Command; sh, python or node run the
+// file their first argument names; python -m names a module), so once an
+// interpreter appears, as the program or behind a wrapper such as sudo, no
+// placeholder may follow it: env (AGENTBUS_*) is the only way to hand an
+// interpreter a value. A script file as the program (.bat, .ps1, .js, ...)
+// is refused outright, since Windows runs it through an interpreter.
+// Other programs take placeholders as whole argv elements.
 func unsafeShellArgv(argv []string) error {
-	program := strings.ToLower(argv[0])
-	if strings.HasSuffix(program, ".bat") || strings.HasSuffix(program, ".cmd") {
-		return errors.New("a .bat or .cmd program runs through cmd; call the program it runs instead")
+	if ext := scriptExtension(argv[0]); ext != "" {
+		return fmt.Errorf("a %s program runs through an interpreter; call the interpreter with the script instead", ext)
 	}
-	interpreter, script := "", false
+	interpreter := ""
 	for _, el := range argv {
 		if el == argsPlaceholder || el == outPlaceholder {
-			if script {
-				return fmt.Errorf("%s would be script text for %s; pass it in env instead", el, interpreter)
+			if interpreter != "" {
+				return fmt.Errorf("%s can't go to %s as an argument; pass it in an %s* env variable", el, interpreter, shellEnvPrefix)
 			}
 			continue
 		}
-		if interpreter == "" {
-			if name := interpreterName(el); name != "" {
-				interpreter = name
-				// cmd treats everything after it as a command line.
-				script = name == "cmd"
-			}
-			continue
+		if interpreter == "" && isInterpreter(el) {
+			interpreter = programBase(el)
 		}
-		script = script || isScriptFlag(interpreter, el)
 	}
 	return nil
 }
 
-// shellInterpreter matches an interpreter's base name, lowercased, without
-// .exe.
-var shellInterpreter = regexp.MustCompile(`^(sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh|python[0-9.]*|node|nodejs|perl|ruby|osascript)$`)
+// shellInterpreters are programs that run code from their arguments, by
+// base name (lowercased, .exe or .com removed). Wrappers that run another
+// program from their arguments (env, xargs, wsl, busybox, ssh) count too.
+var shellInterpreters = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true, "fish": true, "csh": true, "tcsh": true,
+	"cmd": true, "powershell": true, "pwsh": true,
+	"python": true, "python2": true, "python3": true, "py": true, "pythonw": true,
+	"node": true, "deno": true, "bun": true, "perl": true, "ruby": true, "php": true, "lua": true, "tclsh": true,
+	"osascript": true, "wscript": true, "cscript": true, "mshta": true,
+	"awk": true, "gawk": true, "mawk": true, "sed": true,
+	"ssh": true, "wsl": true, "env": true, "xargs": true, "busybox": true, "rscript": true,
+}
 
-// interpreterName returns the interpreter el names, or "".
-func interpreterName(el string) string {
+// pythonVersioned is a versioned python, like python3.12.
+var pythonVersioned = regexp.MustCompile(`^python[0-9][0-9.]*w?$`)
+
+// scriptExtensions are program files Windows hands to an interpreter.
+var scriptExtensions = []string{".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf", ".hta"}
+
+// programBase is el's base name, lowercased, without .exe or .com.
+func programBase(el string) string {
 	base := strings.ToLower(el[strings.LastIndexAny(el, `/\`)+1:])
-	base = strings.TrimSuffix(base, ".exe")
-	if !shellInterpreter.MatchString(base) {
-		return ""
-	}
-	if strings.HasPrefix(base, "python") {
-		return "python"
-	}
-	return base
+	return strings.TrimSuffix(strings.TrimSuffix(base, ".exe"), ".com")
 }
 
-// isScriptFlag reports whether el makes interpreter read the next argument
-// as code. It errs on the side of refusing: PowerShell takes any prefix of
-// -Command or -EncodedCommand (with - or /), and a short-option cluster
-// such as bash's -lc or perl's -ne counts when it holds c, e or p.
-func isScriptFlag(interpreter, el string) bool {
-	lower := strings.ToLower(el)
-	if !strings.HasPrefix(lower, "-") && !strings.HasPrefix(lower, "/") {
-		return false
-	}
-	name := strings.TrimLeft(lower, "-/")
-	switch name {
-	case "c", "k", "e", "p", "command", "encodedcommand", "ec", "enc", "eval", "print", "exec", "cwa", "commandwithargs":
-		return true
-	}
-	if interpreter == "powershell" || interpreter == "pwsh" {
-		return name != "" && (strings.HasPrefix("command", name) || strings.HasPrefix("encodedcommand", name) || strings.HasPrefix("commandwithargs", name))
-	}
-	return shortOptionCluster.MatchString(lower) && strings.ContainsAny(name, "cep")
+func isInterpreter(el string) bool {
+	base := programBase(el)
+	return shellInterpreters[base] || pythonVersioned.MatchString(base)
 }
 
-// shortOptionCluster is a single-dash cluster of short options, like -lc.
-var shortOptionCluster = regexp.MustCompile(`^-[a-z]{1,8}$`)
+// scriptExtension returns program's script extension, or "".
+func scriptExtension(program string) string {
+	lower := strings.ToLower(strings.TrimSpace(program))
+	for _, ext := range scriptExtensions {
+		if strings.HasSuffix(lower, ext) {
+			return ext
+		}
+	}
+	return ""
+}
 
 // registryEntry is one registry file: a spec, or the error that disabled it.
 type registryEntry struct {

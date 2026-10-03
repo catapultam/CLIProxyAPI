@@ -254,9 +254,9 @@ func TestRegistryAcceptsPlaceholdersAsWholeElements(t *testing.T) {
 	}
 }
 
-// An interpreter never gets {args} or {out} as script text: after a script
-// flag they are refused at load. A .bat or .cmd program is refused outright
-// (Windows runs it through cmd). {args} anywhere needs an argument rule.
+// An interpreter never gets {args} or {out} as an argument: an interpreter
+// picks its script from its arguments, so they go through env. A script file
+// as the program is refused outright. {args} anywhere needs an argument rule.
 func TestRegistryKeepsPlaceholdersAwayFromInterpreters(t *testing.T) {
 	const rule = "args_pattern: \"[a-z]+\"\n"
 	for name, content := range map[string]string{
@@ -294,6 +294,33 @@ func TestRegistryKeepsPlaceholdersAwayFromInterpreters(t *testing.T) {
 		"envpreload":  "kind: shell\nargv:\n  linux: [tool]\nenv:\n  LD_PRELOAD: \"{args}\"\n" + rule,
 		"envslash":    "kind: slash\ncommand: compact\nenv:\n  A: b\n",
 		"envprompt":   "kind: prompt\ntext: hi\nenv:\n  A: b\n",
+		// No flag needed: an interpreter picks its script from its arguments.
+		"pwshbare":     "kind: shell\nargv:\n  windows: [powershell, -NoProfile, \"{args}\"]\n" + rule,
+		"pwshonly":     "kind: shell\nargv:\n  windows: [pwsh, \"{args}\"]\n" + rule,
+		"pwshfile":     "kind: shell\nargv:\n  windows: [pwsh, -NoProfile, -File, tool.ps1, \"{args}\"]\n" + rule,
+		"pythonm":      "kind: shell\nargv:\n  linux: [python, -m, \"{args}\"]\n" + rule,
+		"pythonscript": "kind: shell\nargv:\n  linux: [python3, tool.py, \"{args}\"]\n" + rule,
+		"shbare":       "kind: shell\nargv:\n  linux: [sh, \"{args}\"]\n" + rule,
+		"envbare":      "kind: shell\nargv:\n  linux: [env, \"{args}\"]\n" + rule,
+		"nodeout":      "kind: shell\nargv:\n  linux: [node, x.js, \"{out}\"]\n",
+		"pyexe":        "kind: shell\nargv:\n  windows: [py.exe, \"{args}\"]\n" + rule,
+		"pythonwcaps":  "kind: shell\nargv:\n  windows: ['C:\\Python\\PYTHONW.EXE', x.py, \"{out}\"]\n",
+		"pythonver":    "kind: shell\nargv:\n  linux: [python3.12, x.py, \"{out}\"]\n",
+		"cmdcom":       "kind: shell\nargv:\n  windows: [cmd.com, \"{out}\"]\n",
+		"wsl":          "kind: shell\nargv:\n  windows: [wsl, \"{args}\"]\n" + rule,
+		"busybox":      "kind: shell\nargv:\n  linux: [busybox, sh, \"{args}\"]\n" + rule,
+		"awk":          "kind: shell\nargv:\n  linux: [gawk, -f, x.awk, \"{out}\"]\n",
+		"sed":          "kind: shell\nargv:\n  linux: [sed, -n, p, \"{out}\"]\n",
+		"ssh":          "kind: shell\nargv:\n  linux: [ssh, host, \"{args}\"]\n" + rule,
+		"xargs":        "kind: shell\nargv:\n  linux: [xargs, \"{args}\"]\n" + rule,
+		"mshta":        "kind: shell\nargv:\n  windows: [mshta, \"{args}\"]\n" + rule,
+		"rscript":      "kind: shell\nargv:\n  linux: [Rscript, x.R, \"{out}\"]\n",
+		"sudowrapped":  "kind: shell\nargv:\n  linux: [sudo, sh, \"{args}\"]\n" + rule,
+		"ps1":          "kind: shell\nargv:\n  windows: ['C:\\tools\\shot.PS1']\n",
+		"vbs":          "kind: shell\nargv:\n  windows: [shot.vbs]\n",
+		"js":           "kind: shell\nargv:\n  windows: [shot.js]\n",
+		"wsf":          "kind: shell\nargv:\n  windows: [shot.wsf]\n",
+		"hta":          "kind: shell\nargv:\n  windows: [shot.hta]\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -310,9 +337,13 @@ func TestRegistryAcceptsEnvPassedPlaceholders(t *testing.T) {
 	dir := t.TempDir()
 	writeCommand(t, dir, "gnome.yaml", "kind: shell\nargv:\n  linux: [sh, -c, 'gnome-screenshot -f \"$AGENTBUS_OUT\"']\nenv:\n  AGENTBUS_OUT: \"{out}\"\n  LANG: C\noutput: image\n", mtime0)
 	writeCommand(t, dir, "grep.yaml", "kind: shell\nargv:\n  windows: [powershell, -NoProfile, -Command, 'Select-String -Pattern $env:AGENTBUS_ARGS x.log']\nenv:\n  AGENTBUS_ARGS: \"{args}\"\nargs_pattern: \"[a-z]+\"\n", mtime0)
-	writeCommand(t, dir, "script.yaml", "kind: shell\nargv:\n  linux: [python3, tool.py, \"{args}\"]\n  windows: [pwsh, -NoProfile, -File, tool.ps1, \"{args}\"]\nargs_enum: [a, b]\n", mtime0)
+	writeCommand(t, dir, "script.yaml", "kind: shell\nargv:\n  linux: [python3, tool.py]\n  windows: [pwsh, -NoProfile, -File, tool.ps1]\nenv:\n  AGENTBUS_ARGS: \"{args}\"\nargs_enum: [a, b]\n", mtime0)
+	// Interpreter flags are fine without placeholders.
+	writeCommand(t, dir, "strict.yaml", "kind: shell\nargv:\n  linux: [bash, -e, script.sh]\n  darwin: [sh, -ex, run.sh]\n", mtime0)
+	// A program that isn't an interpreter takes placeholders as whole elements.
+	writeCommand(t, dir, "capture.yaml", "kind: shell\nargv:\n  darwin: [screencapture, -x, \"{out}\"]\n  linux: [gnome-screenshot, -f, \"{out}\"]\noutput: image\n", mtime0)
 	r := newRegistry(dir)
-	for _, name := range []string{"gnome", "grep", "script"} {
+	for _, name := range []string{"gnome", "grep", "script", "strict", "capture"} {
 		if e, ok := r.lookup(name); !ok || e.err != nil {
 			t.Fatalf("%s = %+v %v", name, e, ok)
 		}

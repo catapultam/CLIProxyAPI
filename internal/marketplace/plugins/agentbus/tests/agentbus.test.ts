@@ -665,6 +665,24 @@ const UNSAFE: Array<[string, Record<string, string[]>, Record<string, string> | 
   ['{args} in a non-AGENTBUS_ variable', { windows: ['tool.exe'] }, { LD_PRELOAD: '{args}' }],
   ['an embedded env placeholder', { windows: ['tool.exe'] }, { AGENTBUS_X: 'a {args}' }],
   ['a bad env name', { windows: ['tool.exe'] }, { 'A B': 'x' }],
+  // An interpreter picks its script from its arguments, flag or no flag.
+  ['powershell with a bare {args}', { windows: ['powershell', '-NoProfile', '{args}'] }, undefined],
+  ['pwsh {args}', { windows: ['pwsh', '{args}'] }, undefined],
+  ['pwsh -File with {args}', { windows: ['pwsh', '-NoProfile', '-File', 'tool.ps1', '{args}'] }, undefined],
+  ['python -m {args}', { windows: ['python', '-m', '{args}'] }, undefined],
+  ['python script {args}', { windows: ['C:\\Python\\python3.12.exe', 'tool.py', '{args}'] }, undefined],
+  ['sh {args}', { windows: ['sh', '{args}'] }, undefined],
+  ['env {args}', { windows: ['env', '{args}'] }, undefined],
+  ['node x.js {out}', { windows: ['node', 'x.js', '{out}'] }, undefined],
+  ['py.exe {args}', { windows: ['PY.EXE', '{args}'] }, undefined],
+  ['cmd.com {out}', { windows: ['cmd.com', '{out}'] }, undefined],
+  ['wsl {args}', { windows: ['wsl', '{args}'] }, undefined],
+  ['sudo sh {args}', { windows: ['sudo', 'sh', '{args}'] }, undefined],
+  ['a .ps1 program', { windows: ['C:\\tools\\shot.PS1'] }, undefined],
+  ['a .vbs program', { windows: ['shot.vbs'] }, undefined],
+  ['a .js program', { windows: ['shot.js'] }, undefined],
+  ['a .wsf program', { windows: ['shot.wsf'] }, undefined],
+  ['a .hta program', { windows: ['shot.hta'] }, undefined],
 ]
 
 for (const [label, argv, env] of UNSAFE) {
@@ -677,12 +695,21 @@ for (const [label, argv, env] of UNSAFE) {
   })
 }
 
-test('a script file run by an interpreter still gets {args} as one argv element', async ($, on) => {
+test('an interpreter with flags and no placeholders runs', async ($, on) => {
   const runs = recordRuns(on, proc(0, 'ok'))
-  const argv = { windows: ['pwsh', '-NoProfile', '-File', 'tool.ps1', '{args}'] }
-  const msg = commandMessage('m_e8', { name: 'tool', kind: 'shell', argv, args: 'a b; c', output: 'text', timeout: 30 })
-  await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
-  expect(runs).toEqual([{ argv: ['pwsh', '-NoProfile', '-File', 'tool.ps1', 'a b; c'] }])
+  const argv = { windows: ['bash', '-e', 'script.sh'] }
+  const msg = commandMessage('m_e8', { name: 'tool', kind: 'shell', argv, output: 'text', timeout: 30 })
+  const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
+  expect(runs).toEqual([{ argv: ['bash', '-e', 'script.sh'] }])
+  expect(at(at(sends, 0).body.split('\n'), 0)).toBe('✅ !tool: exit 0')
+})
+
+test('a program that is not an interpreter takes {args} and {out} as whole elements', async ($, on) => {
+  const runs = recordRuns(on, proc(0, 'ok'))
+  const argv = { windows: ['screencapture', '-x', '{out}', '{args}'] }
+  const msg = commandMessage('m_ea', { name: 'tool', kind: 'shell', argv, args: 'a b; c', output: 'text', timeout: 30 })
+  await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT', TEMP: 'C:\\Temp' } })
+  expect(at(runs, 0)).toEqual({ argv: ['screencapture', '-x', 'C:\\Temp\\agentbus-m_ea.png', 'a b; c'] })
 })
 
 test('a command reports from the session it was delivered to, even after !clear moves it', async ($, on) => {
@@ -716,6 +743,35 @@ test('a Slack !rename runs through the rename hook and renames the session on th
   const names = calls.filter(c => c.url.endsWith('/name'))
   expect(names.length).toBe(1)
   expect(at(names, 0).body).toEqual({ session: DEFAULT_SESSION_ID, name: 'build-bot' })
+})
+
+// Where the engine does route the mod's own !rename through its rename hook, the hook renames on
+// the bus and the fallback stays out of it. Simulated: while the Slack !rename is in flight, a
+// /rename runs through the hook (the test's $ goes through every plugin's hooks).
+test('a Slack !rename the hook already handled is not renamed on the bus twice', async ($, on) => {
+  const clock = mock.clock(on)
+  const msg = commandMessage('m_cc', { name: 'rename', kind: 'slash', command: 'rename', args: 'build-bot' })
+  const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: [msg] }) }])
+  let runs = 0
+  let finish: (() => void) | undefined
+  on('command.run', (_$, e) => {
+    runs++
+    if (runs > 1) return { text: `Session renamed to: ${e.args}` }
+    return new Promise<{ text: string }>(resolve => {
+      finish = () => resolve({ text: `Session renamed to: ${e.args}` })
+    })
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  await clock.advance(1000)
+  // The mod's own call is pending at the bottom; now the hook sees a run.
+  await runSlash($, 'rename', 'build-bot')
+  expect(calls.filter(c => c.url.endsWith('/name')).length).toBe(1)
+  finish?.()
+  await clock.settle()
+  expect(runs).toBe(2)
+  expect(calls.filter(c => c.url.endsWith('/name')).length).toBe(1)
+  const send = calls.find(c => c.url.endsWith('/send'))
+  expect(send?.body).toMatchObject({ reply_to: 'm_cc' })
 })
 
 // The output is cut at 3500 characters; a token across the cut must not leave a prefix behind.

@@ -194,55 +194,48 @@ function commandReport(m: BusMessage, cmd: Command, o: Outcome): string {
   return redact(lines.join('\n'))
 }
 
-// An interpreter's base name, lowercased, without .exe. The proxy refuses the same definitions
+// Programs that run code from their arguments, by base name (lowercased, .exe or .com removed),
+// wrappers that run another program from theirs included. The proxy refuses the same definitions
 // when it loads the registry; this is the mod's own check.
-const SHELL_INTERPRETER = /^(sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh|python[0-9.]*|node|nodejs|perl|ruby|osascript)$/
-const SCRIPT_FLAGS = new Set(['c', 'k', 'e', 'p', 'command', 'encodedcommand', 'ec', 'enc', 'eval', 'print', 'exec', 'cwa', 'commandwithargs'])
-const SHORT_OPTION_CLUSTER = /^-[a-z]{1,8}$/
+const SHELL_INTERPRETERS = new Set([
+  'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh',
+  'cmd', 'powershell', 'pwsh',
+  'python', 'python2', 'python3', 'py', 'pythonw',
+  'node', 'deno', 'bun', 'perl', 'ruby', 'php', 'lua', 'tclsh',
+  'osascript', 'wscript', 'cscript', 'mshta',
+  'awk', 'gawk', 'mawk', 'sed',
+  'ssh', 'wsl', 'env', 'xargs', 'busybox', 'rscript',
+])
+const PYTHON_VERSIONED = /^python[0-9][0-9.]*w?$/
+// Program files Windows hands to an interpreter.
+const SCRIPT_EXTENSIONS = ['.bat', '.cmd', '.ps1', '.vbs', '.js', '.wsf', '.hta']
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
 const PLACEHOLDER = /\{args\}|\{out\}/
 
-function interpreterName(el: string): string {
+function isInterpreter(el: string): boolean {
   const base = el
     .slice(Math.max(el.lastIndexOf('/'), el.lastIndexOf('\\')) + 1)
     .toLowerCase()
-    .replace(/\.exe$/, '')
-  if (!SHELL_INTERPRETER.test(base)) return ''
-  return base.startsWith('python') ? 'python' : base
+    .replace(/\.(exe|com)$/, '')
+  return SHELL_INTERPRETERS.has(base) || PYTHON_VERSIONED.test(base)
 }
 
-// Whether el makes the interpreter read the next argument as code (-c, -Command, -e, /c, -lc, ...).
-function isScriptFlag(interpreter: string, el: string): boolean {
-  const lower = el.toLowerCase()
-  if (!lower.startsWith('-') && !lower.startsWith('/')) return false
-  const name = lower.replace(/^[-/]+/, '')
-  if (SCRIPT_FLAGS.has(name)) return true
-  if (interpreter === 'powershell' || interpreter === 'pwsh') {
-    return name !== '' && ['command', 'encodedcommand', 'commandwithargs'].some(flag => flag.startsWith(name))
-  }
-  return SHORT_OPTION_CLUSTER.test(lower) && /[cep]/.test(name)
-}
-
-// Whether a shell definition could hand {args} or {out} to an interpreter as script text, runs a
-// .bat or .cmd (cmd parses those), or puts a placeholder where only a whole value may go.
+// Whether a shell definition could hand {args} or {out} to an interpreter. An interpreter picks its
+// script from its arguments (powershell's first bare argument is -Command; sh, python or node run
+// the file their first argument names), so once one appears, as the program or behind a wrapper,
+// no placeholder may follow: env (AGENTBUS_*) is the only way in. A script file as the program is
+// refused, and so is a placeholder that isn't a whole element or value.
 export function unsafeShellCommand(argv: readonly string[], env: Record<string, string> | undefined): boolean {
-  const program = (argv[0] ?? '').toLowerCase()
-  if (!program.trim() || program.endsWith('.bat') || program.endsWith('.cmd') || PLACEHOLDER.test(program)) return true
-  let interpreter = ''
-  let script = false
+  const program = (argv[0] ?? '').trim().toLowerCase()
+  if (!program || SCRIPT_EXTENSIONS.some(ext => program.endsWith(ext)) || PLACEHOLDER.test(program)) return true
+  let interpreter = false
   for (const el of argv) {
     if (el === '{args}' || el === '{out}') {
-      if (script) return true
+      if (interpreter) return true
       continue
     }
     if (PLACEHOLDER.test(el)) return true
-    if (!interpreter) {
-      interpreter = interpreterName(el)
-      // cmd treats everything after it as a command line.
-      script = interpreter === 'cmd'
-      continue
-    }
-    script = script || isScriptFlag(interpreter, el)
+    interpreter = interpreter || isInterpreter(el)
   }
   for (const [name, value] of Object.entries(env ?? {})) {
     if (!ENV_NAME.test(name)) return true
