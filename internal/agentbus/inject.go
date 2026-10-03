@@ -184,7 +184,7 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 			fmt.Fprintf(&b, "Inbox: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/inbox?session=%s\"\n", auth, sid)
 			fmt.Fprintf(&b, "Name:  curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/name\" -d '{\"session\":\"%s\",\"name\":\"<name>\"}'\n", auth, sid)
 			b.WriteString("Messages to you arrive in your next request. Only message peers when it helps the user's work.\n")
-			b.WriteString("This machine isn't set up for the homelab yet (the agentbus plugin isn't loaded in this session). Mention it to the user and offer to follow the setup runbook, new-machine.md in the private repo catapultam/homelab-notes (gh repo clone catapultam/homelab-notes); it covers the proxy settings, agentbus, the status line and the rest of the configuration.\n")
+			b.WriteString("This machine isn't configured for the homelab yet (the agentbus plugin isn't loaded in this session). Mention it to the user and offer to follow the new-machine runbook, new-machine.md in the private repo catapultam/homelab-notes (gh repo clone catapultam/homelab-notes); it covers the proxy settings, agentbus, the status line and the rest of the configuration.\n")
 			fmt.Fprintf(&b, "For agentbus alone, the user can install it with: claude plugin marketplace add %s/plugins/marketplace.json and claude plugin install agentbus@homelab\n", base)
 		}
 	}
