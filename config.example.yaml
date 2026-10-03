@@ -1205,6 +1205,11 @@ plugins:
 # "home" is where sessions' threads open: "channel" (the default) or "dm",
 # the first allowed-emails user's DM with the bot. With "dm", channel is
 # optional. Owners can move one agent's thread with "!channel" or "!dm".
+# Owners run commands on an agent with "!name args": any Claude Code slash
+# command, or one from the registry, one <name>.yaml per command in
+# agent-commands/ in the state directory (WRITABLE_PATH, else next to this
+# file, beside slack-state.json). The registry is re-read live; see
+# docs/agent-commands/ for the format and a !screenshot command.
 # slack:
 #   bot-token: "xoxb-..."
 #   app-token: "xapp-..."

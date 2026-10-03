@@ -242,7 +242,7 @@ test('session.end with clear says bye, then the next tick follows the session to
   calls.length = 0
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.4' })
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.5' })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
@@ -259,11 +259,11 @@ test('both hellos and every wait carry the mod version', async ($, on) => {
 
   const hellos = calls.filter(c => c.url.endsWith('/hello'))
   expect(hellos.length).toBe(2)
-  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.4' })
-  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.4' })
+  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.5' })
+  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.5' })
   const waits = calls.filter(c => c.url.includes('/wait?'))
   expect(waits.length).toBeGreaterThan(0)
-  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.4')
+  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.5')
 })
 
 test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {

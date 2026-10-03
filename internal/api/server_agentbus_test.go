@@ -37,3 +37,17 @@ func TestAgentbusStateSavedNextToConfig(t *testing.T) {
 		t.Fatalf("state path = %q, want %q", got, want)
 	}
 }
+
+func TestSlackConfigReadsCommandsNextToState(t *testing.T) {
+	t.Setenv("WRITABLE_PATH", "")
+	s := newTestServer(t)
+	t.Cleanup(s.stopAgentbus)
+	cfg := s.slackConfig()
+	want := filepath.Join(filepath.Dir(s.configFilePath), "agent-commands")
+	if cfg.CommandsDir != want {
+		t.Fatalf("CommandsDir = %q, want %q", cfg.CommandsDir, want)
+	}
+	if want = s.runtimeStatePath("slack-state.json"); cfg.StatePath != want {
+		t.Fatalf("StatePath = %q, want %q", cfg.StatePath, want)
+	}
+}

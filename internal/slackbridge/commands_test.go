@@ -841,3 +841,127 @@ func TestRegistryShellParityCases(t *testing.T) {
 		}
 	}
 }
+
+// cmd expands %VAR% (and !VAR! with delayed expansion) before it parses the
+// line, so an AGENTBUS_* reference in a cmd argv would run Slack text as
+// cmd syntax. Once any element is cmd, no element may name one that way.
+func TestRegistryRefusesCmdExpandedAgentbusVariables(t *testing.T) {
+	const free = "env:\n  AGENTBUS_ARGS: \"{args}\"\nargs_pattern: \"[a-z ]+\"\n"
+	for name, content := range map[string]string{
+		"percent":   "kind: shell\nargv:\n  windows: [cmd, /c, 'tool.exe %AGENTBUS_ARGS%']\n" + free,
+		"lowercase": "kind: shell\nargv:\n  windows: [cmd.exe, /c, 'tool.exe %agentbus_args%']\n" + free,
+		"delayed":   "kind: shell\nargv:\n  windows: ['C:\\Windows\\System32\\CMD.EXE.', /v:on, /c, 'tool.exe !AGENTBUS_ARGS!']\n" + free,
+		"substring": "kind: shell\nargv:\n  windows: [cmd, /c, 'echo %AGENTBUS_ARGS:~0,5%']\n" + free,
+		"cmdlater":  "kind: shell\nargv:\n  windows: [tool.exe, '%AGENTBUS_OUT%', cmd]\nenv:\n  AGENTBUS_OUT: \"{out}\"\noutput: image\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeCommand(t, dir, name+".yaml", content, mtime0)
+			e, ok := newRegistry(dir).lookup(name)
+			if !ok || e.err == nil {
+				t.Fatalf("%s loaded: %+v", content, e.spec)
+			}
+			if !strings.Contains(e.err.Error(), "cmd expands") {
+				t.Fatalf("err = %v", e.err)
+			}
+		})
+	}
+	dir := t.TempDir()
+	// cmd that leaves the variable to the program, and a %AGENTBUS_...% that
+	// no cmd expands, are fine.
+	writeCommand(t, dir, "cmdtool.yaml", "kind: shell\nargv:\n  windows: [cmd, /c, tool.exe]\n"+free, mtime0)
+	writeCommand(t, dir, "literal.yaml", "kind: shell\nargv:\n  windows: [tool.exe, '--fmt=%AGENTBUS_ARGS%']\n"+free, mtime0)
+	r := newRegistry(dir)
+	for _, name := range []string{"cmdtool", "literal"} {
+		if e, ok := r.lookup(name); !ok || e.err != nil {
+			t.Fatalf("%s = %+v %v", name, e, ok)
+		}
+	}
+}
+
+// The shipped registry examples in docs/agent-commands load, and the
+// screenshot command's windows argv is a parity table accept case, so the
+// mod's tests run the same definition.
+func TestShippedAgentCommandsLoad(t *testing.T) {
+	r := newRegistry(filepath.Join("..", "..", "docs", "agent-commands"))
+	entries := r.list()
+	if len(entries) == 0 {
+		t.Fatal("docs/agent-commands has no commands")
+	}
+	for _, e := range entries {
+		if e.err != nil {
+			t.Errorf("%s: %v", e.name, e.err)
+		}
+	}
+	e, ok := r.lookup("screenshot")
+	if !ok || e.err != nil {
+		t.Fatalf("screenshot = %+v %v", e, ok)
+	}
+	s := e.spec
+	if s.Kind != agentbus.CommandShell || s.Output != "image" || s.Timeout != 30 {
+		t.Fatalf("screenshot = %+v", s)
+	}
+	if want := map[string]string{"AGENTBUS_OUT": "{out}"}; !reflect.DeepEqual(s.Env, want) {
+		t.Fatalf("env = %v, want %v", s.Env, want)
+	}
+	if got := s.Argv["darwin"]; !reflect.DeepEqual(got, []string{"screencapture", "-x", "{out}"}) {
+		t.Fatalf("darwin = %q", got)
+	}
+	linux := s.Argv["linux"]
+	if len(linux) != 3 || linux[0] != "sh" || linux[1] != "-c" || strings.Contains(linux[2], "{") {
+		t.Fatalf("linux = %q", linux)
+	}
+	win := s.Argv["windows"]
+	if len(win) != 7 || !reflect.DeepEqual(win[:6], []string{"powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"}) {
+		t.Fatalf("windows = %q", win)
+	}
+	if !strings.Contains(win[6], "$env:AGENTBUS_OUT") || strings.Contains(win[6], `"`) {
+		t.Fatal("the windows script must read $env:AGENTBUS_OUT and hold no double quote")
+	}
+	for _, c := range loadShellCases(t) {
+		if c.Name != "docs/agent-commands/screenshot.yaml (windows)" {
+			continue
+		}
+		if !c.OK || !reflect.DeepEqual(c.Argv, win) || !reflect.DeepEqual(c.Env, s.Env) || c.Output != "image" {
+			t.Fatal("the parity case differs from docs/agent-commands/screenshot.yaml")
+		}
+		return
+	}
+	t.Fatal("shell-cases.ts lacks the docs/agent-commands/screenshot.yaml (windows) case")
+}
+
+// Every example in docs/agent-commands/README.md (a yaml block whose first
+// line is "# <name>.yaml...") loads.
+func TestAgentCommandsReadmeExamplesLoad(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", "docs", "agent-commands", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	var names []string
+	for _, block := range strings.Split(string(src), "```yaml\n")[1:] {
+		body, _, _ := strings.Cut(block, "```")
+		file, _, _ := strings.Cut(strings.TrimPrefix(body, "# "), ":")
+		name, ok := strings.CutSuffix(file, ".yaml")
+		if !ok {
+			t.Fatalf("example without a # <name>.yaml line: %q", body)
+		}
+		writeCommand(t, dir, file, body, mtime0)
+		names = append(names, name)
+	}
+	if len(names) < 4 {
+		t.Fatalf("examples = %v", names)
+	}
+	kinds := map[string]bool{}
+	r := newRegistry(dir)
+	for _, name := range names {
+		e, ok := r.lookup(name)
+		if !ok || e.err != nil {
+			t.Fatalf("%s = %+v %v", name, e, ok)
+		}
+		kinds[e.spec.Kind] = true
+	}
+	if len(kinds) != 3 {
+		t.Fatalf("kinds = %v, want slash, prompt and shell", kinds)
+	}
+}

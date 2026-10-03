@@ -1,0 +1,106 @@
+# !screenshot: a picture of the agent's terminal, posted to its thread.
+# Copy this file to <state dir>/agent-commands/ on the proxy host. The agent's
+# machine must opt in to shell commands with AGENTBUS_ALLOW_SHELL=1.
+#
+# The temp path ({out}) reaches every script through AGENTBUS_OUT, never as
+# an argument: an interpreter (powershell, sh) must not get a placeholder.
+#
+# Windows: the script walks up from its parent process (Claude Code) to the
+# first ancestor with a main window (the terminal: Windows Terminal, conhost,
+# VS Code) and captures that window with PrintWindow (PW_RENDERFULLCONTENT),
+# so it works when the window is covered. With no such window, or one that is
+# minimized, it captures the primary screen. The PNG is scaled down until it
+# is under 3.5 MiB (the mod reads at most 4 MiB), with JPEG quality 85 as the
+# last resort. The script holds no double quote (it builds the one C# needs
+# from [char]34) and no # comment, so Windows command-line quoting can't
+# change it.
+#
+# macOS: screencapture of the whole screen. A large Retina screen can exceed
+# the mod's 4 MiB read limit, which fails as "could not read the image".
+#
+# Linux: the first of gnome-screenshot, grim (Wayland) and ImageMagick's
+# import that works.
+description: Screenshot of the agent's terminal window (or the screen)
+kind: shell
+output: image
+timeout_seconds: 30
+env:
+  AGENTBUS_OUT: "{out}"
+argv:
+  windows:
+    - powershell
+    - -NoProfile
+    - -NonInteractive
+    - -ExecutionPolicy
+    - Bypass
+    - -Command
+    - |
+      $ErrorActionPreference = 'Stop'
+      $q = [string][char]34
+      $u = '[DllImport(' + $q + 'user32.dll' + $q + ')] public static extern '
+      Add-Type -Namespace AgentbusShot -Name User32 -MemberDefinition ('[StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; } ' + $u + 'bool SetProcessDPIAware(); ' + $u + 'bool IsIconic(IntPtr hWnd); ' + $u + 'bool GetWindowRect(IntPtr hWnd, out RECT rect); ' + $u + 'bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);')
+      Add-Type -AssemblyName System.Drawing, System.Windows.Forms
+      [void][AgentbusShot.User32]::SetProcessDPIAware()
+      $bmp = $null
+      try {
+        $child = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID)
+        for ($i = 0; $i -lt 32 -and $child -and $child.ParentProcessId -gt 0; $i++) {
+          $parent = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $child.ParentProcessId)
+          if (-not $parent -or -not $parent.CreationDate -or $parent.CreationDate -gt $child.CreationDate) { break }
+          $child = $parent
+          $proc = Get-Process -Id $parent.ProcessId -ErrorAction SilentlyContinue
+          if (-not $proc -or $proc.MainWindowHandle -eq [IntPtr]::Zero) { continue }
+          $hwnd = $proc.MainWindowHandle
+          $rect = New-Object AgentbusShot.User32+RECT
+          if ([AgentbusShot.User32]::IsIconic($hwnd) -or -not [AgentbusShot.User32]::GetWindowRect($hwnd, [ref]$rect)) { break }
+          $w = $rect.Right - $rect.Left
+          $h = $rect.Bottom - $rect.Top
+          if ($w -le 0 -or $h -le 0) { break }
+          $bmp = New-Object System.Drawing.Bitmap $w, $h
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $dc = $g.GetHdc()
+          $ok = [AgentbusShot.User32]::PrintWindow($hwnd, $dc, 2)
+          $g.ReleaseHdc($dc)
+          $g.Dispose()
+          if (-not $ok) { $bmp.Dispose(); $bmp = $null }
+          break
+        }
+      } catch {
+        $bmp = $null
+      }
+      if (-not $bmp) {
+        $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+        $g.Dispose()
+      }
+      $max = 3670016
+      $img = $bmp
+      $ms = New-Object System.IO.MemoryStream
+      $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+      while ($ms.Length -gt $max -and $img.Width -gt 640) {
+        $nw = [int]($img.Width * 0.75)
+        $nh = [Math]::Max(1, [int]($img.Height * 0.75))
+        $small = New-Object System.Drawing.Bitmap $nw, $nh
+        $g = [System.Drawing.Graphics]::FromImage($small)
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.DrawImage($img, 0, 0, $nw, $nh)
+        $g.Dispose()
+        $img = $small
+        $ms = New-Object System.IO.MemoryStream
+        $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+      }
+      if ($ms.Length -gt $max) {
+        $jpeg = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+        $params = New-Object System.Drawing.Imaging.EncoderParameters 1
+        $params.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality, [long]85)
+        $ms = New-Object System.IO.MemoryStream
+        $img.Save($ms, $jpeg, $params)
+      }
+      [System.IO.File]::WriteAllBytes($env:AGENTBUS_OUT, $ms.ToArray())
+  darwin: [screencapture, -x, "{out}"]
+  linux:
+    - sh
+    - -c
+    - 'gnome-screenshot -f "$AGENTBUS_OUT" || grim "$AGENTBUS_OUT" || import -window root "$AGENTBUS_OUT"'

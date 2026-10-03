@@ -323,7 +323,10 @@ env, xargs, busybox, sudo, su, doas, runas, watch, script, flock, nice,
 nohup, timeout, stdbuf, time, chroot, setsid, unbuffer, conhost, forfiles,
 rundll32, regsvr32, wt. A program whose normalized file name ends in `.bat`,
 `.cmd`, `.ps1`, `.vbs`, `.js`, `.wsf` or `.hta` is refused (`run.bat.`
-included). `tests/shell-cases.ts` in the mod is a table both sides' tests
+included). When any argv element is `cmd` (by the same name comparison),
+no element may contain `%AGENTBUS_` or `!AGENTBUS_` in any case, since cmd
+expands `%VAR%` (and `!VAR!` with delayed expansion) before it parses the
+line (Task 4; mod 0.3.5). `tests/shell-cases.ts` in the mod is a table both sides' tests
 run. The supported way to hand a value to a script is `env`, for example
 `[sh, -c, 'gnome-screenshot -f "$AGENTBUS_OUT"']` with
 `env: {AGENTBUS_OUT: "{out}"}`. A slash `args`
@@ -720,3 +723,36 @@ messages go to your own thread in Slack" (no channel).
   `homes[sid]` decides where a new thread opens if the session has none
   (for `dm`, the first owner's DM) and keeps a channel post from becoming a
   DM-homed agent's home thread.
+
+**Wiring, `!screenshot` and the registry docs (Task 4; mod 0.3.5).** The
+server sets `CommandsDir` to `agent-commands` under the runtime state
+directory (`WRITABLE_PATH`, else next to `config.yaml`); a missing
+directory means no registry commands. `docs/agent-commands/README.md` is
+the format reference: one example of each kind, and how a script reads
+`AGENTBUS_*` safely (sh `"$AGENTBUS_ARGS"` quoted; PowerShell
+`$env:AGENTBUS_ARGS` as a cmdlet argument, never `Invoke-Expression`; cmd
+never, which the loader enforces). `docs/agent-commands/screenshot.yaml` is
+the shipped `!screenshot` (`kind: shell`, `output: image`,
+`timeout_seconds: 30`, `env: {AGENTBUS_OUT: "{out}"}`), installed by copying
+it into the state directory:
+
+- `windows`: `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass
+  -Command <script>`. The inline script calls `SetProcessDPIAware`, walks up
+  from its parent process (at most 32 steps, stopping at a parent newer than
+  its child, which is a reused PID) to the first ancestor with a
+  `MainWindowHandle`, and captures it with `PrintWindow(…,
+  PW_RENDERFULLCONTENT)`. A minimized window, no window, or any failure falls
+  back to `CopyFromScreen` of the primary screen. The PNG is scaled by 0.75
+  until it is at most 3.5 MiB (or 640 pixels wide), then JPEG quality 85 as
+  the last resort, and written to `$env:AGENTBUS_OUT`. The script holds no
+  double quote and no `#` comment, so Windows command-line quoting can't
+  change it.
+- `darwin`: `screencapture -x {out}`. A large Retina capture can exceed the
+  mod's 4 MiB read; resizing needs a second command, which the format can't
+  express.
+- `linux`: `sh -c 'gnome-screenshot -f "$AGENTBUS_OUT" || grim
+  "$AGENTBUS_OUT" || import -window root "$AGENTBUS_OUT"'`.
+
+Its `windows` argv is a `tests/shell-cases.ts` accept case, and a Go test
+checks that the case equals the file and that every file and README example
+in `docs/agent-commands/` loads.

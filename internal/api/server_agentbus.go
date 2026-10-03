@@ -48,21 +48,30 @@ func (s *Server) initAgentbus() {
 	s.initSlack()
 }
 
-// initSlack starts the Slack bridge when config.yaml has a complete slack
-// block. Changing the block needs a restart.
-func (s *Server) initSlack() {
-	if s.cfg == nil {
-		return
-	}
+// slackConfig is the bridge's config: the slack block, with the bridge's
+// state and the agent command registry (agent-commands/, re-read live; a
+// missing directory means no registry commands) next to the other runtime
+// state.
+func (s *Server) slackConfig() slackbridge.Config {
 	sc := s.cfg.Slack
-	bridge, errNew := slackbridge.New(slackbridge.Config{
+	return slackbridge.Config{
 		BotToken:      sc.BotToken,
 		AppToken:      sc.AppToken,
 		Channel:       sc.Channel,
 		AllowedEmails: sc.AllowedEmails,
 		Home:          sc.Home,
 		StatePath:     s.runtimeStatePath("slack-state.json"),
-	}, s.agentbus)
+		CommandsDir:   s.runtimeStatePath("agent-commands"),
+	}
+}
+
+// initSlack starts the Slack bridge when config.yaml has a complete slack
+// block. Changing the block needs a restart.
+func (s *Server) initSlack() {
+	if s.cfg == nil {
+		return
+	}
+	bridge, errNew := slackbridge.New(s.slackConfig(), s.agentbus)
 	if errNew != nil {
 		log.Warnf("slack: %v", errNew)
 		return

@@ -51,7 +51,7 @@ func TestBuildDocShape(t *testing.T) {
 	if p.Source.Source != "archive" {
 		t.Fatalf("source.source = %q", p.Source.Source)
 	}
-	wantURL := "https://cakebox:8317/plugins/agentbus-0.3.4.zip"
+	wantURL := "https://cakebox:8317/plugins/agentbus-0.3.5.zip"
 	if p.Source.URL != wantURL {
 		t.Fatalf("source.url = %q, want %q", p.Source.URL, wantURL)
 	}

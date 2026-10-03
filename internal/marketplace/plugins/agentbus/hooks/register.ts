@@ -4,7 +4,7 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.3.4'
+export const VERSION = '0.3.5'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
@@ -283,6 +283,9 @@ const SHELL_INTERPRETERS = new Set([
 const SCRIPT_EXTENSIONS = ['.bat', '.cmd', '.ps1', '.vbs', '.js', '.wsf', '.hta']
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
 const PLACEHOLDER = /\{args\}|\{out\}/
+// An AGENTBUS_* variable as cmd expands it (%VAR%, or !VAR! with delayed expansion; any case),
+// before it parses the line.
+const CMD_EXPANDED_VAR = /[%!]AGENTBUS_/i
 
 // el's file name as Windows runs it: the base name, trailing dots and spaces dropped (Win32 ignores
 // them), lowercased, and any .exe or .com suffixes removed (python.com.exe is python).
@@ -312,7 +315,8 @@ function isInterpreter(el: string): boolean {
 // - once an interpreter or wrapper appears, as the program or later, no placeholder may follow it,
 //   since an interpreter picks its script from its arguments;
 // - a script file as the program (.bat, .ps1, ...) runs through an interpreter;
-// - a placeholder must be a whole element or env value, and only AGENTBUS_* variables take one.
+// - a placeholder must be a whole element or env value, and only AGENTBUS_* variables take one;
+// - when cmd is in argv, no element may name an AGENTBUS_* variable as %VAR% or !VAR!.
 export function unsafeShellCommand(
   argv: readonly string[],
   env: Record<string, string> | undefined,
@@ -332,6 +336,7 @@ export function unsafeShellCommand(
     if (PLACEHOLDER.test(el)) return true
     interpreter = interpreter || isInterpreter(el)
   }
+  if (argv.some(el => programBase(el) === 'cmd') && argv.some(el => CMD_EXPANDED_VAR.test(el))) return true
   for (const [name, value] of Object.entries(env ?? {})) {
     if (!ENV_NAME.test(name)) return true
     if (value === '{args}' || value === '{out}') {
