@@ -60,13 +60,14 @@ func newTestHandlerBase(t *testing.T, clock mgmtauth.Clock) *Handler {
 	t.Helper()
 	path := writeTestConfigFile(t)
 	return &Handler{
-		cfg:               &config.Config{},
-		configFilePath:    path,
-		failedAttempts:    make(map[string]*attemptInfo),
-		loginStore:        mgmtauth.NewStore(path),
-		loginThrottle:     mgmtauth.NewThrottle(clock),
-		passkeyCeremonies: mgmtauth.NewCeremonyCache(clock),
-		clock:             clock,
+		cfg:                    &config.Config{},
+		configFilePath:         path,
+		failedAttempts:         make(map[string]*attemptInfo),
+		loginStore:             mgmtauth.NewStore(path, ""),
+		loginThrottle:          mgmtauth.NewThrottle(clock),
+		loginCeremonies:        mgmtauth.NewCeremonyCache(clock),
+		registrationCeremonies: mgmtauth.NewCeremonyCache(clock),
+		clock:                  clock,
 	}
 }
 
@@ -551,31 +552,35 @@ func TestKeyAuthStillReachesV0AndV8Routes(t *testing.T) {
 	}
 }
 
-// TestSessionReachesV0Route proves a session bypasses allow-remote for a
-// genuinely remote (non-loopback) client, not merely a loopback request
-// that would pass other checks for unrelated reasons.
-func TestSessionReachesV0Route(t *testing.T) {
+// TestSessionObeysAllowRemote covers S9: a session no longer bypasses the
+// local-or-allow-remote predicate. A genuinely remote (non-loopback) client
+// holding a valid session is rejected unless allow-remote (or the
+// MANAGEMENT_PASSWORD override) is in effect.
+func TestSessionObeysAllowRemote(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
 	engine := newTestEngine(h)
 
 	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
 	cookieHeader, _ := sessionCookieFrom(loginRec)
-
+	headers := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
 	const remoteAddr = "203.0.113.5:54321"
 
-	// Sanity check: without a session, this remote, key-less client is
-	// rejected (no allow-remote override, no key configured).
-	sanity := doRequestFrom(engine, http.MethodGet, "/v0/management/config", "", nil, remoteAddr)
-	if sanity.Code == http.StatusOK {
-		t.Fatal("expected a remote request with no credential to be rejected")
+	rec := doRequestFrom(engine, http.MethodGet, "/v0/management/config", "", headers, remoteAddr)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("remote session without allow-remote: status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
 
-	rec := doRequestFrom(engine, http.MethodGet, "/v0/management/config", "", map[string]string{
-		"Cookie":         cookieHeader,
-		"Sec-Fetch-Site": "same-origin",
-	}, remoteAddr)
+	h.allowRemoteOverride = true
+	rec = doRequestFrom(engine, http.MethodGet, "/v0/management/config", "", headers, remoteAddr)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("remote session with allow-remote: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// A local client's session works regardless.
+	h.allowRemoteOverride = false
+	rec = doRequest(engine, http.MethodGet, "/v0/management/config", "", headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("local session: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

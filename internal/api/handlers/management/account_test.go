@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,11 @@ func putAccountBody(username, password, currentPassword string) string {
 		"password":         password,
 		"current_password": currentPassword,
 	})
+	return string(b)
+}
+
+func currentPasswordBody(currentPassword string) string {
+	b, _ := json.Marshal(map[string]string{"current_password": currentPassword})
 	return string(b)
 }
 
@@ -243,7 +249,7 @@ func TestPutAccountResponseKeepsPasskeyMethodLabel(t *testing.T) {
 	cookieHeader, _ := sessionCookieFrom(loginRec)
 	authedHeaders := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
 
-	beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", "", authedHeaders)
+	beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", currentPasswordBody(testAccountPassword), authedHeaders)
 	var beginResp struct {
 		CeremonyID string `json:"ceremony_id"`
 		Options    struct {
@@ -445,7 +451,7 @@ func TestPasskeyRegistrationAndLoginOverHTTP(t *testing.T) {
 	cookieHeader, _ := sessionCookieFrom(loginRec)
 	authedHeaders := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
 
-	beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", "", authedHeaders)
+	beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", currentPasswordBody(testAccountPassword), authedHeaders)
 	if beginRec.Code != http.StatusOK {
 		t.Fatalf("passkeys/begin status = %d, want 200; body=%s", beginRec.Code, beginRec.Body.String())
 	}
@@ -545,7 +551,7 @@ func TestPasskeyLoginRejectsOriginOutsidePasskeyOrigins(t *testing.T) {
 	cookieHeader, _ := sessionCookieFrom(loginRec)
 	authedHeaders := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
 
-	beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", "", authedHeaders)
+	beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", currentPasswordBody(testAccountPassword), authedHeaders)
 	var beginResp struct {
 		CeremonyID string `json:"ceremony_id"`
 		Options    struct {
@@ -626,8 +632,12 @@ func TestPasskeysAvailableOnlyCountsCurrentRPID(t *testing.T) {
 	}
 }
 
-// TestPasskeyCeremonyBeginReturns429WhenCacheFull covers the ceremony cap.
-func TestPasskeyCeremonyBeginReturns429WhenCacheFull(t *testing.T) {
+// TestPasskeyCeremonyBeginNeverRejectsAtCapacity covers the ceremony cap at
+// the HTTP layer: once MaxPendingCeremonies login ceremonies are
+// outstanding, begin still succeeds (evicting the oldest) rather than
+// returning 429 -- the eviction mechanics themselves are covered by
+// mgmtauth's own TestCeremonyCacheCapsPendingCeremoniesByEvictingOldest.
+func TestPasskeyCeremonyBeginNeverRejectsAtCapacity(t *testing.T) {
 	h := newAccountHandler(t, mgmtauth.SystemClock{})
 	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
 		acct.PasskeyRPID = "mgmt.example.com"
@@ -645,8 +655,182 @@ func TestPasskeyCeremonyBeginReturns429WhenCacheFull(t *testing.T) {
 		}
 	}
 	rec := doRequest(engine, http.MethodPost, "/v8/management/session/passkey/begin", "", nil)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("begin at capacity: status = %d, want 429; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("begin at capacity: status = %d, want 200 (evict-oldest, not reject); body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostAccountPasskeysBeginRequiresCurrentPasswordOverSession and
+// TestPutAccountPasskeySettingsRequiresCurrentPasswordOverSession cover S7:
+// both endpoints require the correct current_password over a session, and
+// not at all over the key.
+func TestPostAccountPasskeysBeginRequiresCurrentPasswordOverSession(t *testing.T) {
+	clock := newMockClock(time.Now())
+	h := newAccountHandler(t, clock)
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "mgmt.example.com"
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	cookieHeader, _ := sessionCookieFrom(loginRec)
+	headers := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
+
+	rec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", "", headers)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("missing current_password status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+	rec = doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", currentPasswordBody("wrong"), headers)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("wrong current_password status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+	clock.Advance(time.Minute) // clear the failure backoff window
+	rec = doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", currentPasswordBody(testAccountPassword), headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("correct current_password status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostAccountPasskeysBeginOverKeyDoesNotRequireCurrentPassword(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	h.envSecret = "test-secret"
+	h.allowRemoteOverride = true
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "mgmt.example.com"
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	engine := newTestEngine(h)
+
+	rec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", "", map[string]string{"X-Management-Key": "test-secret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPutAccountPasskeySettingsRequiresCurrentPasswordOverSession(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	cookieHeader, _ := sessionCookieFrom(loginRec)
+	headers := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
+
+	body, _ := json.Marshal(map[string]interface{}{"rp_id": "mgmt.example.com", "origins": []string{"https://mgmt.example.com"}})
+	rec := doRequest(engine, http.MethodPut, "/v8/management/account/passkey-settings", string(body), headers)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("missing current_password status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+
+	body, _ = json.Marshal(map[string]interface{}{"rp_id": "mgmt.example.com", "origins": []string{"https://mgmt.example.com"}, "current_password": testAccountPassword})
+	rec = doRequest(engine, http.MethodPut, "/v8/management/account/passkey-settings", string(body), headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("correct current_password status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPutAccountPasskeySettingsOverKeyDoesNotRequireCurrentPassword(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	h.envSecret = "test-secret"
+	h.allowRemoteOverride = true
+	engine := newTestEngine(h)
+
+	body, _ := json.Marshal(map[string]interface{}{"rp_id": "mgmt.example.com", "origins": []string{"https://mgmt.example.com"}})
+	rec := doRequest(engine, http.MethodPut, "/v8/management/account/passkey-settings", string(body), map[string]string{"X-Management-Key": "test-secret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostAccountPasskeysFinishRejectsDuplicateCredential covers N11.
+func TestPostAccountPasskeysFinishRejectsDuplicateCredential(t *testing.T) {
+	const rpID = "mgmt.example.com"
+	const origin = "https://mgmt.example.com"
+
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = rpID
+		acct.PasskeyOrigins = []string{origin}
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	cookieHeader, _ := sessionCookieFrom(loginRec)
+	authedHeaders := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
+
+	authenticator := newSoftAuthenticator(t, []byte("dup-credential"))
+
+	register := func() *httptest.ResponseRecorder {
+		beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", currentPasswordBody(testAccountPassword), authedHeaders)
+		var beginResp struct {
+			CeremonyID string `json:"ceremony_id"`
+			Options    struct {
+				PublicKey struct {
+					Challenge string `json:"challenge"`
+				} `json:"publicKey"`
+			} `json:"options"`
+		}
+		_ = json.Unmarshal(beginRec.Body.Bytes(), &beginResp)
+		regJSON := authenticator.registrationResponseJSON(t, rpID, origin, decodeB64URLForTest(t, beginResp.Options.PublicKey.Challenge))
+		finishBody, _ := json.Marshal(map[string]interface{}{
+			"ceremony_id": beginResp.CeremonyID,
+			"name":        "Dup Key",
+			"credential":  json.RawMessage(regJSON),
+		})
+		return doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/finish", string(finishBody), authedHeaders)
+	}
+
+	first := register()
+	if first.Code != http.StatusOK {
+		t.Fatalf("first registration status = %d, want 200; body=%s", first.Code, first.Body.String())
+	}
+	second := register()
+	if second.Code != http.StatusConflict {
+		t.Fatalf("duplicate registration status = %d, want 409; body=%s", second.Code, second.Body.String())
+	}
+}
+
+// TestPostAccountPasskeysFinishStatusCodes covers item A: ceremony/
+// verification failures on this authenticated route use 410/400, never
+// 401 (which the panel treats as "logged out").
+func TestPostAccountPasskeysFinishStatusCodes(t *testing.T) {
+	h := newAccountHandler(t, mgmtauth.SystemClock{})
+	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
+		acct.PasskeyRPID = "mgmt.example.com"
+		return acct, nil
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSON("admin", testAccountPassword), nil)
+	cookieHeader, _ := sessionCookieFrom(loginRec)
+	authedHeaders := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
+
+	// Unknown/expired ceremony -> 410, not 401.
+	body, _ := json.Marshal(map[string]interface{}{"ceremony_id": "does-not-exist", "name": "x", "credential": json.RawMessage(`{}`)})
+	rec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/finish", string(body), authedHeaders)
+	if rec.Code != http.StatusGone {
+		t.Fatalf("unknown ceremony status = %d, want 410; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// A real ceremony with garbage credential data -> 400, not 401.
+	beginRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/begin", currentPasswordBody(testAccountPassword), authedHeaders)
+	var beginResp struct {
+		CeremonyID string `json:"ceremony_id"`
+	}
+	_ = json.Unmarshal(beginRec.Body.Bytes(), &beginResp)
+	badBody, _ := json.Marshal(map[string]interface{}{"ceremony_id": beginResp.CeremonyID, "name": "x", "credential": json.RawMessage(`{"garbage":true}`)})
+	rec = doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/finish", string(badBody), authedHeaders)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed credential status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

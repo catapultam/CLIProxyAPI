@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -55,8 +56,9 @@ func passkeyView(p mgmtauth.PasskeyRecord) gin.H {
 }
 
 // mutationErrorResponse writes the appropriate status/body for a
-// Store.Mutate error: a *mgmtauth.MutationError carries its own status,
-// anything else is an unexpected internal failure (500).
+// Store.Mutate error: a *mgmtauth.MutationError carries its own status
+// (e.g. 404 "not found", 409 "changed concurrently", 503 "store
+// unavailable"), anything else is an unexpected internal failure (500).
 func mutationErrorResponse(c *gin.Context, err error) {
 	var mutErr *mgmtauth.MutationError
 	if errors.As(err, &mutErr) {
@@ -75,6 +77,46 @@ func resolvedSessionMethod(c *gin.Context) mgmtauth.Method {
 		return mgmtauth.MethodPasskey
 	}
 	return mgmtauth.MethodPassword
+}
+
+// bindOptionalJSON decodes body's JSON into dst, tolerating a completely
+// empty request body (treated as leaving dst at its zero value): callers
+// authenticated via the management key legitimately send no body at all to
+// endpoints that only need current_password over a session.
+func bindOptionalJSON(c *gin.Context, dst any) bool {
+	if err := c.ShouldBindJSON(dst); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return false
+	}
+	return true
+}
+
+// verifyCurrentPassword checks currentPassword against expectedHash through
+// the shared login throttle's single-flight admission, writing the
+// appropriate error response and returning false on any failure (missing
+// value, throttled, or wrong). The release is deferred with a success flag
+// set just before it, so a panic between Reserve and the deferred call can
+// never leak the throttle's slot.
+func (h *Handler) verifyCurrentPassword(c *gin.Context, expectedHash, currentPassword string) bool {
+	if currentPassword == "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "current_password is required"})
+		return false
+	}
+	release, ok, retryAfter := h.loginThrottle.Reserve()
+	if !ok {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many attempts", "retry_after": ceilSecondsAtLeastOne(retryAfter)})
+		return false
+	}
+	success := false
+	defer func() { release(success) }()
+
+	match, verifyErr := mgmtauth.VerifyPassword(expectedHash, currentPassword)
+	success = verifyErr == nil && match
+	if !success {
+		c.JSON(http.StatusForbidden, gin.H{"error": "current_password is incorrect"})
+		return false
+	}
+	return true
 }
 
 // GetAccount returns the current account configuration.
@@ -120,45 +162,51 @@ func (h *Handler) PutAccount(c *gin.Context) {
 		return
 	}
 
+	expectedCurrentHash := ""
+	if current != nil {
+		expectedCurrentHash = current.PasswordHash
+	}
 	authViaSession := c.GetString(AuthMethodContextKey) == AuthMethodSession
 	if !firstSetup && authViaSession {
-		if body.CurrentPassword == "" {
-			c.JSON(http.StatusForbidden, gin.H{"error": "current_password is required"})
-			return
-		}
 		// current_password verification goes through the same single-flight
 		// throttle as login, since a held session/key is not proof of the
 		// current password and must not let an attacker brute-force it.
-		release, ok, retryAfter := h.loginThrottle.Reserve()
-		if !ok {
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many attempts", "retry_after": ceilSecondsAtLeastOne(retryAfter)})
+		if !h.verifyCurrentPassword(c, expectedCurrentHash, body.CurrentPassword) {
 			return
 		}
-		match, verifyErr := mgmtauth.VerifyPassword(current.PasswordHash, body.CurrentPassword)
-		success := verifyErr == nil && match
-		release(success)
-		if !success {
-			c.JSON(http.StatusForbidden, gin.H{"error": "current_password is incorrect"})
+	}
+
+	// N1: the new password is hashed here, before Mutate, so the slow
+	// argon2 call never runs while Store.mu is held.
+	passwordChanging := body.Password != ""
+	var newHash string
+	if passwordChanging {
+		hashed, errHash := mgmtauth.HashPassword(body.Password)
+		if errHash != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errHash.Error()})
 			return
 		}
+		newHash = hashed
 	}
 
 	next, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
 		out := acct
 		stillFirstSetup := !mgmtauth.HasAccount(out)
+		if !stillFirstSetup && authViaSession {
+			// N2: current_password was checked against a snapshot taken
+			// before this Mutate call; re-check it is still the current
+			// value, so a concurrent password change cannot be silently
+			// overwritten by a request authorized against a stale hash.
+			if out.PasswordHash != expectedCurrentHash {
+				return nil, &mgmtauth.MutationError{Status: http.StatusConflict, Message: "account changed concurrently; retry"}
+			}
+		}
 		if out == nil {
 			out = &mgmtauth.Account{}
 		}
 		out.Username = username
-
-		passwordChanged := false
-		if body.Password != "" {
-			hashed, errHash := mgmtauth.HashPassword(body.Password)
-			if errHash != nil {
-				return nil, errHash
-			}
-			out.PasswordHash = hashed
-			passwordChanged = true
+		if passwordChanging {
+			out.PasswordHash = newHash
 		}
 
 		if stillFirstSetup {
@@ -172,7 +220,7 @@ func (h *Handler) PutAccount(c *gin.Context) {
 				return nil, errGen2
 			}
 			out.UserHandle = handle
-		} else if passwordChanged {
+		} else if passwordChanging {
 			// A password change invalidates every existing session.
 			secret, errGen := generateAccountSecret()
 			if errGen != nil {
@@ -196,15 +244,30 @@ func (h *Handler) PutAccount(c *gin.Context) {
 }
 
 // PutAccountPasskeySettings updates the WebAuthn relying party id/origins.
+// Over a session, current_password is required (S7); over the key it is
+// not.
 func (h *Handler) PutAccountPasskeySettings(c *gin.Context) {
 	var body struct {
-		RPID    string   `json:"rp_id"`
-		Origins []string `json:"origins"`
+		RPID            string   `json:"rp_id"`
+		Origins         []string `json:"origins"`
+		CurrentPassword string   `json:"current_password"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+
+	if c.GetString(AuthMethodContextKey) == AuthMethodSession {
+		current := h.loginStore.Get()
+		expectedHash := ""
+		if current != nil {
+			expectedHash = current.PasswordHash
+		}
+		if !h.verifyCurrentPassword(c, expectedHash, body.CurrentPassword) {
+			return
+		}
+	}
+
 	next, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
 		out := acct
 		if out == nil {
@@ -222,12 +285,27 @@ func (h *Handler) PutAccountPasskeySettings(c *gin.Context) {
 }
 
 // PostAccountPasskeysBegin starts a ceremony to register a new passkey.
+// Over a session, current_password is required (S7, body {"current_password"});
+// over the key it is not, and the body may be omitted entirely.
 func (h *Handler) PostAccountPasskeysBegin(c *gin.Context) {
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+	}
+	if !bindOptionalJSON(c, &body) {
+		return
+	}
+
 	account := h.loginStore.Get()
 	if account == nil || account.PasskeyRPID == "" || !mgmtauth.HasAccount(account) {
 		c.JSON(http.StatusConflict, gin.H{"error": "passkeys are not configured"})
 		return
 	}
+	if c.GetString(AuthMethodContextKey) == AuthMethodSession {
+		if !h.verifyCurrentPassword(c, account.PasswordHash, body.CurrentPassword) {
+			return
+		}
+	}
+
 	w, err := buildWebAuthn(account)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -243,12 +321,8 @@ func (h *Handler) PostAccountPasskeysBegin(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	ceremonyID, err := h.passkeyCeremonies.Begin(*session)
+	ceremonyID, err := h.registrationCeremonies.Begin(*session)
 	if err != nil {
-		if errors.Is(err, mgmtauth.ErrTooManyCeremonies) {
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
-			return
-		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -257,6 +331,10 @@ func (h *Handler) PostAccountPasskeysBegin(c *gin.Context) {
 
 // PostAccountPasskeysFinish completes a passkey registration ceremony and
 // persists the new credential, tagged with the account's current rp-id.
+//
+// This is an authenticated route: per the panel's "every 401 means logged
+// out" convention, ceremony/verification failures here use 410 and 400
+// rather than 401, which stays reserved for "not authenticated".
 func (h *Handler) PostAccountPasskeysFinish(c *gin.Context) {
 	var body struct {
 		CeremonyID string          `json:"ceremony_id"`
@@ -268,9 +346,9 @@ func (h *Handler) PostAccountPasskeysFinish(c *gin.Context) {
 		return
 	}
 
-	session, ok := h.passkeyCeremonies.Take(body.CeremonyID)
+	session, ok := h.registrationCeremonies.Take(body.CeremonyID)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "ceremony expired or already used"})
+		c.JSON(http.StatusGone, gin.H{"error": "ceremony expired or already used"})
 		return
 	}
 
@@ -287,7 +365,7 @@ func (h *Handler) PostAccountPasskeysFinish(c *gin.Context) {
 	}
 	cred, err := mgmtauth.FinishAddPasskey(w, user, session, body.Credential)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "passkey registration failed"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "passkey registration failed"})
 		return
 	}
 	rpID := account.PasskeyRPID
@@ -296,6 +374,14 @@ func (h *Handler) PostAccountPasskeysFinish(c *gin.Context) {
 	if _, err := h.loginStore.Mutate(func(acct *mgmtauth.Account) (*mgmtauth.Account, error) {
 		if acct == nil {
 			return nil, &mgmtauth.MutationError{Status: http.StatusConflict, Message: "no account configured"}
+		}
+		for _, existing := range acct.Passkeys {
+			if existing.ID == stored.ID {
+				// N11: a duplicate credential ID (the same physical key
+				// registered twice) must be rejected, not silently
+				// duplicated in the store.
+				return nil, &mgmtauth.MutationError{Status: http.StatusConflict, Message: "passkey already registered"}
+			}
 		}
 		acct.Passkeys = append(acct.Passkeys, stored)
 		return acct, nil
@@ -385,6 +471,10 @@ func (h *Handler) PostAccountSignOutAll(c *gin.Context) {
 		mutationErrorResponse(c, err)
 		return
 	}
+	// N4: this issues no new token, so any refresh header a prior
+	// Middleware() step attached (signed with the secret just rotated away)
+	// must not ride along either.
+	c.Header("X-CPA-Session-Refresh", "")
 	h.clearSessionCookie(c, effectivePasskeyOrigins(next))
 	c.Status(http.StatusNoContent)
 }

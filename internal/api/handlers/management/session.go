@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/mgmtauth"
+	log "github.com/sirupsen/logrus"
 )
 
 // SessionCookieName is the HttpOnly cookie carrying a signed session token
@@ -67,33 +68,43 @@ const (
 
 // tryAuthenticateSession implements the first step of Middleware(): verify a
 // cpa_mgmt_session cookie and/or an Authorization: Bearer cpas_... token
-// (accepting whichever one is valid when both are present), apply the CSRF
-// guard for cookie-authenticated requests, and slide the session forward
-// when it is past its halfway point.
+// (accepting whichever one is valid when both are present -- the bearer is
+// tried first, so a cookie that fails the CSRF guard can never block an
+// otherwise-valid bearer), apply the CSRF guard for cookie-authenticated
+// requests, and slide the session forward when it is past its halfway
+// point. When every presented credential fails and a cookie was among
+// them, the cookie is cleared in the response: a cpas_ cookie the browser
+// is still holding is, by definition, no longer any good.
 func (h *Handler) tryAuthenticateSession(c *gin.Context) sessionAuthStatus {
 	if h == nil {
 		return sessionAuthNone
 	}
+
+	cookieToken, hasCookie := sessionCookieToken(c)
+	bearerToken, hasBearer := sessionBearerToken(c)
+	if !hasCookie && !hasBearer {
+		return sessionAuthNone
+	}
+
+	account := h.loginStore.Get()
+	origins := effectivePasskeyOrigins(account)
+	var secret []byte
+	if mgmtauth.HasAccount(account) {
+		secret, _ = decodeLoginSecret(account.SessionSecret)
+	}
+	now := h.now()
 
 	type candidate struct {
 		token     string
 		viaCookie bool
 	}
 	var candidates []candidate
-	if cookie, ok := sessionCookieToken(c); ok {
-		candidates = append(candidates, candidate{cookie, true})
+	if hasBearer {
+		candidates = append(candidates, candidate{bearerToken, false})
 	}
-	if bearer, ok := sessionBearerToken(c); ok {
-		candidates = append(candidates, candidate{bearer, false})
+	if hasCookie {
+		candidates = append(candidates, candidate{cookieToken, true})
 	}
-	if len(candidates) == 0 {
-		return sessionAuthNone
-	}
-
-	account := h.loginStore.Get()
-	secret, _ := decodeLoginSecret(accountSessionSecret(account))
-	origins := effectivePasskeyOrigins(account)
-	now := h.now()
 
 	for _, cand := range candidates {
 		if len(secret) == 0 {
@@ -121,6 +132,9 @@ func (h *Handler) tryAuthenticateSession(c *gin.Context) sessionAuthStatus {
 	}
 
 	// Every presented cpas_ credential failed to verify.
+	if hasCookie {
+		h.clearSessionCookie(c, origins)
+	}
 	return sessionAuthInvalid
 }
 
@@ -257,13 +271,6 @@ func decodeLoginSecret(value string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(value)
 }
 
-func accountSessionSecret(account *mgmtauth.Account) string {
-	if account == nil {
-		return ""
-	}
-	return account.SessionSecret
-}
-
 // effectivePasskeyOrigins returns the origins WebAuthn ceremonies are
 // actually accepted from: the configured list, or ["https://<rp-id>"] when
 // that list is empty and an rp-id is set (matching mgmtauth.NewWebAuthn's
@@ -323,7 +330,10 @@ func mgmtUser(account *mgmtauth.Account) (mgmtauth.User, error) {
 		}
 		cred, errDecode := decodePasskeyRecord(p)
 		if errDecode != nil {
-			return mgmtauth.User{}, errDecode
+			// A single corrupt record (e.g. hand-edited sidecar file) must
+			// not take down every other working passkey; skip and log it.
+			log.WithError(errDecode).WithField("passkey_id", p.ID).Error("management: skipping undecodable passkey record")
+			continue
 		}
 		creds = append(creds, cred)
 	}
@@ -408,36 +418,56 @@ func (h *Handler) issueSessionResponse(c *gin.Context, status int, secret []byte
 // against the login-key failure bookkeeping.
 func (h *Handler) GetSessionStatus(c *gin.Context) {
 	account := h.loginStore.Get()
+	origins := effectivePasskeyOrigins(account)
 
 	authenticated := false
 	method := ""
+	cookieStale := false
 
-	secret, _ := decodeLoginSecret(accountSessionSecret(account))
+	var secret []byte
+	if mgmtauth.HasAccount(account) {
+		secret, _ = decodeLoginSecret(account.SessionSecret)
+	}
 	if len(secret) > 0 {
-		if token, ok := sessionCookieToken(c); ok {
+		if token, ok := sessionBearerToken(c); ok {
 			if claims, err := mgmtauth.VerifyToken(secret, token, h.now()); err == nil {
 				authenticated, method = true, string(claims.Method)
 			}
 		}
 		if !authenticated {
-			if token, ok := sessionBearerToken(c); ok {
+			if token, ok := sessionCookieToken(c); ok {
 				if claims, err := mgmtauth.VerifyToken(secret, token, h.now()); err == nil {
 					authenticated, method = true, string(claims.Method)
+				} else {
+					cookieStale = true
 				}
 			}
 		}
+	} else if _, ok := sessionCookieToken(c); ok {
+		cookieStale = true
 	}
 
+	// This never touches the key's failure bookkeeping (B1): a stale cpas_
+	// value is excluded by managementKeyFromRequest, and even a genuine
+	// wrong-key guess here must not contribute toward banning the caller.
 	if !authenticated {
 		provided := managementKeyFromRequest(c)
 		if provided != "" {
 			clientIP := c.ClientIP()
 			localClient := clientIP == "127.0.0.1" || clientIP == "::1"
-			if ok, _, _ := h.AuthenticateManagementKey(clientIP, localClient, provided); ok {
+			if h.AuthenticateManagementKeyReadOnly(clientIP, localClient, provided) {
 				authenticated = true
 				method = string(mgmtauth.MethodKey)
 			}
 		}
+	}
+
+	// A cookie the browser is still holding that no longer verifies is, by
+	// definition, no longer any good; clear it here too (not just in
+	// Middleware()) so a stale cookie does not keep riding along forever if
+	// the caller only ever hits /session/status.
+	if cookieStale {
+		h.clearSessionCookie(c, origins)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -446,7 +476,7 @@ func (h *Handler) GetSessionStatus(c *gin.Context) {
 		"method":             method,
 		"passkeys_available": passkeysAvailable(account),
 		"passkey_rp_id":      passkeyRPID(account),
-		"passkey_origins":    effectivePasskeyOrigins(account),
+		"passkey_origins":    origins,
 	})
 }
 
@@ -459,12 +489,18 @@ func passkeyRPID(account *mgmtauth.Account) string {
 
 // managementKeyFromRequest extracts a management key the same way
 // Middleware() does, without consuming it against the failure bookkeeping.
+// managementKeyFromRequest extracts a management-key candidate from the
+// request: Authorization: Bearer <key> (excluding a cpas_-prefixed value,
+// which is a session credential and never a key guess), a raw Authorization
+// value, or X-Management-Key.
 func managementKeyFromRequest(c *gin.Context) string {
 	var provided string
 	if ah := c.GetHeader("Authorization"); ah != "" {
 		parts := strings.SplitN(ah, " ", 2)
 		if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
-			provided = parts[1]
+			if !strings.HasPrefix(parts[1], mgmtauth.TokenPrefix) {
+				provided = parts[1]
+			}
 		} else {
 			provided = ah
 		}
@@ -483,6 +519,7 @@ func (h *Handler) PostSessionLogin(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
 		return
 	}
+	limitPublicRequestBody(c)
 
 	var body struct {
 		Username string `json:"username"`
@@ -492,6 +529,7 @@ func (h *Handler) PostSessionLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	username := strings.TrimSpace(body.Username)
 
 	account := h.loginStore.Get()
 	if !mgmtauth.HasAccount(account) {
@@ -504,9 +542,14 @@ func (h *Handler) PostSessionLogin(c *gin.Context) {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many attempts", "retry_after": ceilSecondsAtLeastOne(retryAfter)})
 		return
 	}
-	match, verifyErr := mgmtauth.VerifyPassword(account.PasswordHash, body.Password)
-	success := verifyErr == nil && match && body.Username == account.Username
-	release(success)
+	success := false
+	func() {
+		// Deferred release with a success flag: a panic inside
+		// VerifyPassword can never leak the throttle's single slot.
+		defer func() { release(success) }()
+		match, verifyErr := mgmtauth.VerifyPassword(account.PasswordHash, body.Password)
+		success = verifyErr == nil && match && username == account.Username
+	}()
 	if !success {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
@@ -522,6 +565,12 @@ func (h *Handler) PostSessionLogin(c *gin.Context) {
 
 // PostSessionPasskeyBegin starts a discoverable passkey login ceremony.
 func (h *Handler) PostSessionPasskeyBegin(c *gin.Context) {
+	if !h.remoteAllowed(c) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
+		return
+	}
+	limitPublicRequestBody(c)
+
 	account := h.loginStore.Get()
 	if !passkeysAvailable(account) {
 		c.JSON(http.StatusConflict, gin.H{"error": "passkeys are not available"})
@@ -537,12 +586,8 @@ func (h *Handler) PostSessionPasskeyBegin(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	ceremonyID, err := h.passkeyCeremonies.Begin(*session)
+	ceremonyID, err := h.loginCeremonies.Begin(*session)
 	if err != nil {
-		if errors.Is(err, mgmtauth.ErrTooManyCeremonies) {
-			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
-			return
-		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -557,6 +602,7 @@ func (h *Handler) PostSessionPasskeyFinish(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
 		return
 	}
+	limitPublicRequestBody(c)
 
 	var body struct {
 		CeremonyID string          `json:"ceremony_id"`
@@ -567,7 +613,7 @@ func (h *Handler) PostSessionPasskeyFinish(c *gin.Context) {
 		return
 	}
 
-	session, ok := h.passkeyCeremonies.Take(body.CeremonyID)
+	session, ok := h.loginCeremonies.Take(body.CeremonyID)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "ceremony expired or already used"})
 		return
@@ -610,7 +656,23 @@ func (h *Handler) PostSessionPasskeyFinish(c *gin.Context) {
 
 // PostSessionLogout clears the session cookie.
 func (h *Handler) PostSessionLogout(c *gin.Context) {
+	limitPublicRequestBody(c)
 	account := h.loginStore.Get()
 	h.clearSessionCookie(c, effectivePasskeyOrigins(account))
 	c.Status(http.StatusNoContent)
+}
+
+// maxPublicRequestBodyBytes caps the body size accepted by the public,
+// unauthenticated /session/* POST endpoints, so an oversized request body
+// cannot be used to exhaust memory before any auth check even runs.
+const maxPublicRequestBodyBytes = 64 * 1024
+
+// limitPublicRequestBody wraps the request body in http.MaxBytesReader.
+// ShouldBindJSON's decode then fails cleanly once the limit is exceeded,
+// rather than reading an unbounded body into memory.
+func limitPublicRequestBody(c *gin.Context) {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPublicRequestBodyBytes)
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/mgmtauth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -64,19 +65,24 @@ type Handler struct {
 	pluginReleases          pluginReleaseCache
 
 	// loginStore holds the management panel login account (username,
-	// password hash, session-secret, passkeys) in a sidecar JSON file next
-	// to configFilePath. It is intentionally independent of cfg/h.mu: see
-	// internal/mgmtauth.Store.
+	// password hash, session-secret, passkeys) in a sidecar file next to
+	// configFilePath (or auth-dir, or WRITABLE_PATH -- see
+	// mgmtauth.ResolveStorePath). It is intentionally independent of
+	// cfg/h.mu: see internal/mgmtauth.Store.
 	loginStore *mgmtauth.Store
 	// loginThrottle enforces the global password-verification backoff
 	// (login and PUT /account's current_password check share it). It
 	// survives config hot-reloads: only session-secret rotation
 	// invalidates tokens.
 	loginThrottle *mgmtauth.Throttle
-	// passkeyCeremonies holds in-memory, single-use WebAuthn ceremony state.
-	// It also survives hot-reloads; ceremonies are keyed by a random id, not
-	// by anything that changes across a reload.
-	passkeyCeremonies *mgmtauth.CeremonyCache
+	// loginCeremonies and registrationCeremonies hold in-memory, single-use
+	// WebAuthn ceremony state for, respectively, passkey login
+	// (/session/passkey/*) and passkey registration (/account/passkeys/*).
+	// They are kept separate so a burst of one kind can never evict or
+	// starve the other. Both survive hot-reloads; ceremonies are keyed by a
+	// random id, not by anything that changes across a reload.
+	loginCeremonies        *mgmtauth.CeremonyCache
+	registrationCeremonies *mgmtauth.CeremonyCache
 	// clock is the time source for session tokens and login throttling.
 	// Tests in this package may override it directly.
 	clock mgmtauth.Clock
@@ -93,23 +99,39 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	clock := mgmtauth.Clock(mgmtauth.SystemClock{})
-	loginStore := mgmtauth.NewStore(configFilePath)
+	loginStore := mgmtauth.NewStore(configFilePath, resolveLoginStoreAuthDir(cfg))
 	loginStore.Load()
 	h := &Handler{
-		cfg:                 cfg,
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
-		loginStore:          loginStore,
-		loginThrottle:       mgmtauth.NewThrottle(clock),
-		passkeyCeremonies:   mgmtauth.NewCeremonyCache(clock),
-		clock:               clock,
+		cfg:                    cfg,
+		configFilePath:         configFilePath,
+		failedAttempts:         make(map[string]*attemptInfo),
+		authManager:            manager,
+		tokenStore:             sdkAuth.GetTokenStore(),
+		allowRemoteOverride:    envSecret != "",
+		envSecret:              envSecret,
+		loginStore:             loginStore,
+		loginThrottle:          mgmtauth.NewThrottle(clock),
+		loginCeremonies:        mgmtauth.NewCeremonyCache(clock),
+		registrationCeremonies: mgmtauth.NewCeremonyCache(clock),
+		clock:                  clock,
 	}
 	h.startAttemptCleanup()
 	return h
+}
+
+// resolveLoginStoreAuthDir resolves the auth-dir the way the rest of the
+// server does, for mgmtauth.ResolveStorePath's third-priority fallback. A
+// resolution failure (e.g. an unexpanded "~" with no home directory) just
+// means the login store falls further back to the config file's directory.
+func resolveLoginStoreAuthDir(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	dir, err := util.ResolveAuthDir(cfg.AuthDir)
+	if err != nil {
+		return ""
+	}
+	return dir
 }
 
 // startAttemptCleanup launches a background goroutine that periodically
@@ -296,8 +318,20 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
 		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
 
+		// Accept either Authorization: Bearer <key> or X-Management-Key as a
+		// key candidate up front: a stale session credential plus a
+		// plausible key lets sessionAuthInvalid fall through to the key
+		// check below instead of rejecting outright.
+		provided := managementKeyFromRequest(c)
+
 		switch h.tryAuthenticateSession(c) {
 		case sessionAuthOK:
+			if !h.remoteAllowed(c) {
+				// A session no longer bypasses allow-remote: it must obey
+				// the same local-or-allow-remote predicate key auth does.
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
+				return
+			}
 			c.Set(AuthMethodContextKey, AuthMethodSession)
 			c.Next()
 			return
@@ -305,12 +339,17 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "cross-site request blocked"})
 			return
 		case sessionAuthInvalid:
-			// A cpas_ credential was presented (cookie and/or bearer) but did
-			// not verify: reject outright. This must never fall through to
-			// key auth (a stale session token is not a management key guess)
-			// and must never count against the key's failure bookkeeping.
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "session expired"})
-			return
+			// A cpas_ credential was presented (cookie and/or bearer) but
+			// did not verify (tryAuthenticateSession already cleared a
+			// stale cookie, if any). If the request also carries a
+			// plausible, distinct management key, fall through to the key
+			// check below without counting the session failure against
+			// anything; otherwise reject outright. Either way this must
+			// never pass the stale cpas_ value itself to key auth.
+			if provided == "" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "session expired"})
+				return
+			}
 		case sessionAuthNone:
 			// No session credential was presented at all; fall through to
 			// the unchanged management-key logic below.
@@ -318,20 +357,6 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
-
-		// Accept either Authorization: Bearer <key> or X-Management-Key
-		var provided string
-		if ah := c.GetHeader("Authorization"); ah != "" {
-			parts := strings.SplitN(ah, " ", 2)
-			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
-				provided = parts[1]
-			} else {
-				provided = ah
-			}
-		}
-		if provided == "" {
-			provided = c.GetHeader("X-Management-Key")
-		}
 
 		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
 		if !allowed {
@@ -442,6 +467,58 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	reset()
 
 	return true, 0, ""
+}
+
+// AuthenticateManagementKeyReadOnly reports whether provided matches the
+// current management key, WITHOUT any IP-ban failure bookkeeping: it
+// neither extends nor resets the failure counter, and a right-or-wrong
+// guess here can never contribute toward banning clientIP. This is for
+// read-only/status-reporting callers (GET /session/status) that must never
+// let a mere probe -- or a stale session credential mistakenly handed to
+// this check -- affect whether the key still works afterward. An existing
+// ban is still honored (reported as not-authenticated), since status should
+// not claim a banned caller succeeded.
+func (h *Handler) AuthenticateManagementKeyReadOnly(clientIP string, localClient bool, provided string) bool {
+	if h == nil || provided == "" {
+		return false
+	}
+
+	h.attemptsMu.Lock()
+	ai := h.failedAttempts[clientIP]
+	banned := ai != nil && !ai.blockedUntil.IsZero() && time.Now().Before(ai.blockedUntil)
+	h.attemptsMu.Unlock()
+	if banned {
+		return false
+	}
+
+	cfg := h.cfg
+	var (
+		allowRemote bool
+		secretHash  string
+	)
+	if cfg != nil {
+		allowRemote = cfg.RemoteManagement.AllowRemote
+		secretHash = cfg.RemoteManagement.SecretKey
+	}
+	if h.allowRemoteOverride {
+		allowRemote = true
+	}
+	if !localClient && !allowRemote {
+		return false
+	}
+	if secretHash == "" && h.envSecret == "" {
+		return false
+	}
+
+	if localClient {
+		if lp := h.localPassword; lp != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(lp)) == 1 {
+			return true
+		}
+	}
+	if h.envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(h.envSecret)) == 1 {
+		return true
+	}
+	return secretHash != "" && bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) == nil
 }
 
 // remoteAllowed reports whether a request from c's client is allowed under
