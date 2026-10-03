@@ -106,6 +106,10 @@ type Message struct {
 	// message id. Only DeliverApproval sets it, always with FromUser; clients
 	// can never send it.
 	Approval string `json:"approval,omitempty"`
+	// Broadcast marks an owner's message (or command) to all agents ("all:
+	// ..."). Only DeliverBroadcast and DeliverCommandBroadcast set it, always
+	// with FromUser; clients can never send it.
+	Broadcast bool `json:"broadcast,omitempty"`
 	// SlackUserID is the Slack user ID of the owner who sent Command. Only
 	// DeliverCommand sets it, and /wait re-checks it before handing the
 	// command out.
@@ -905,8 +909,9 @@ func (s *Store) Load() error {
 // cleanLoadedMessage drops an invalid reply_to, any via validVia rejects on
 // a Slack user's or guest's message (and every via on anything else), an
 // approval on anything but a Slack user's message or with an invalid request
-// id and, on a message from a session, a sender name validName rejects
-// (keeping the sender's address). It reports whether it changed m.
+// id, a broadcast mark on anything but a Slack user's message and, on a
+// message from a session, a sender name validName rejects (keeping the
+// sender's address). It reports whether it changed m.
 func cleanLoadedMessage(m *Message) bool {
 	changed := false
 	if m.ReplyTo != "" && !validReplyTo.MatchString(m.ReplyTo) {
@@ -919,6 +924,10 @@ func cleanLoadedMessage(m *Message) bool {
 	}
 	if m.Approval != "" && (!m.FromUser || m.Guest || !validReplyTo.MatchString(m.Approval)) {
 		m.Approval = ""
+		changed = true
+	}
+	if m.Broadcast && (!m.FromUser || m.Guest) {
+		m.Broadcast = false
 		changed = true
 	}
 	if m.FromUser || m.Guest {

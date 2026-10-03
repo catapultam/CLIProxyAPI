@@ -44,7 +44,18 @@ const (
 	// maxOptionText caps an option's text (Slack's limit).
 	maxOptionText = 75
 
+	// refusalEvery is how often someone who isn't allowed is told so; in
+	// between the bridge is silent.
+	refusalEvery = 10 * time.Minute
+	// maxRefused caps the users remembered as refused.
+	maxRefused = 1000
+	// maxViewOpens caps the views.open calls in flight.
+	maxViewOpens = 4
+
 	notAllowedHere = "You're not allowed to use this."
+	dialogFailed   = "Couldn't open the dialog, try again."
+	clankerWorking = "Working… the result arrives in your DM with %s."
+	clankerCommand = "/clanker"
 	askDefaultNote = "Please look at this message."
 	askExpired     = "This request expired. Run Ask an agent on the message again."
 	askChoose      = "Choose an agent from the list."
@@ -144,8 +155,10 @@ func (b *Bridge) handleInteractive(raw json.RawMessage) map[string]any {
 func (b *Bridge) askShortcut(p interactivePayload) {
 	user, ok := b.state.user(p.User.ID)
 	if !ok {
-		log.Infof("slack: refused Ask an agent from %s: not an allowed user", p.User.ID)
-		b.ephemeralInDM(p.User.ID, notAllowedHere)
+		if b.refuseOnce(p.User.ID) {
+			log.Infof("slack: refused Ask an agent from %s: not an allowed user", p.User.ID)
+			b.refuseEphemeral(p.User.ID)
+		}
 		return
 	}
 	choices := b.agentChoices(user.config)
@@ -171,9 +184,87 @@ func (b *Bridge) askShortcut(p interactivePayload) {
 		log.Warnf("slack: Ask an agent: can't build the modal")
 		return
 	}
-	trigger := p.TriggerID
+	b.openViewNow(user.ID, p.TriggerID, view)
+}
+
+// openViewNow opens view for trigger right away, in its own goroutine
+// (at most maxViewOpens at a time), since Slack's trigger expires after 3
+// seconds; queued behind other jobs it could expire. When it fails (rate
+// limited, the trigger expired, too many opening), userID is told in their
+// DM.
+func (b *Bridge) openViewNow(userID, trigger, view string) {
+	select {
+	case b.viewSlots <- struct{}{}:
+	default:
+		log.Warnf("slack: Ask an agent: %d dialogs already opening; refused one for %s", maxViewOpens, userID)
+		b.tellDialogFailed(userID)
+		return
+	}
+	ctx := b.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.viewsWG.Add(1)
+	go func() {
+		defer b.viewsWG.Done()
+		defer func() { <-b.viewSlots }()
+		if errOpen := b.api.openView(ctx, b.cfg.BotToken, trigger, view); errOpen != nil && ctx.Err() == nil {
+			log.Infof("slack: Ask an agent: couldn't open the dialog for %s: %v", userID, errOpen)
+			b.tellDialogFailed(userID)
+		}
+	}()
+}
+
+// tellDialogFailed tells allowed user userID, in their DM with the bot, that
+// the Ask an agent dialog didn't open.
+func (b *Bridge) tellDialogFailed(userID string) {
 	b.enqueueCommand(func(ctx context.Context) error {
-		return b.api.openView(ctx, b.cfg.BotToken, trigger, view)
+		channel, err := b.dmChannel(ctx, userID)
+		if err != nil {
+			return err
+		}
+		_, err = b.api.postMessage(ctx, b.cfg.BotToken, channel, dialogFailed, "")
+		return err
+	})
+}
+
+// refuseOnce reports whether userID, who isn't allowed, should be told so
+// now: at most once every refusalEvery, and not at all while maxRefused
+// others are within their window.
+func (b *Bridge) refuseOnce(userID string) bool {
+	now := b.state.now()
+	b.askMu.Lock()
+	defer b.askMu.Unlock()
+	if b.refused == nil {
+		b.refused = map[string]time.Time{}
+	}
+	if at, ok := b.refused[userID]; ok && now.Sub(at) < refusalEvery {
+		return false
+	}
+	if len(b.refused) >= maxRefused {
+		for id, at := range b.refused {
+			if now.Sub(at) >= refusalEvery {
+				delete(b.refused, id)
+			}
+		}
+		if len(b.refused) >= maxRefused {
+			return false
+		}
+	}
+	b.refused[userID] = now
+	return true
+}
+
+// refuseEphemeral tells userID, who isn't allowed, that they can't use the
+// shortcut: an ephemeral in their DM with the bot, opened for this alone
+// (it isn't cached).
+func (b *Bridge) refuseEphemeral(userID string) {
+	b.enqueueCommand(func(ctx context.Context) error {
+		channel, err := b.api.openDM(ctx, b.cfg.BotToken, userID)
+		if err != nil {
+			return err
+		}
+		return b.api.postEphemeral(ctx, b.cfg.BotToken, channel, userID, notAllowedHere)
 	})
 }
 
@@ -402,7 +493,15 @@ func (b *Bridge) handleSlash(raw json.RawMessage) map[string]any {
 		log.Debugf("slack: bad slash command payload: %v", errJSON)
 		return nil
 	}
-	return map[string]any{"text": b.clanker(p)}
+	if p.Command != clankerCommand {
+		log.Debugf("slack: ignored slash command %q", p.Command)
+		return nil
+	}
+	text := b.clanker(p)
+	if text == "" {
+		return nil
+	}
+	return map[string]any{"text": text}
 }
 
 // clanker runs /clanker for an allowed user: "name: message" (or "@name
@@ -412,6 +511,9 @@ func (b *Bridge) handleSlash(raw json.RawMessage) map[string]any {
 func (b *Bridge) clanker(p slashPayload) string {
 	user, ok := b.state.user(p.UserID)
 	if !ok {
+		if !b.refuseOnce(p.UserID) {
+			return ""
+		}
 		log.Infof("slack: refused /clanker from %s: not an allowed user", p.UserID)
 		return notAllowedHere
 	}
@@ -421,7 +523,7 @@ func (b *Bridge) clanker(p slashPayload) string {
 	if raw == "" || strings.EqualFold(raw, "help") {
 		return b.help(ev)
 	}
-	inDM := fmt.Sprintf("The answer arrives in your DM with %s.", b.botMention())
+	working := fmt.Sprintf(clankerWorking, b.botMention())
 	text := plainText(raw, b.state.idLabels())
 	if isBang(text) {
 		// Only !commands needs no agent; runCommand explains the rest.
@@ -430,7 +532,7 @@ func (b *Bridge) clanker(p slashPayload) string {
 			return ownersOnlyCommands
 		}
 		b.enqueueCommand(b.slashJob(user, "", text))
-		return inDM
+		return working
 	}
 	target, body, tagged := parseAddressed(text)
 	if !tagged {
@@ -451,9 +553,14 @@ func (b *Bridge) clanker(p slashPayload) string {
 		return ownersOnlyCommands
 	}
 	b.enqueueCommand(b.slashJob(user, sid, body))
+	if _, isMove := parseMove(body); isMove || isBang(body) {
+		// Moves and commands are checked when they run; the outcome (or why
+		// not) is posted in the DM.
+		return working
+	}
 	label := escape(b.agentLabel(ev, sid))
 	if b.bus.SessionStatus(sid) == agentbus.StatusOffline {
-		return fmt.Sprintf("%s is offline; it gets this when it's back. %s", label, inDM)
+		return fmt.Sprintf("%s is offline; it gets this when it's back. The answer arrives in your DM with %s.", label, b.botMention())
 	}
 	return fmt.Sprintf("Sent to %s — answer arrives in your DM with %s.", label, b.botMention())
 }

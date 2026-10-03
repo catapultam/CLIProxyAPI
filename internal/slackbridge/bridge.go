@@ -147,6 +147,16 @@ type Bridge struct {
 	// across a Slack or Store call.
 	askMu sync.Mutex
 	asks  map[askKey]askEntry
+	// refused maps a user who isn't allowed to when they were last told so
+	// (see refuseOnce); askMu guards it too.
+	refused map[string]time.Time
+	// viewSlots bounds the views.open calls in flight; viewsWG tracks them,
+	// and Stop waits for them.
+	viewSlots chan struct{}
+	viewsWG   sync.WaitGroup
+	// runCtx is the context of the running bridge (Start), for work started
+	// outside the job queue.
+	runCtx context.Context
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -184,6 +194,7 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 		dmChannels:  map[string]string{},
 		guestNames:  map[string]string{},
 		guestQueued: map[string]int{},
+		viewSlots:   make(chan struct{}, maxViewOpens),
 	}
 	b.refreshLinks()
 	return b, nil
@@ -244,11 +255,13 @@ func (b *Bridge) logCommandOutcome(o agentbus.Outbound) {
 	log.Infof("slack: %s !%s on %s", outcome, r.Command, o.Machine)
 }
 
-// postOutbound posts o where threadFor puts it. A "confirm: …" body is an
-// approval request: its text is posted with approvalNote, and the post is
-// recorded so an allowed user's 👍 approves it (see handleReaction).
+// postOutbound posts o where threadFor puts it. A "confirm: …" body that
+// answers someone (reply_to) is an approval request: its text is posted with
+// approvalNote, and the post is recorded so an allowed user's 👍 approves it
+// (see handleReaction). Without reply_to it is an ordinary post.
 func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
 	request, confirm := confirmRequest(o.Body)
+	confirm = confirm && o.ReplyTo != ""
 	text := withMentions(o.Body, b.state.mentionIDs())
 	if confirm {
 		text = withMentions(request, b.state.mentionIDs()) + "\n" + approvalNote
@@ -795,6 +808,7 @@ func (b *Bridge) homeDescription() string {
 func (b *Bridge) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.cancel = cancel
+	b.runCtx = ctx
 	b.done = make(chan struct{})
 	go func() {
 		defer close(b.done)
@@ -835,6 +849,7 @@ func (b *Bridge) Stop() {
 		b.cancel()
 		<-b.done
 		b.jobsWG.Wait()
+		b.viewsWG.Wait()
 		b.bus.SetBridge(nil)
 		b.cancel = nil
 	}

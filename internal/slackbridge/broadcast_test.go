@@ -9,12 +9,12 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
 )
 
-// claimByBody claims sid's one message and checks it is the broadcast body
-// from alex.
+// claimBroadcast claims sid's one message and checks it is alex's broadcast
+// of body, marked as one.
 func claimBroadcast(t *testing.T, bus *agentbus.Store, sid, body, via string) agentbus.Message {
 	t.Helper()
 	m := claimOne(t, bus, sid)
-	if !m.FromUser || m.Guest || m.SlackUser != "alex" || m.Body != body || m.Via != via || m.Command != nil {
+	if !m.FromUser || !m.Broadcast || m.Guest || m.SlackUser != "alex" || m.Body != body || m.Via != via || m.Command != nil {
 		t.Fatalf("%s got %+v", sid, m)
 	}
 	return m
@@ -69,32 +69,64 @@ func TestOwnerBroadcastReachesLiveSessions(t *testing.T) {
 	claimBroadcast(t, bus, sidB, "and here", "")
 }
 
-func TestNonOwnerBroadcastIsRefused(t *testing.T) {
+// A non-owner's "all: …" is no broadcast: it takes the normal routes.
+func TestNonOwnerAllTakesTheNormalRoutes(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	if _, _, err := b.state.allow("UJANE", "jane"); err != nil {
 		t.Fatal(err)
 	}
+	// In the channel, "all" is no agent: the not-found help.
 	b.handleEvent("EvBn1", msg("UJANE", "all: hi", "1700011100.000001", ""))
-	b.handleEvent("EvBn2", dmMsg("UJANE", "@all hi", "1700011100.000002", ""))
-	b.handleEvent("EvBn3", msg("UJANE", "all: !compact", "1700011100.000003", ""))
 	drainJobs(t, b)
 	if bus.Pending(sidA) || bus.Pending(sidB) {
-		t.Fatal("a non-owner's broadcast was delivered")
+		t.Fatal("a non-owner's all: was delivered")
 	}
-	posts := f.callsTo("chat.postMessage")
-	if len(posts) != 3 {
-		t.Fatalf("posts = %d", len(posts))
+	if got := lastPostText(f); !strings.HasPrefix(got, "No agent called `all`.") {
+		t.Fatalf("channel reply = %q", got)
 	}
-	for _, p := range posts {
-		if p.Form.Get("text") != ownersOnlyBroadcast {
-			t.Fatalf("reply = %q", p.Form.Get("text"))
+	// In their DM it falls back to dm_last (Part D).
+	b.handleEvent("EvBn2", dmMsg("UJANE", "flyer: hello", "1700011100.000002", ""))
+	_ = deliveredID(t, bus, sidA)
+	b.handleEvent("EvBn3", dmMsg("UJANE", "all: hi", "1700011100.000003", ""))
+	if m := claimOne(t, bus, sidA); m.Body != "all: hi" || m.Broadcast {
+		t.Fatalf("DM fallback = %+v", m)
+	}
+	if bus.Pending(sidB) {
+		t.Fatal("broadcast")
+	}
+	// A command needs a real agent.
+	b.handleEvent("EvBn4", msg("UJANE", "all: !compact", "1700011100.000004", ""))
+	drainJobs(t, b)
+	if bus.Pending(sidA) || bus.Pending(sidB) {
+		t.Fatal("a non-owner's command was delivered")
+	}
+	for _, p := range f.callsTo("chat.postMessage") {
+		if p.Form.Get("text") == ownersOnlyBroadcast {
+			t.Fatalf("refused as a broadcast: %+v", p.Form)
 		}
+	}
+}
+
+// Where the bot was only added, an owner's "All: …" without mentioning the
+// bot is no broadcast, and the bot stays quiet.
+func TestOwnerAllWhereTheBotWasOnlyAddedIsIgnored(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	other := messageEvent{Type: "message", Channel: "C0OTHER", ChannelType: "channel", User: "UALEX", Text: "All: lunch?", TS: "1700011150.000002"}
+	b.handleEvent("EvBo1", foreignMsg("UALEX", "All: lunch?", "1700011150.000001", ""))
+	b.handleEvent("EvBo2", other)
+	drainJobs(t, b)
+	if bus.Pending(sidA) || bus.Pending(sidB) {
+		t.Fatal("broadcast from a conversation the bot was only added to")
+	}
+	if n := len(f.callsTo("chat.postMessage")); n != 0 {
+		t.Fatalf("posts = %d", n)
 	}
 }
 
 func TestBroadcastReplyNamesPublicly(t *testing.T) {
 	b, f, bus := newTestBridge(t)
-	b.handleEvent("EvBp1", foreignMsg("UALEX", "all: hi", "1700011200.000001", ""))
+	// In a group DM it takes a mention of the bot.
+	b.handleEvent("EvBp1", foreignMsg("UALEX", "<@UBOT> all: hi", "1700011200.000001", ""))
 	claimBroadcast(t, bus, sidA, "hi", agentbus.ViaGroup)
 	claimBroadcast(t, bus, sidB, "hi", agentbus.ViaGroup)
 	drainJobs(t, b)
@@ -182,7 +214,7 @@ func TestBroadcastCommand(t *testing.T) {
 	const ts = "1700011600.000001"
 	b.handleEvent("EvBc1", msg("UALEX", "all: !compact now", ts, ""))
 	m := claimOne(t, bus, sidA)
-	if m.Command == nil || m.Command.Command != "compact" || m.Command.Args != "now" || m.SlackUserID != "UALEX" {
+	if m.Command == nil || m.Command.Command != "compact" || m.Command.Args != "now" || m.SlackUserID != "UALEX" || !m.Broadcast {
 		t.Fatalf("command = %+v", m)
 	}
 	if bus.Pending(sidB) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
 	"github.com/tidwall/gjson"
@@ -45,6 +46,7 @@ func submission(user, view, option, note string) string {
 // openedView runs queued jobs and returns the view of the one views.open.
 func openedView(t *testing.T, b *Bridge, f *fakeSlack) string {
 	t.Helper()
+	b.viewsWG.Wait()
 	drainJobs(t, b)
 	opens := f.callsTo("views.open")
 	if len(opens) != 1 || opens[0].Form.Get("trigger_id") != "TRIG1" {
@@ -72,8 +74,8 @@ func TestAskShortcutEndToEnd(t *testing.T) {
 	if _, _, err := b.state.allow("UJANE", "jane"); err != nil {
 		t.Fatal(err)
 	}
-	// The envelope comes over the socket, which acks it before any Slack
-	// call: no job runs until drainJobs.
+	// The envelope comes over the socket, which acks it at once; views.open
+	// runs on its own.
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -85,9 +87,6 @@ func TestAskShortcutEndToEnd(t *testing.T) {
 	waitAck(t, f, "env-s1")
 	if got := f.ackPayload("env-s1"); got != "" {
 		t.Fatalf("ack payload = %s", got)
-	}
-	if n := len(f.callsTo("views.open")); n != 0 {
-		t.Fatalf("views.open before the ack: %d", n)
 	}
 	cancel()
 	<-done
@@ -197,6 +196,12 @@ func TestAskShortcutRefusesNonAllowed(t *testing.T) {
 	}
 	if n := len(f.callsTo("chat.postMessage")); n != 0 {
 		t.Fatalf("posts = %d", n)
+	}
+	b.dmMu.Lock()
+	_, cached := b.dmChannels["UBOB"]
+	b.dmMu.Unlock()
+	if cached {
+		t.Fatal("a refused user's DM was cached")
 	}
 	// A submission from someone not allowed (say, removed meanwhile) is
 	// refused too.
@@ -317,7 +322,7 @@ func TestClankerCommandByOwner(t *testing.T) {
 	if bus.Pending(sidA) {
 		t.Fatalf("a non-owner's command was delivered: %+v", bus.Claim(sidA))
 	}
-	if got := slash(t, b, "UALEX", "flyer: !compact now"); !strings.Contains(got, "@clanker-bro") {
+	if got := slash(t, b, "UALEX", "flyer: !compact now"); got != "Working… the result arrives in your DM with @clanker-bro." {
 		t.Fatalf("owner ack = %q", got)
 	}
 	drainJobs(t, b)
@@ -352,5 +357,61 @@ func TestSlashEnvelopeAckCarriesTheAnswer(t *testing.T) {
 	<-done
 	if got := gjson.Get(f.ackPayload("env-c1"), "text").String(); got != "Sent to flyer — answer arrives in your DM with @clanker-bro." {
 		t.Fatalf("ack payload = %s", f.ackPayload("env-c1"))
+	}
+}
+
+// Someone not allowed is told at most once every refusalEvery, whichever of
+// the shortcut and /clanker they use; then the bridge is silent.
+func TestRefusalsAreRateLimited(t *testing.T) {
+	b, f, _ := newTestBridge(t)
+	clock := newTestClock()
+	b.state.now = clock.now
+	b.handleInteractive(json.RawMessage(shortcutPayload("UBOB", "hi")))
+	drainJobs(t, b)
+	if got := slash(t, b, "UBOB", "flyer: hi"); got != "" {
+		t.Fatalf("second refusal = %q", got)
+	}
+	b.handleInteractive(json.RawMessage(shortcutPayload("UBOB", "hi")))
+	drainJobs(t, b)
+	if n := len(f.callsTo("chat.postEphemeral")); n != 1 {
+		t.Fatalf("ephemerals = %d", n)
+	}
+	clock.advance(refusalEvery + time.Second)
+	if got := slash(t, b, "UBOB", "flyer: hi"); got != notAllowedHere {
+		t.Fatalf("refusal after the window = %q", got)
+	}
+	// Another stranger has their own window.
+	if got := slash(t, b, "UCAROL", "flyer: hi"); got != notAllowedHere {
+		t.Fatalf("other stranger = %q", got)
+	}
+}
+
+func TestViewsOpenFailureTellsTheUser(t *testing.T) {
+	b, f, _ := newTestBridge(t)
+	f.setFail("views.open", "expired_trigger_id")
+	b.handleInteractive(json.RawMessage(shortcutPayload("UALEX", "hi")))
+	b.viewsWG.Wait()
+	drainJobs(t, b)
+	if got := lastPost(t, f); got["channel"] != "DUALEX" || got["text"] != dialogFailed {
+		t.Fatalf("post = %+v", got)
+	}
+}
+
+func TestClankerIgnoresOtherCommands(t *testing.T) {
+	b, _, bus := newTestBridge(t)
+	data, _ := json.Marshal(map[string]any{"command": "/other", "text": "flyer: hi", "user_id": "UALEX"})
+	if ack := b.handleSlash(json.RawMessage(data)); ack != nil {
+		t.Fatalf("ack = %+v", ack)
+	}
+	drainJobs(t, b)
+	if bus.Pending(sidA) {
+		t.Fatal("delivered")
+	}
+}
+
+func TestClankerMoveAcksWorking(t *testing.T) {
+	b, _, _ := newTestBridge(t)
+	if got := slash(t, b, "UALEX", "flyer: !dm"); !strings.HasPrefix(got, "Working…") {
+		t.Fatalf("ack = %q", got)
 	}
 }

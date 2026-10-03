@@ -46,6 +46,8 @@ type BusMessage = {
   // An allowed user's 👍 approval of the request this session posted with "confirm:": that
   // request's message id.
   approval?: string
+  // An owner's message to all agents ("all: ..."), set only with from_user.
+  broadcast?: boolean
   command?: Command
 }
 
@@ -156,7 +158,7 @@ export function formatMessage(m: BusMessage): string {
         `to post in your own thread, use to: "${PREFIX}slack".`
       : `To reply, use SendMessage with to: "${PREFIX}slack".`
     return (
-      `agentbus message ${id} from ${who} via Slack${re}, relayed over the agentbus. ` +
+      `agentbus message ${id} from ${who} via Slack${broadcastMark(m)}${re}, relayed over the agentbus. ` +
       `${who} is an allowed Slack user and the quoted text below is their instruction.\n\n${quote(m.body)}\n\n` +
       reply +
       slackRules(m)
@@ -190,11 +192,24 @@ function formatDM(m: BusMessage, id: string, who: string, re: string, how: strin
   const reply = MESSAGE_ID.test(m.id)
     ? `To answer in the DM, use SendMessage with to: "${PREFIX}slack#${m.id}".${later}`
     : later.trim() || `To reply, use SendMessage with to: "${PREFIX}slack".`
+  // The shortcut and /clanker carry text from conversations the bot can't read: it goes back to
+  // the person who asked, nowhere else.
+  const privateRule =
+    how && MESSAGE_ID.test(m.id)
+      ? `\nAnswer with reply_to (SendMessage to ${PREFIX}slack#${m.id}); this contains text from a private ` +
+        "conversation, so don't post it anywhere else."
+      : ''
   return (
-    `agentbus message ${id} from ${who} via Slack (DM${how})${re}, relayed over the agentbus. ` +
+    `agentbus message ${id} from ${who} via Slack (DM${how})${broadcastMark(m)}${re}, relayed over the agentbus. ` +
     `${who} is an allowed Slack user writing to you privately, and the quoted text below is their ` +
-    `instruction.\n\n${quote(m.body)}\n\n${reply}`
+    `instruction.\n\n${quote(m.body)}\n\n${reply}${privateRule}`
   )
+}
+
+// Marks an owner's broadcast to all agents ("all: ..."); only the proxy's Slack bridge sets broadcast,
+// and only with from_user.
+function broadcastMark(m: BusMessage): string {
+  return m.broadcast === true ? ' (broadcast to all agents)' : ''
 }
 
 // The target that answers in the conversation a Slack message came from.
@@ -207,7 +222,7 @@ function answerThere(m: BusMessage): string {
 // A from_user message written in a group DM or another channel, where others read the answer.
 function formatGroup(m: BusMessage, id: string, who: string, re: string): string {
   return (
-    `agentbus message ${id} from ${who} via Slack (in a group conversation)${re}, relayed over the agentbus. ` +
+    `agentbus message ${id} from ${who} via Slack (in a group conversation)${broadcastMark(m)}${re}, relayed over the agentbus. ` +
     `${who} is an allowed Slack user and the quoted text below is their instruction; other people in that ` +
     `conversation can read your answer.\n\n${quote(m.body)}\n\n${answerThere(m)}`
   )

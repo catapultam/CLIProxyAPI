@@ -988,3 +988,34 @@ whose name is no agent's goes, whole, to `dm_last` (or the DM's link), with
 "→ sent to <agent>"; without either it gets the not-found help. A `!cmd`
 never falls back. Thread replies already went to the thread's agent; the
 main channel is unchanged.
+
+**Fix round 1.** Where this disagrees with the paragraphs above, it wins.
+
+- Broadcasts are marked: `Message.Broadcast` (`broadcast`), set only by
+  `Store.DeliverBroadcast` and `DeliverCommandBroadcast`, never by `/send`,
+  and kept on load only on `from_user` messages. The note and the mod
+  render "(broadcast to all agents)" after "via Slack (…)".
+- `all:` is a broadcast only from an owner, and only in the main channel,
+  a DM with the bot, or a message that mentions the bot (and
+  `/clanker all:`). Anything else that reads `all: …` takes the normal
+  routes silently, so a non-owner's DM falls back to `dm_last`.
+- An approval is marked done only after `DeliverApproval` succeeds, and
+  that is saved at once. When the session has ended, the bot answers in
+  the request's thread "That agent's session has ended; the approval
+  wasn't delivered.", adds no ✅, and the request stays open.
+- `confirm:` makes an approval request only when the session's send has a
+  `reply_to`. Without one it is an ordinary post.
+- `views.open` runs at once in its own goroutine (at most 4 in flight;
+  Stop waits for them), not behind command jobs. A failure (a 429, an
+  expired trigger, too many opening) gets "Couldn't open the dialog, try
+  again." in the user's DM.
+- People who aren't allowed are refused at most once per 10 minutes,
+  across the shortcut and `/clanker`; then the bridge is silent. Their DM
+  is opened for the ephemeral alone and isn't cached.
+- `shortcut`/`slash` messages tell the agent to answer with `reply_to`
+  (`agentbus:slack#<id>`) and not to post the text anywhere else, since it
+  comes from a private conversation. Without `reply_to` an answer still
+  goes to the home thread; the framing forbids that.
+- `/clanker` ignores any other command name. For moves and `!cmd` the ack
+  is "Working… the result arrives in your DM with @<bot>.", and the
+  outcome (or the refusal) is posted there once they have been checked.

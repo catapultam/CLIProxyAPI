@@ -2,6 +2,7 @@ package slackbridge
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -28,6 +29,8 @@ const (
 	reactionApproved = "white_check_mark"
 	// confirmPrefix starts an agent's approval request (case-insensitive).
 	confirmPrefix = "confirm:"
+	// approvalUndelivered answers a 👍 whose session has ended.
+	approvalUndelivered = "That agent's session has ended; the approval wasn't delivered."
 )
 
 // pendingApproval is an approval request the bot posted for a session.
@@ -94,15 +97,18 @@ func (b *Bridge) noteApproval(o agentbus.Outbound, request string, t postTarget,
 }
 
 // handleReaction handles a reaction_added event: an allowed user's 👍 on an
-// open approval request delivers the approval to its session (once), and
-// the bot marks the post ✅. Anything else is ignored; a 👍 from someone who
-// isn't allowed is logged at debug level only. It touches only memory, the
-// state and the job queue.
+// open approval request delivers the approval to its session, then marks
+// the request done (saved at once) and the post ✅. When the session has
+// ended, the bot says so in the request's thread and the request stays
+// open. Anything else is ignored; a 👍 from someone who isn't allowed is
+// logged at debug level only. It touches only memory, the state and the job
+// queue, and runs only in the socket's goroutine, so two 👍 can't race.
 func (b *Bridge) handleReaction(ev messageEvent) {
 	if !isApprovalReaction(ev.Reaction) || ev.Item.Type != "message" || ev.User == "" || ev.User == b.botUserID {
 		return
 	}
-	if p, ok := b.state.approval(ev.Item.Channel, ev.Item.TS); !ok || p.Done {
+	p, ok := b.state.approval(ev.Item.Channel, ev.Item.TS)
+	if !ok || p.Done {
 		return
 	}
 	user, allowed := b.state.user(ev.User)
@@ -110,15 +116,26 @@ func (b *Bridge) handleReaction(ev messageEvent) {
 		log.Debugf("slack: ignored a 👍 by %s on an approval request in %s: not an allowed user", ev.User, ev.Item.Channel)
 		return
 	}
-	p, ok := b.state.takeApproval(ev.Item.Channel, ev.Item.TS)
-	if !ok {
-		return
-	}
 	sid := b.state.current(p.Session)
 	nsid, msgID, err := b.bus.DeliverApproval(sid, p.Request, "approved: "+p.Text, user.Label)
 	if err != nil {
 		log.Warnf("slack: %s's approval of request %s not delivered: %v", user.ID, p.Request, err)
+		text := "The approval wasn't delivered: " + escape(err.Error())
+		if errors.Is(err, agentbus.ErrUnknownTarget) {
+			text = approvalUndelivered
+		}
+		thread := p.Thread
+		if thread == "" {
+			thread = p.TS
+		}
+		b.enqueue(func(ctx context.Context) error {
+			_, errPost := b.api.postMessage(ctx, b.cfg.BotToken, p.Channel, text, thread)
+			return errPost
+		})
 		return
+	}
+	if errSave := b.state.finishApproval(p.Channel, p.TS); errSave != nil {
+		logSaveError(errSave)
 	}
 	// The agent answers the approval where the request was.
 	r := replyRecord{ID: msgID, Channel: p.Channel, ThreadTS: p.Thread, Session: nsid, Link: p.Link, TopLevel: p.Thread == ""}
@@ -169,18 +186,20 @@ func (st *state) approval(channel, ts string) (pendingApproval, bool) {
 	return st.approvals[i], true
 }
 
-// takeApproval marks the unexpired, not yet approved request posted at ts in
-// channel approved and returns it; false when there is none.
-func (st *state) takeApproval(channel, ts string) (pendingApproval, bool) {
+// finishApproval marks the request posted at ts in channel approved and
+// writes the state to disk at once, so a restart can't let it be approved
+// again.
+func (st *state) finishApproval(channel, ts string) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	i, ok := st.approvalIndexLocked(channel, ts)
-	if !ok || st.approvals[i].Done {
-		return pendingApproval{}, false
+	for i := len(st.approvals) - 1; i >= 0; i-- {
+		if st.approvals[i].Channel == channel && st.approvals[i].TS == ts {
+			st.approvals[i].Done = true
+			st.dirty = true
+			return st.saveLocked()
+		}
 	}
-	st.approvals[i].Done = true
-	st.dirty = true
-	return st.approvals[i], true
+	return nil
 }
 
 // pruneApprovals drops expired approval requests.

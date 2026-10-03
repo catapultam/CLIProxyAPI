@@ -36,6 +36,17 @@ func (s *Store) DeliverCommand(target string, cmd Command, slackUser, slackUserI
 // /clanker), so a prompt command from a DM is framed as private and a report
 // in a group conversation leaves the machine out.
 func (s *Store) DeliverCommandVia(target string, cmd Command, slackUser, slackUserID, via string) (sessionID, msgID string, err error) {
+	return s.deliverCommand(target, cmd, slackUser, slackUserID, via, false)
+}
+
+// DeliverCommandBroadcast is DeliverCommandVia for an owner's broadcast to
+// all agents ("all: !cmd"): the message is marked Broadcast. Only the Slack
+// bridge calls it.
+func (s *Store) DeliverCommandBroadcast(target string, cmd Command, slackUser, slackUserID, via string) (sessionID, msgID string, err error) {
+	return s.deliverCommand(target, cmd, slackUser, slackUserID, via, true)
+}
+
+func (s *Store) deliverCommand(target string, cmd Command, slackUser, slackUserID, via string, broadcast bool) (string, string, error) {
 	if !validVia(via) {
 		return "", "", ErrInvalidVia
 	}
@@ -61,6 +72,7 @@ func (s *Store) DeliverCommandVia(target string, cmd Command, slackUser, slackUs
 	msg := s.fromSlackLocked(sess, body, slackUser)
 	msg.SlackUserID = slackUserID
 	msg.Via = via
+	msg.Broadcast = broadcast
 	if cmd.Argv != nil {
 		argv := make(map[string][]string, len(cmd.Argv))
 		for osKey, list := range cmd.Argv {

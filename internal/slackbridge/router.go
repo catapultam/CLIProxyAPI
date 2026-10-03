@@ -148,7 +148,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		ev.Text = rest
 	}
 	text := plainText(ev.Text, b.state.idLabels())
-	if body, isBroadcast := broadcastBody(ev.Text, text); isBroadcast {
+	// A broadcast is an owner's, written where owners address the bridge:
+	// the channel, a DM, or a message that mentions the bot. Anything else
+	// that reads "all: …" takes the normal routes.
+	if body, isBroadcast := broadcastBody(ev.Text, text); isBroadcast && user.config && (main || dm || mentioned) {
 		b.broadcast(ev, user, body)
 		return
 	}

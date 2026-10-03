@@ -137,7 +137,8 @@ func TestInjectShortcutAndSlashHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := injectedText(t, r, seen)
-	for _, want := range []string{"from jane via Slack (DM, sent with the Ask an agent shortcut)", "from jane via Slack (DM, sent with /clanker)", `to answer in their DM, reply to "slack" with reply_to`} {
+	for _, want := range []string{"from jane via Slack (DM, sent with the Ask an agent shortcut)", "from jane via Slack (DM, sent with /clanker)",
+		"answer with reply_to m_", "(SendMessage to agentbus:slack#m_", "this contains text from a private conversation, so don't post it anywhere else"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("lacks %q:\n%s", want, got)
 		}

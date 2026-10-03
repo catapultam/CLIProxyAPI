@@ -9,8 +9,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// Broadcasts: an owner's "all: message" (or "@all message") goes to every
-// session that isn't offline, as an ordinary instruction from them to each.
+// Broadcasts: an owner's "all: message" (or "@all message"), written in the
+// main channel, a DM with the bot, a message that mentions the bot, or with
+// /clanker, goes to every session that isn't offline, as their instruction
+// to each, marked as a broadcast (agentbus.Message.Broadcast).
 // Every agent answers where the broadcast was written. Its Slack message
 // shows one receipt for all of them (state.groupReceipt). "all: !cmd" sends
 // a command to every session that can run commands, except shell commands.
@@ -128,10 +130,10 @@ func (b *Bridge) runBroadcast(ev messageEvent, user allowedUser, plan broadcastP
 		var nsid, msgID, queued, command string
 		var err error
 		if plan.cmd != nil {
-			nsid, msgID, err = b.bus.DeliverCommandVia(sid, *plan.cmd, user.Label, user.ID, b.viaOf(ev))
+			nsid, msgID, err = b.bus.DeliverCommandBroadcast(sid, *plan.cmd, user.Label, user.ID, b.viaOf(ev))
 			queued, command = reactionCommand, plan.cmd.Name
 		} else {
-			nsid, msgID, err = b.bus.DeliverVia(sid, plan.body, user.Label, b.viaOf(ev))
+			nsid, msgID, err = b.bus.DeliverBroadcast(sid, plan.body, user.Label, b.viaOf(ev))
 			queued = reactionQueued
 		}
 		if err != nil {

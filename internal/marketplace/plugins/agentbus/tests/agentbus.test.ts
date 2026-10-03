@@ -1211,4 +1211,24 @@ test('a message sent with Ask an agent or /clanker is framed as private, answere
   expect(at(prompts, 0)).toContain('To answer in the DM, use SendMessage with to: "agentbus:slack#m_5a".')
   expect(at(prompts, 1)).toContain('agentbus message m_5b from jane via Slack (DM, sent with /clanker)')
   expect(at(prompts, 1)).toContain('the quoted text below is their instruction')
+  for (const [i, id] of [[0, 'm_5a'], [1, 'm_5b']] as const) {
+    expect(at(prompts, i)).toContain(
+      `Answer with reply_to (SendMessage to agentbus:slack#${id}); this contains text from a private conversation, so don't post it anywhere else.`,
+    )
+  }
+})
+
+test('a broadcast is marked as one in every Slack instruction framing', async ($, on) => {
+  const prompts = await promptsFor($, on, [
+    { id: 'm_b1', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true },
+    { id: 'm_b2', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, via: 'dm' },
+    { id: 'm_b3', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, via: 'group' },
+    { id: 'm_b4', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex' },
+    { id: 'm_b5', from: 'pc/x-111111', body: 'status?', broadcast: true },
+  ])
+  expect(at(prompts, 0)).toContain('agentbus message m_b1 from alex via Slack (broadcast to all agents), relayed')
+  expect(at(prompts, 1)).toContain('agentbus message m_b2 from alex via Slack (DM) (broadcast to all agents), relayed')
+  expect(at(prompts, 2)).toContain('agentbus message m_b3 from alex via Slack (in a group conversation) (broadcast to all agents), relayed')
+  expect(at(prompts, 3)).not.toContain('broadcast')
+  expect(at(prompts, 4)).not.toContain('broadcast to all agents')
 })

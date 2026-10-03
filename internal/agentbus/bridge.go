@@ -233,6 +233,18 @@ func (s *Store) DeliverVia(target, body, slackUser, via string) (sessionID, msgI
 	})
 }
 
+// DeliverBroadcast is DeliverVia for an owner's broadcast to all agents
+// ("all: message"): the message is marked Broadcast. Only the Slack bridge
+// calls it, and together with DeliverCommandBroadcast it is the only way a
+// message gets Broadcast.
+func (s *Store) DeliverBroadcast(target, body, slackUser, via string) (sessionID, msgID string, err error) {
+	return s.deliverFromSlack(target, body, via, func(m *Message) {
+		m.FromUser = true
+		m.SlackUser = slackUser
+		m.Broadcast = true
+	})
+}
+
 // DeliverGuest queues a message from a guest: a Slack user who isn't
 // allowed, writing in a conversation an owner linked to the session. label
 // names the guest; via is as for DeliverVia. It sets Guest, never FromUser.

@@ -39,6 +39,66 @@ func confirmPost(t *testing.T, b *Bridge, bus *agentbus.Store, f *fakeSlack, bod
 	return sent.ID, lastPostTS(f)
 }
 
+// askInThread opens flyer's home thread and has alex ask in it; it returns
+// the thread and the id of alex's message as flyer got it.
+func askInThread(t *testing.T, b *Bridge, bus *agentbus.Store) (string, string) {
+	t.Helper()
+	home := threadOf(t, b, bus)
+	b.handleEvent("EvAskT", msg("UALEX", "can you deploy?", "1700013000.000001", home))
+	id := deliveredID(t, bus, sidA)
+	drainJobs(t, b)
+	return home, id
+}
+
+// A post that starts with "Confirm:" but answers no one is a plain post.
+func TestConfirmWithoutReplyToIsAPlainPost(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	threadOf(t, b, bus)
+	_, ts := confirmPost(t, b, bus, f, "Confirm: the build is green", "")
+	if got := lastPost(t, f); got["text"] != "Confirm: the build is green" {
+		t.Fatalf("post = %+v", got)
+	}
+	if _, ok := b.state.approval("CAGENTS", ts); ok {
+		t.Fatal("recorded as an approval request")
+	}
+}
+
+// An approval for a session that has ended isn't delivered: the bot says so
+// in the request's thread, adds no ✅, and the request stays open.
+func TestApprovalToAnEndedSessionSaysSo(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	g := guestAsks(t, b, bus)
+	_, ts := confirmPost(t, b, bus, f, "confirm: restart", g.ID)
+	bus.Bye(sidA)
+	b.handleEvent("EvEnd1", reactionEv("UALEX", "+1", "GMPIM1", ts))
+	drainJobs(t, b)
+	if got := lastPost(t, f); got["channel"] != "GMPIM1" || got["thread_ts"] != ts || got["text"] != approvalUndelivered {
+		t.Fatalf("reply = %+v", got)
+	}
+	if got := f.reactionsOn("GMPIM1", ts); len(got) != 0 {
+		t.Fatalf("reactions = %v", got)
+	}
+	if p, ok := b.state.approval("GMPIM1", ts); !ok || p.Done {
+		t.Fatalf("pending = %+v %v", p, ok)
+	}
+}
+
+// Done is written to disk at once, so a crash can't allow a second approval.
+func TestApprovalDoneIsSavedAtOnce(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	g := guestAsks(t, b, bus)
+	_, ts := confirmPost(t, b, bus, f, "confirm: restart", g.ID)
+	b.handleEvent("EvSave1", reactionEv("UALEX", "+1", "GMPIM1", ts))
+	_ = claimOne(t, bus, sidA)
+	st, err := loadState(b.cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := st.approval("GMPIM1", ts); !ok || !p.Done {
+		t.Fatalf("on disk = %+v %v", p, ok)
+	}
+}
+
 func TestConfirmPostsAnApprovalRequest(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	g := guestAsks(t, b, bus)
@@ -78,8 +138,8 @@ func TestConfirmPostsAnApprovalRequest(t *testing.T) {
 
 func TestConfirmInAThreadKeepsTheThread(t *testing.T) {
 	b, f, bus := newTestBridge(t)
-	home := threadOf(t, b, bus)
-	_, ts := confirmPost(t, b, bus, f, "confirm: deploy to prod", "")
+	home, ask := askInThread(t, b, bus)
+	_, ts := confirmPost(t, b, bus, f, "confirm: deploy to prod", ask)
 	if got := lastPost(t, f); got["channel"] != "CAGENTS" || got["thread_ts"] != home || got["text"] != "deploy to prod\n"+approvalNoteText {
 		t.Fatalf("post = %+v", got)
 	}
@@ -178,7 +238,8 @@ func TestSkinToneThumbsUpApproves(t *testing.T) {
 func TestApprovalsExpireAndArePruned(t *testing.T) {
 	clock := newTestClock()
 	b, f, bus := newClockBridge(t, clock)
-	_, ts := confirmPost(t, b, bus, f, "confirm: restart", "")
+	_, ask := askInThread(t, b, bus)
+	_, ts := confirmPost(t, b, bus, f, "confirm: restart", ask)
 	clock.advance(approvalTTL + time.Second)
 	b.handleEvent("EvEx1", reactionEv("UALEX", "+1", b.channelID, ts))
 	if bus.Pending(sidA) {
@@ -195,7 +256,8 @@ func TestApprovalsExpireAndArePruned(t *testing.T) {
 
 func TestApprovalsPersist(t *testing.T) {
 	b, f, bus := newTestBridge(t)
-	reqID, ts := confirmPost(t, b, bus, f, "confirm: restart", "")
+	_, ask := askInThread(t, b, bus)
+	reqID, ts := confirmPost(t, b, bus, f, "confirm: restart", ask)
 	if err := b.state.flush(); err != nil {
 		t.Fatal(err)
 	}

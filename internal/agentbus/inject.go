@@ -306,6 +306,9 @@ func messageHead(m Message) string {
 	case ViaSlash:
 		where = " (DM, sent with /clanker)"
 	}
+	if m.Broadcast && m.FromUser && !m.Guest {
+		where += " (broadcast to all agents)"
+	}
 	answer := fmt.Sprintf(`to answer there, reply to "slack" with reply_to %s`, id)
 	switch {
 	case m.Approval != "" && m.FromUser && !m.Guest:
@@ -335,7 +338,7 @@ func messageHead(m Message) string {
 		case ViaGroup:
 			reply = answer + "; other people there can read it"
 		case ViaShortcut, ViaSlash:
-			reply = fmt.Sprintf(`to answer in their DM, reply to "slack" with reply_to %s`, id)
+			reply = fmt.Sprintf(`answer with reply_to %s (SendMessage to agentbus:slack#%s), which posts in their DM; this contains text from a private conversation, so don't post it anywhere else`, id, id)
 		}
 		return fmt.Sprintf("Message %s from %s via Slack%s (an allowed Slack user; this is their instruction; %s)", id, inline(who), where, reply)
 	case m.From == SlackAddress:
