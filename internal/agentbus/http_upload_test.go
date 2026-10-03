@@ -127,7 +127,7 @@ func TestHTTPSlackUploadPostsImage(t *testing.T) {
 	if len(got) != 1 || !bytes.Equal(got[0].data, data) || got[0].filename != "chart.png" {
 		t.Fatalf("posted = %+v", got)
 	}
-	want := Outbound{SessionID: sidA, Address: s.Address(sidA), Name: "flyer", Machine: "pc", Cwd: "/work/flyer", Body: "the chart <!channel>"}
+	want := Outbound{SessionID: sidA, Address: s.Address(sidA), Name: "flyer", Machine: "pc", Body: "the chart <!channel>"}
 	if got[0].out != want {
 		t.Fatalf("outbound = %+v, want %+v", got[0].out, want)
 	}

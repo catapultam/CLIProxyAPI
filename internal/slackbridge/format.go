@@ -125,8 +125,5 @@ func sessionHeader(o agentbus.Outbound) string {
 	if o.Machine != "" {
 		parts = append(parts, escape(o.Machine))
 	}
-	if o.Cwd != "" {
-		parts = append(parts, "`"+escape(o.Cwd)+"`")
-	}
 	return strings.Join(parts, " · ")
 }

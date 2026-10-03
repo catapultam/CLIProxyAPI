@@ -82,8 +82,8 @@ func TestLabels(t *testing.T) {
 }
 
 func TestSessionHeader(t *testing.T) {
-	got := sessionHeader(agentbus.Outbound{Name: "flyer", Address: "pc/flyer-aaaaaa", Machine: "pc", Cwd: `C:\work\<x>`})
-	want := "*flyer* · pc/flyer-aaaaaa · pc · `C:\\work\\&lt;x&gt;`"
+	got := sessionHeader(agentbus.Outbound{Name: "flyer", Address: "pc/flyer-aaaaaa", Machine: "pc"})
+	want := "*flyer* · pc/flyer-aaaaaa · pc"
 	if got != want {
 		t.Fatalf("header = %q, want %q", got, want)
 	}

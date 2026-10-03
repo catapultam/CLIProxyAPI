@@ -15,7 +15,6 @@ type Outbound struct {
 	Address   string
 	Name      string
 	Machine   string
-	Cwd       string
 	Body      string
 	// ReplyTo is a validated message id or empty. The bridge posts into the
 	// Slack thread that message came from only when it was delivered to this
@@ -64,7 +63,6 @@ func (s *Store) outboundLocked(id string, sess *session, body string) Outbound {
 		Address:   s.addressLocked(sess),
 		Name:      sess.Name,
 		Machine:   sess.Machine,
-		Cwd:       sess.Cwd,
 		Body:      body,
 	}
 }

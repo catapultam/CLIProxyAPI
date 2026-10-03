@@ -126,7 +126,7 @@ func TestPostOpensThreadThenReplies(t *testing.T) {
 	if first.Get("channel") != "CAGENTS" || first.Get("thread_ts") != "" {
 		t.Fatalf("first = %v", first)
 	}
-	wantText := "*flyer* · pc/flyer-aaaaaa · pc · `/work/flyer`\nstarting <@UALEX> &lt;!channel&gt;"
+	wantText := "*flyer* · pc/flyer-aaaaaa · pc\nstarting <@UALEX> &lt;!channel&gt;"
 	if first.Get("text") != wantText {
 		t.Fatalf("first text = %q", first.Get("text"))
 	}

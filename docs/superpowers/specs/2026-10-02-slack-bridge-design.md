@@ -29,7 +29,7 @@ have to go through agentbus to wake an idle session.
   needs no public URL.
 - One channel (e.g. `#agents`) with the bot invited.
 - **Thread per session.** The first message from a session becomes a top-level
-  post labelled with the session (`*name* · address · machine · cwd`). Later
+  post labelled with the session (`*name* · address · machine`; the working directory is not sent to Slack). Later
   messages from that session go in its thread.
 - **An allowed user replying in a thread** sends the reply to that thread's
   session.
@@ -164,7 +164,7 @@ Changes in `internal/agentbus`, behind an optional `Bridge` interface so the bus
 works unchanged without Slack:
 
 - `Resolve("slack")` succeeds when a bridge is attached. `Send` to it hands the
-  message plus the sender's address, name, machine, and cwd to the bridge
+  message plus the sender's address, name and machine to the bridge
   instead of an inbox. `Peers()` lists it as `address: slack, machine: slack,
   status: idle`, so the mod's `ListAgents` shows `agentbus:slack`.
 - `Deliver(targetSessionID, Message)` for the bridge to queue inbound messages.
