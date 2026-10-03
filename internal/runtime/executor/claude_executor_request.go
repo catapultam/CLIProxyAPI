@@ -681,6 +681,24 @@ func (e claudeRateLimitError) IsRequestScoped() bool {
 	return false
 }
 
+// claudeMissingThreadStateError marks the 404 Anthropic returns when a thread
+// continuation (thread: {"type":"continue","previous_message_id":...}) names a
+// previous_message_id the server has no state for. No other credential has
+// that thread state either, so the auth manager must neither rotate nor cool
+// down on this; the 404 is returned to the client unchanged so it can replay
+// the full conversation with thread: {"type": "create"}.
+type claudeMissingThreadStateError struct {
+	statusErr
+}
+
+func (claudeMissingThreadStateError) IsRequestScoped() bool {
+	return true
+}
+
+func (claudeMissingThreadStateError) IsCredentialScoped() bool {
+	return false
+}
+
 // classifyClaudeUpstreamError promotes upstream refusals that no other credential
 // can satisfy into request-scoped errors.
 //
@@ -711,7 +729,25 @@ func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header,
 		// Ordinary model-level Claude 429 (not a unified 5h/7d rejection)
 		return claudeRateLimitError{statusErr: err, credentialScoped: false}
 	}
+	if statusCode == http.StatusNotFound && claudeBodyIndicatesMissingThreadState(body) {
+		return claudeMissingThreadStateError{err}
+	}
 	return err
+}
+
+// claudeBodyIndicatesMissingThreadState matches Anthropic's not_found_error for
+// a thread continuation whose previous_message_id has no server-side state,
+// without matching an unrelated 404 (such as model not found) that happens to
+// share the same error type.
+func claudeBodyIndicatesMissingThreadState(body []byte) bool {
+	if strings.ToLower(gjson.GetBytes(body, "error.type").String()) != "not_found_error" {
+		return false
+	}
+	message := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	if message == "" {
+		message = strings.ToLower(string(body))
+	}
+	return strings.Contains(message, "previous_message_id") || strings.Contains(message, "thread state")
 }
 
 // claudeBodyIndicatesFastModeCredits matches Anthropic's fast-mode entitlement

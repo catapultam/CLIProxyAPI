@@ -294,6 +294,50 @@ func TestClassifyClaudeUpstreamError_OtherStatusesUnaffected(t *testing.T) {
 	}
 }
 
+// Claude Code sends thread: {"type":"continue","previous_message_id":...} to
+// resume a prior turn. When Anthropic has no server-side state for that id
+// (e.g. it expired, or the original turn was never persisted) it answers 404
+// not_found_error and tells the caller to replay the full conversation with
+// thread: {"type": "create"}. No other credential has that thread state
+// either, so rotating credentials cannot help: the failure belongs to the
+// request, not the credential.
+func TestClassifyClaudeUpstreamError_MissingThreadStateIsRequestScoped(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"type":"not_found_error","message":"No thread state was found for the requested ` + "`previous_message_id`" + `. Replay the full conversation with ` + "`thread: {\\\"type\\\": \\\"create\\\"}`" + ` instead."}}`)
+
+	err := classifyClaudeUpstreamError(http.StatusNotFound, nil, body)
+
+	scoped, ok := err.(cliproxyexecutor.RequestScopedError)
+	if !ok || !scoped.IsRequestScoped() {
+		t.Fatalf("missing thread state 404 = %T, want a request-scoped error: %s", err, body)
+	}
+	var credScoped interface{ IsCredentialScoped() bool }
+	if errors.As(err, &credScoped) && credScoped.IsCredentialScoped() {
+		t.Fatal("missing thread state 404 must not be credential-scoped")
+	}
+	var status cliproxyexecutor.StatusError
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusNotFound {
+		t.Fatalf("status was not preserved for the caller: %v", err)
+	}
+	// The 404 must reach the client unchanged: it is the caller's only
+	// explanation of what to do about it (replay with thread: {"type": "create"}).
+	if err.Error() != string(body) {
+		t.Fatalf("body was rewritten:\n got  %s\n want %s", err.Error(), body)
+	}
+}
+
+// A 404 not_found_error that does not mention previous_message_id or thread
+// state (e.g. Anthropic's "model not found") must stay a plain, credential-
+// scoped status error so rotation and cooldown still apply.
+func TestClassifyClaudeUpstreamError_OtherNotFoundStaysCredentialScoped(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"type":"not_found_error","message":"model: claude-nonexistent-model"}}`)
+
+	err := classifyClaudeUpstreamError(http.StatusNotFound, nil, body)
+
+	if scoped, ok := err.(cliproxyexecutor.RequestScopedError); ok && scoped.IsRequestScoped() {
+		t.Fatalf("unrelated not_found_error was misclassified as request-scoped: %s", body)
+	}
+}
+
 func TestApplyClaudeHeaders_AdvisorToolBetaPreservedWhenRequested(t *testing.T) {
 	incoming := http.Header{}
 	incoming.Set("Anthropic-Beta", "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24")
