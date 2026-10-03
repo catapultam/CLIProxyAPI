@@ -331,7 +331,7 @@ test('a session message body with a bus-style Message header is quoted', async (
 
 // Remote commands. Only the proxy's Slack bridge sets command, on a from_user message.
 
-type Cmd = { name: string; kind: string; command?: string; args?: string; text?: string; argv?: Record<string, string[]>; output?: string; timeout?: number }
+type Cmd = { name: string; kind: string; command?: string; args?: string; text?: string; argv?: Record<string, string[]>; env?: Record<string, string>; output?: string; timeout?: number }
 
 function commandMessage(id: string, command: Cmd, extra: object = {}) {
   const body = `!${command.name}${command.args ? ` ${command.args}` : ''}`
@@ -540,13 +540,28 @@ test('long output is cut to 3500 characters', async ($, on) => {
   expect(body).toContain('truncated')
 })
 
-test('an image command reads {out}, uploads it to the thread, and deletes the file', async ($, on) => {
-  const argvs: string[][] = []
-  const reads: Array<{ path: string; as: string }> = []
+const PS_REMOVE = ['powershell', '-NoProfile', '-NonInteractive', '-Command', 'Remove-Item -LiteralPath $env:AGENTBUS_OUT -Force -ErrorAction SilentlyContinue']
+
+type Run = { argv: string[]; env?: Record<string, string> }
+
+// recordRuns answers process.run with result (uname with unameOut) and records argv and env.
+function recordRuns(on: TestArgs[1], result = proc(0, ''), unameOut = 'Linux\n') {
+  const runs: Run[] = []
   on('process.run', (_$, e) => {
-    argvs.push([...e.argv])
-    return proc(0, '')
+    runs.push(e.init?.env ? { argv: [...e.argv], env: { ...e.init.env } } : { argv: [...e.argv] })
+    return e.argv[0] === 'uname' ? proc(0, unameOut) : result
   })
+  return runs
+}
+
+function imageOnDisk(on: TestArgs[1], size = 12) {
+  on('fs.stat', () => ({ value: { kind: 'file' as const, size, mtimeMs: 0, isLink: false } }))
+}
+
+test('an image command clears {out}, reads it, uploads it to the thread, and deletes the file', async ($, on) => {
+  const runs = recordRuns(on)
+  imageOnDisk(on)
+  const reads: Array<{ path: string; as: string }> = []
   on('fs.read', (_$, e) => {
     reads.push({ path: e.path, as: e.as })
     return { value: { base64: 'iVBORw0KGgo=' } }
@@ -556,47 +571,164 @@ test('an image command reads {out}, uploads it to the thread, and deletes the fi
   const { calls, sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT', TEMP: 'C:\\Temp\\' } })
 
   const out = 'C:\\Temp\\agentbus-m_0a1.png'
-  expect(at(argvs, 0)).toEqual(['shot.exe', '--window', out])
+  expect(runs).toEqual([
+    { argv: PS_REMOVE, env: { AGENTBUS_OUT: out } },
+    { argv: ['shot.exe', '--window', out] },
+    { argv: PS_REMOVE, env: { AGENTBUS_OUT: out } },
+  ])
   expect(reads).toEqual([{ path: out, as: 'bytes' }])
   const upload = calls.find(c => c.url.endsWith('/slack/upload'))
   expect(upload?.url).toBe('http://bus.test:8317/v1/agentbus/slack/upload')
   expect(upload?.method).toBe('POST')
   expect(upload?.body).toMatchObject({ session: DEFAULT_SESSION_ID, reply_to: 'm_0a1', filename: 'screenshot.png', data_base64: 'iVBORw0KGgo=' })
-  expect(at(argvs, 1)).toEqual(['cmd', '/c', 'del', '/q', out])
   expect(sends.length).toBe(1)
   expect(at(sends, 0).reply_to).toBe('m_0a1')
   expect(at(sends, 0).body.startsWith('✅ !screenshot: ')).toBe(true)
 })
 
-test('an image command on Linux writes under TMPDIR and removes the file with rm', async ($, on) => {
-  const argvs: string[][] = []
-  on('process.run', (_$, e) => {
-    argvs.push([...e.argv])
-    return e.argv[0] === 'uname' ? proc(0, 'Linux\n') : proc(0, '')
-  })
+test('an image command on Linux writes under TMPDIR and removes the file with rm --', async ($, on) => {
+  const runs = recordRuns(on)
+  imageOnDisk(on)
   on('fs.read', () => ({ value: { base64: 'iVBORw0KGgo=' } }))
-  const argv = { linux: ['shot', '{out}'] }
-  const msg = commandMessage('m_0a2', { name: 'screenshot', kind: 'shell', argv, output: 'image', timeout: 30 })
+  const msg = commandMessage('m_0a2', { name: 'screenshot', kind: 'shell', argv: { linux: ['shot', '{out}'] }, output: 'image', timeout: 30 })
   await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', TMPDIR: '/var/tmp/' } })
-  expect(argvs).toEqual([['uname', '-s'], ['shot', '/var/tmp/agentbus-m_0a2.png'], ['rm', '-f', '/var/tmp/agentbus-m_0a2.png']])
+  const out = '/var/tmp/agentbus-m_0a2.png'
+  expect(runs.map(r => r.argv)).toEqual([['uname', '-s'], ['rm', '-f', '--', out], ['shot', out], ['rm', '-f', '--', out]])
+})
+
+test('an image command that leaves no file, or an empty one, reports no image produced', async ($, on) => {
+  const runs = recordRuns(on)
+  imageOnDisk(on, 0)
+  let reads = 0
+  on('fs.read', () => {
+    reads++
+    return { value: { base64: '' } }
+  })
+  const msg = commandMessage('m_0a4', { name: 'screenshot', kind: 'shell', argv: { windows: ['shot.exe', '{out}'] }, output: 'image', timeout: 30 })
+  const { calls, sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT', TEMP: 'C:\\Temp' } })
+  expect(reads).toBe(0)
+  expect(calls.some(c => c.url.endsWith('/slack/upload'))).toBe(false)
+  expect(at(at(sends, 0).body.split('\n'), 0)).toBe('❌ !screenshot: no image produced')
+  expect(runs.at(-1)).toEqual({ argv: PS_REMOVE, env: { AGENTBUS_OUT: 'C:\\Temp\\agentbus-m_0a4.png' } })
+})
+
+test('an image command whose file is missing reports no image produced', async ($, on) => {
+  recordRuns(on)
+  // Nothing answers fs.stat, so it rejects as a missing file would.
+  const msg = commandMessage('m_0a5', { name: 'screenshot', kind: 'shell', argv: { windows: ['shot.exe', '{out}'] }, output: 'image', timeout: 30 })
+  const { calls, sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT', TEMP: 'C:\\Temp' } })
+  expect(calls.some(c => c.url.endsWith('/slack/upload'))).toBe(false)
+  expect(at(at(sends, 0).body.split('\n'), 0)).toBe('❌ !screenshot: no image produced')
 })
 
 test('a failed image upload is reported and the file still goes', async ($, on) => {
-  const argvs: string[][] = []
-  on('process.run', (_$, e) => {
-    argvs.push([...e.argv])
-    return proc(0, '')
-  })
+  const runs = recordRuns(on)
+  imageOnDisk(on)
   on('fs.read', () => ({ value: { base64: 'aGk=' } }))
-  const argv = { windows: ['shot.exe', '{out}'] }
-  const msg = commandMessage('m_0a3', { name: 'screenshot', kind: 'shell', argv, output: 'image', timeout: 30 })
+  const msg = commandMessage('m_0a3', { name: 'screenshot', kind: 'shell', argv: { windows: ['shot.exe', '{out}'] }, output: 'image', timeout: 30 })
   const { sends } = await runMessages($, on, [msg], {
     env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT', TEMP: 'C:\\Temp' },
     routes: { '/slack/upload': { status: 415, text: '{"error":"only PNG, JPEG, GIF or WebP images"}' } },
   })
-  expect(at(argvs, 1)).toEqual(['cmd', '/c', 'del', '/q', 'C:\\Temp\\agentbus-m_0a3.png'])
-  expect(at(sends, 0).body.split('\n')[0]).toBe('❌ !screenshot: image upload failed: HTTP 415 only PNG, JPEG, GIF or WebP images')
+  expect(runs.at(-1)).toEqual({ argv: PS_REMOVE, env: { AGENTBUS_OUT: 'C:\\Temp\\agentbus-m_0a3.png' } })
+  expect(at(at(sends, 0).body.split('\n'), 0)).toBe('❌ !screenshot: image upload failed: HTTP 415 only PNG, JPEG, GIF or WebP images')
 })
+
+test('env-passed {args} and {out} reach the process environment, never argv', async ($, on) => {
+  const runs = recordRuns(on, proc(0, 'found'))
+  const hostile = '"; Remove-Item C:\\ -Recurse; $(calc) `whoami` \' & del * | x'
+  const script = 'Select-String -Pattern $env:AGENTBUS_ARGS -Path x.log; Get-Item $env:AGENTBUS_OUT'
+  const argv = { windows: ['powershell', '-NoProfile', '-Command', script] }
+  const env = { AGENTBUS_ARGS: '{args}', AGENTBUS_OUT: '{out}', LANG: 'C' }
+  const msg = commandMessage('m_e6', { name: 'grep', kind: 'shell', argv, env, args: hostile, output: 'text', timeout: 30 })
+  const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT', TEMP: 'C:\\Temp' } })
+
+  const out = 'C:\\Temp\\agentbus-m_e6.png'
+  expect(at(runs, 0)).toEqual({ argv: ['powershell', '-NoProfile', '-Command', script], env: { AGENTBUS_ARGS: hostile, AGENTBUS_OUT: out, LANG: 'C' } })
+  for (const run of runs) expect(run.argv.some(a => a.includes('Remove-Item C:') || a.includes('whoami'))).toBe(false)
+  expect(at(runs, 1)).toEqual({ argv: PS_REMOVE, env: { AGENTBUS_OUT: out } })
+  expect(at(at(sends, 0).body.split('\n'), 0)).toBe('✅ !grep: exit 0')
+})
+
+const UNSAFE: Array<[string, Record<string, string[]>, Record<string, string> | undefined]> = [
+  ['sh -c then {args}', { windows: ['sh', '-c', 'echo', '{args}'] }, undefined],
+  ['bash -lc', { windows: ['/bin/bash', '-lc', 'x', '{args}'] }, undefined],
+  ['powershell -Command then {out}', { windows: ['powershell', '-NoProfile', '-Command', 'x', '{out}'] }, undefined],
+  ['pwsh abbreviated -com', { windows: ['pwsh.exe', '-com', '{args}'] }, undefined],
+  ['cmd /c', { windows: ['C:\\Windows\\System32\\CMD.EXE', '/C', 'dir', '{args}'] }, undefined],
+  ['python -c', { windows: ['python3', '-c', 'x', '{args}'] }, undefined],
+  ['node -e behind env', { windows: ['env', 'node', '-e', 'x', '{args}'] }, undefined],
+  ['a .bat program', { windows: ['run.BAT', '{args}'] }, undefined],
+  ['a .cmd program', { windows: ['C:\\tools\\run.cmd'] }, undefined],
+  ['{args} as the program', { windows: ['{args}'] }, undefined],
+  ['an embedded placeholder', { windows: ['tool.exe', '--x={args}'] }, undefined],
+  ['{args} in a non-AGENTBUS_ variable', { windows: ['tool.exe'] }, { LD_PRELOAD: '{args}' }],
+  ['an embedded env placeholder', { windows: ['tool.exe'] }, { AGENTBUS_X: 'a {args}' }],
+  ['a bad env name', { windows: ['tool.exe'] }, { 'A B': 'x' }],
+]
+
+for (const [label, argv, env] of UNSAFE) {
+  test(`an unsafe shell definition is refused: ${label}`, async ($, on) => {
+    const runs = recordRuns(on)
+    const msg = commandMessage('m_e7', { name: 'tool', kind: 'shell', argv, env, args: 'x', output: 'text', timeout: 30 })
+    const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
+    expect(runs).toEqual([])
+    expect(at(at(sends, 0).body.split('\n'), 0)).toBe('❌ !tool: unsafe command definition')
+  })
+}
+
+test('a script file run by an interpreter still gets {args} as one argv element', async ($, on) => {
+  const runs = recordRuns(on, proc(0, 'ok'))
+  const argv = { windows: ['pwsh', '-NoProfile', '-File', 'tool.ps1', '{args}'] }
+  const msg = commandMessage('m_e8', { name: 'tool', kind: 'shell', argv, args: 'a b; c', output: 'text', timeout: 30 })
+  await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
+  expect(runs).toEqual([{ argv: ['pwsh', '-NoProfile', '-File', 'tool.ps1', 'a b; c'] }])
+})
+
+test('a command reports from the session it was delivered to, even after !clear moves it', async ($, on) => {
+  const clock = mock.clock(on)
+  const session = { id: DEFAULT_SESSION_ID }
+  const msg = commandMessage('m_c9', { name: 'clear', kind: 'slash', command: 'clear' })
+  const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: [msg] }) }], session)
+  let finish: (() => void) | undefined
+  on('command.run', () => {
+    // /clear gives the session a new id; the result comes back later.
+    session.id = 'cleared2-0000-0000-0000-000000000000'
+    return new Promise<{ text: string }>(resolve => {
+      finish = () => resolve({ text: 'cleared' })
+    })
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  await clock.advance(1000)
+  await clock.advance(1000)
+  expect(calls.some(c => c.url.endsWith('/hello') && (c.body as { session: string }).session === session.id)).toBe(true)
+  finish?.()
+  await clock.settle()
+  const send = calls.find(c => c.url.endsWith('/send'))
+  expect(send?.body).toMatchObject({ from_session: DEFAULT_SESSION_ID, to: 'slack', reply_to: 'm_c9' })
+})
+
+test('a Slack !rename runs through the rename hook and renames the session on the bus', async ($, on) => {
+  on('command.run', (_$, e) => ({ text: `Session renamed to: ${e.args}` }))
+  const msg = commandMessage('m_cb', { name: 'rename', kind: 'slash', command: 'rename', args: 'build-bot' })
+  const { calls, sends } = await runMessages($, on, [msg])
+  expect(at(sends, 0).body).toContain('Session renamed to: build-bot')
+  const names = calls.filter(c => c.url.endsWith('/name'))
+  expect(names.length).toBe(1)
+  expect(at(names, 0).body).toEqual({ session: DEFAULT_SESSION_ID, name: 'build-bot' })
+})
+
+// The output is cut at 3500 characters; a token across the cut must not leave a prefix behind.
+for (const position of [3490, 3492, 3495, 3499]) {
+  test(`the token is redacted before the output is cut (token at ${position})`, async ($, on) => {
+    const token = ENV.ANTHROPIC_AUTH_TOKEN
+    recordRuns(on, proc(0, 'x'.repeat(position) + token + 'y'.repeat(50)))
+    const msg = commandMessage('m_e9', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, output: 'text', timeout: 30 })
+    const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
+    const body = at(sends, 0).body
+    for (let k = 4; k <= token.length; k++) expect(body).not.toContain(token.slice(0, k))
+  })
+}
 
 test('/rename also renames the session on the bus', async ($, on) => {
   const calls = wire($, on, [])

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,7 +43,13 @@ var (
 	// slash command (plugin commands carry a colon).
 	commandName = regexp.MustCompile(`^[a-z0-9][a-z0-9:_-]{0,63}$`)
 	shellOSKeys = map[string]bool{"windows": true, "darwin": true, "linux": true}
+	// shellEnvName is an env variable a shell command may set.
+	shellEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 )
+
+// shellEnvPrefix is the prefix of the env variables that may carry {args}
+// or {out}.
+const shellEnvPrefix = "AGENTBUS_"
 
 // commandFile is one <name>.yaml in the registry. Unknown keys are rejected.
 type commandFile struct {
@@ -52,6 +59,7 @@ type commandFile struct {
 	Args           string              `yaml:"args"`
 	Text           string              `yaml:"text"`
 	Argv           map[string][]string `yaml:"argv"`
+	Env            map[string]string   `yaml:"env"`
 	Output         string              `yaml:"output"`
 	TimeoutSeconds int                 `yaml:"timeout_seconds"`
 	ArgsPattern    string              `yaml:"args_pattern"`
@@ -67,6 +75,7 @@ type commandSpec struct {
 	Args        string
 	Text        string
 	Argv        map[string][]string
+	Env         map[string]string
 	Output      string
 	Timeout     int
 	// argsPattern (anchored) or argsEnum limits a shell command's
@@ -129,6 +138,7 @@ func (c *commandSpec) command(rest string) agentbus.Command {
 		cmd.Args = rest
 	case agentbus.CommandShell:
 		cmd.Argv = c.Argv
+		cmd.Env = c.Env
 		cmd.Output = c.Output
 		cmd.Timeout = c.Timeout
 		cmd.Args = rest
@@ -161,7 +171,7 @@ func parseCommandFile(name string, data []byte) (*commandSpec, error) {
 		return nil
 	}
 	shellOnly := map[string]bool{
-		"argv": f.Argv != nil, "output": f.Output != "", "timeout_seconds": f.TimeoutSeconds != 0,
+		"argv": f.Argv != nil, "env": f.Env != nil, "output": f.Output != "", "timeout_seconds": f.TimeoutSeconds != 0,
 		"args_pattern": f.ArgsPattern != "", "args_enum": f.ArgsEnum != nil,
 	}
 	switch f.Kind {
@@ -216,6 +226,25 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 	if len(f.Argv) == 0 {
 		return errors.New("argv is required")
 	}
+	usesArgs, envOut := false, false
+	for name, value := range f.Env {
+		if !shellEnvName.MatchString(name) {
+			return fmt.Errorf("env name %q must be letters, digits and _ (not starting with a digit)", name)
+		}
+		switch {
+		case value == argsPlaceholder || value == outPlaceholder:
+			// Only the mod's own variables carry Slack text or the temp path,
+			// so a placeholder can't land in LD_PRELOAD, BASH_ENV and the like.
+			if !strings.HasPrefix(name, shellEnvPrefix) {
+				return fmt.Errorf("env.%s: {args} and {out} only go in %s* variables", name, shellEnvPrefix)
+			}
+			usesArgs = usesArgs || value == argsPlaceholder
+			envOut = envOut || value == outPlaceholder
+		case strings.Contains(value, argsPlaceholder) || strings.Contains(value, outPlaceholder):
+			return fmt.Errorf("env.%s: {args} and {out} must be the whole value", name)
+		}
+	}
+	spec.Env = maps.Clone(f.Env)
 	spec.Argv = make(map[string][]string, len(f.Argv))
 	for osKey, argv := range f.Argv {
 		if !shellOSKeys[osKey] {
@@ -229,19 +258,26 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 				if i == 0 {
 					return fmt.Errorf("argv.%s: %s can't be the program", osKey, el)
 				}
+				usesArgs = usesArgs || el == argsPlaceholder
 				continue
 			}
 			if strings.Contains(el, argsPlaceholder) || strings.Contains(el, outPlaceholder) {
 				return fmt.Errorf("argv.%s: {args} and {out} must be whole argv elements", osKey)
 			}
 		}
-		if spec.Output == "image" && !slices.Contains(argv, outPlaceholder) {
-			return fmt.Errorf("argv.%s: output image needs an {out} element", osKey)
+		if errUnsafe := unsafeShellArgv(argv); errUnsafe != nil {
+			return fmt.Errorf("argv.%s: %w", osKey, errUnsafe)
+		}
+		if spec.Output == "image" && !envOut && !slices.Contains(argv, outPlaceholder) {
+			return fmt.Errorf("argv.%s: output image needs an {out} element or env value", osKey)
 		}
 		spec.Argv[osKey] = append([]string(nil), argv...)
 	}
 	if f.ArgsPattern != "" && len(f.ArgsEnum) > 0 {
 		return errors.New("declare args_pattern or args_enum, not both")
+	}
+	if usesArgs && f.ArgsPattern == "" && len(f.ArgsEnum) == 0 {
+		return errors.New("{args} needs args_pattern or args_enum")
 	}
 	if f.ArgsPattern != "" {
 		// Compile the pattern on its own first: one with unbalanced groups,
@@ -259,6 +295,79 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 	spec.argsEnum = append([]string(nil), f.ArgsEnum...)
 	return nil
 }
+
+// unsafeShellArgv refuses an argv that would hand {args} or {out} to an
+// interpreter as script text: a placeholder after a script flag (-c,
+// -Command, -e, /c, ...) once an interpreter has appeared (as the program or
+// behind a wrapper such as env or sudo), or anywhere after cmd, which parses
+// its whole command line. A .bat or .cmd program is refused outright:
+// Windows runs it through cmd. Env variables are the way to hand a value to
+// a script.
+func unsafeShellArgv(argv []string) error {
+	program := strings.ToLower(argv[0])
+	if strings.HasSuffix(program, ".bat") || strings.HasSuffix(program, ".cmd") {
+		return errors.New("a .bat or .cmd program runs through cmd; call the program it runs instead")
+	}
+	interpreter, script := "", false
+	for _, el := range argv {
+		if el == argsPlaceholder || el == outPlaceholder {
+			if script {
+				return fmt.Errorf("%s would be script text for %s; pass it in env instead", el, interpreter)
+			}
+			continue
+		}
+		if interpreter == "" {
+			if name := interpreterName(el); name != "" {
+				interpreter = name
+				// cmd treats everything after it as a command line.
+				script = name == "cmd"
+			}
+			continue
+		}
+		script = script || isScriptFlag(interpreter, el)
+	}
+	return nil
+}
+
+// shellInterpreter matches an interpreter's base name, lowercased, without
+// .exe.
+var shellInterpreter = regexp.MustCompile(`^(sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh|python[0-9.]*|node|nodejs|perl|ruby|osascript)$`)
+
+// interpreterName returns the interpreter el names, or "".
+func interpreterName(el string) string {
+	base := strings.ToLower(el[strings.LastIndexAny(el, `/\`)+1:])
+	base = strings.TrimSuffix(base, ".exe")
+	if !shellInterpreter.MatchString(base) {
+		return ""
+	}
+	if strings.HasPrefix(base, "python") {
+		return "python"
+	}
+	return base
+}
+
+// isScriptFlag reports whether el makes interpreter read the next argument
+// as code. It errs on the side of refusing: PowerShell takes any prefix of
+// -Command or -EncodedCommand (with - or /), and a short-option cluster
+// such as bash's -lc or perl's -ne counts when it holds c, e or p.
+func isScriptFlag(interpreter, el string) bool {
+	lower := strings.ToLower(el)
+	if !strings.HasPrefix(lower, "-") && !strings.HasPrefix(lower, "/") {
+		return false
+	}
+	name := strings.TrimLeft(lower, "-/")
+	switch name {
+	case "c", "k", "e", "p", "command", "encodedcommand", "ec", "enc", "eval", "print", "exec", "cwa", "commandwithargs":
+		return true
+	}
+	if interpreter == "powershell" || interpreter == "pwsh" {
+		return name != "" && (strings.HasPrefix("command", name) || strings.HasPrefix("encodedcommand", name) || strings.HasPrefix("commandwithargs", name))
+	}
+	return shortOptionCluster.MatchString(lower) && strings.ContainsAny(name, "cep")
+}
+
+// shortOptionCluster is a single-dash cluster of short options, like -lc.
+var shortOptionCluster = regexp.MustCompile(`^-[a-z]{1,8}$`)
 
 // registryEntry is one registry file: a spec, or the error that disabled it.
 type registryEntry struct {

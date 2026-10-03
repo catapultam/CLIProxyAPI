@@ -21,6 +21,7 @@ type Command = {
   args?: string
   text?: string
   argv?: Record<string, string[]>
+  env?: Record<string, string>
   output?: string
   timeout?: number
 }
@@ -155,17 +156,19 @@ type Outcome = { ok: boolean; status: string; output?: string }
 // A bus name, as the proxy's /name accepts it.
 const BUS_NAME = /^[A-Za-z0-9._-]{1,64}$/
 
-// Keeps the proxy token out of anything posted to Slack.
+// Keeps the proxy token out of anything posted to Slack. Runs before any cut, so no prefix of the
+// token survives a truncation.
 function redact(text: string): string {
   return token ? text.split(token).join('[redacted]') : text
 }
 
 function errorText(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err)
-  return oneLine(message).slice(0, 300) || 'failed'
+  return oneLine(redact(message)).slice(0, 300) || 'failed'
 }
 
 // The output in a code block, cut to MAX_OUTPUT_CHARS; a ``` inside can't end the block early.
+// Callers redact first.
 export function codeBlock(output: string): string {
   let text = output.trimEnd()
   let cut = ''
@@ -178,13 +181,78 @@ export function codeBlock(output: string): string {
 }
 
 // The thread reply for a command: the result line, who asked and where it ran, then the output.
+// Every part is redacted before it is cut.
 function commandReport(m: BusMessage, cmd: Command, o: Outcome): string {
-  const who = oneLine(m.slack_user) || 'an allowed Slack user'
-  let asked = oneLine(m.body)
+  const who = oneLine(redact(m.slack_user ?? '')) || 'an allowed Slack user'
+  let asked = oneLine(redact(m.body))
   if (asked.length > 200) asked = `${asked.slice(0, 200)}…`
-  const lines = [`${o.ok ? '✅' : '❌'} !${oneLine(cmd.name)}: ${o.status}`, `asked by ${who} · ran on ${machine} · ${asked}`]
-  if (o.output !== undefined) lines.push(codeBlock(o.output))
+  const lines = [
+    `${o.ok ? '✅' : '❌'} !${oneLine(cmd.name)}: ${redact(o.status)}`,
+    `asked by ${who} · ran on ${machine} · ${asked}`,
+  ]
+  if (o.output !== undefined) lines.push(codeBlock(redact(o.output)))
   return redact(lines.join('\n'))
+}
+
+// An interpreter's base name, lowercased, without .exe. The proxy refuses the same definitions
+// when it loads the registry; this is the mod's own check.
+const SHELL_INTERPRETER = /^(sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh|python[0-9.]*|node|nodejs|perl|ruby|osascript)$/
+const SCRIPT_FLAGS = new Set(['c', 'k', 'e', 'p', 'command', 'encodedcommand', 'ec', 'enc', 'eval', 'print', 'exec', 'cwa', 'commandwithargs'])
+const SHORT_OPTION_CLUSTER = /^-[a-z]{1,8}$/
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
+const PLACEHOLDER = /\{args\}|\{out\}/
+
+function interpreterName(el: string): string {
+  const base = el
+    .slice(Math.max(el.lastIndexOf('/'), el.lastIndexOf('\\')) + 1)
+    .toLowerCase()
+    .replace(/\.exe$/, '')
+  if (!SHELL_INTERPRETER.test(base)) return ''
+  return base.startsWith('python') ? 'python' : base
+}
+
+// Whether el makes the interpreter read the next argument as code (-c, -Command, -e, /c, -lc, ...).
+function isScriptFlag(interpreter: string, el: string): boolean {
+  const lower = el.toLowerCase()
+  if (!lower.startsWith('-') && !lower.startsWith('/')) return false
+  const name = lower.replace(/^[-/]+/, '')
+  if (SCRIPT_FLAGS.has(name)) return true
+  if (interpreter === 'powershell' || interpreter === 'pwsh') {
+    return name !== '' && ['command', 'encodedcommand', 'commandwithargs'].some(flag => flag.startsWith(name))
+  }
+  return SHORT_OPTION_CLUSTER.test(lower) && /[cep]/.test(name)
+}
+
+// Whether a shell definition could hand {args} or {out} to an interpreter as script text, runs a
+// .bat or .cmd (cmd parses those), or puts a placeholder where only a whole value may go.
+export function unsafeShellCommand(argv: readonly string[], env: Record<string, string> | undefined): boolean {
+  const program = (argv[0] ?? '').toLowerCase()
+  if (!program.trim() || program.endsWith('.bat') || program.endsWith('.cmd') || PLACEHOLDER.test(program)) return true
+  let interpreter = ''
+  let script = false
+  for (const el of argv) {
+    if (el === '{args}' || el === '{out}') {
+      if (script) return true
+      continue
+    }
+    if (PLACEHOLDER.test(el)) return true
+    if (!interpreter) {
+      interpreter = interpreterName(el)
+      // cmd treats everything after it as a command line.
+      script = interpreter === 'cmd'
+      continue
+    }
+    script = script || isScriptFlag(interpreter, el)
+  }
+  for (const [name, value] of Object.entries(env ?? {})) {
+    if (!ENV_NAME.test(name)) return true
+    if (value === '{args}' || value === '{out}') {
+      if (!name.startsWith('AGENTBUS_')) return true
+    } else if (PLACEHOLDER.test(value)) {
+      return true
+    }
+  }
+  return false
 }
 
 // The argv key for this machine: windows where Windows says so, else by uname.
@@ -210,16 +278,30 @@ async function tempPath($: EngineInterface, os: string, id: string): Promise<str
   return `${dir.replace(/\/+$/, '')}/${file}`
 }
 
-// The plugin API has no file removal, so the OS's own command deletes it.
+// The plugin API has no file removal, so the OS deletes it. The path never meets a command-line
+// parser: PowerShell reads it from the environment, and rm gets it after --.
 async function removeFile($: EngineInterface, os: string, path: string) {
   try {
-    await $.process.run(os === 'windows' ? ['cmd', '/c', 'del', '/q', path] : ['rm', '-f', path])
+    if (os === 'windows') {
+      await $.process.run(
+        ['powershell', '-NoProfile', '-NonInteractive', '-Command', 'Remove-Item -LiteralPath $env:AGENTBUS_OUT -Force -ErrorAction SilentlyContinue'],
+        { env: { AGENTBUS_OUT: path } },
+      )
+    } else {
+      await $.process.run(['rm', '-f', '--', path])
+    }
   } catch {
     // Best effort.
   }
 }
 
-async function uploadImage($: EngineInterface, m: BusMessage, cmd: Command, path: string): Promise<Outcome> {
+async function uploadImage($: EngineInterface, from: string, m: BusMessage, cmd: Command, path: string): Promise<Outcome> {
+  try {
+    const stat = await $.fs.stat(path)
+    if (stat.kind !== 'file' || stat.size === 0) return { ok: false, status: 'no image produced' }
+  } catch {
+    return { ok: false, status: 'no image produced' }
+  }
   let data: string
   try {
     data = (await $.fs.read(path, { as: 'bytes' })).base64
@@ -227,7 +309,7 @@ async function uploadImage($: EngineInterface, m: BusMessage, cmd: Command, path
     return { ok: false, status: `could not read the image: ${errorText(err)}` }
   }
   const { status, json } = await bus($, 'POST', '/slack/upload', {
-    session,
+    session: from,
     caption: `!${oneLine(cmd.name)} on ${machine}`,
     ...(MESSAGE_ID.test(m.id) ? { reply_to: m.id } : {}),
     filename: `${cmd.name.replace(/[^A-Za-z0-9._-]/g, '_')}.png`,
@@ -239,40 +321,80 @@ async function uploadImage($: EngineInterface, m: BusMessage, cmd: Command, path
   return { ok: true, status: 'exit 0, image posted' }
 }
 
-// Runs a registry shell command: this OS's argv, never through a shell. {args} becomes exactly one
-// argv element, whatever it holds, and {out} a temp file that is deleted afterwards.
-async function runShell($: EngineInterface, m: BusMessage, cmd: Command): Promise<Outcome> {
+// Runs a registry shell command: this OS's argv, never through a shell. An argv element or env
+// value that is exactly {args} becomes the args string, whole; {out} a temp file deleted afterwards.
+async function runShell($: EngineInterface, from: string, m: BusMessage, cmd: Command): Promise<Outcome> {
   if ((await $.env.get('AGENTBUS_ALLOW_SHELL')) !== '1') {
     return { ok: false, status: `shell commands are disabled on ${machine} (set AGENTBUS_ALLOW_SHELL=1 there)` }
   }
   const os = await osKey($)
   const template = cmd.argv?.[os]
   if (!template || template.length === 0) return { ok: false, status: `this command has no argv for ${os}` }
+  if (unsafeShellCommand(template, cmd.env)) return { ok: false, status: 'unsafe command definition' }
   const args = cmd.args ?? ''
   const out = await tempPath($, os, m.id)
-  const argv = template.map(el => (el === '{args}' ? args : el === '{out}' ? out : el))
+  const fill = (v: string) => (v === '{args}' ? args : v === '{out}' ? out : v)
+  const argv = template.map(fill)
+  const env = Object.fromEntries(Object.entries(cmd.env ?? {}).map(([name, value]) => [name, fill(value)]))
+  const usesOut = template.includes('{out}') || Object.values(cmd.env ?? {}).includes('{out}')
   const seconds = cmd.timeout && cmd.timeout > 0 ? cmd.timeout : DEFAULT_SHELL_TIMEOUT_S
+  const timeoutMs = Math.min(seconds * 1000, MAX_SHELL_TIMEOUT_MS)
+  // A stale file from an earlier run must not pass for this run's image.
+  if (cmd.output === 'image') await removeFile($, os, out)
   try {
-    const run = await $.process.run(argv, { timeoutMs: Math.min(seconds * 1000, MAX_SHELL_TIMEOUT_MS) })
+    const run = await $.process.run(argv, cmd.env ? { timeoutMs, env } : { timeoutMs })
     if (run.exitCode !== 0) {
       return { ok: false, status: `exit ${run.exitCode}`, output: run.stderr.trim() ? run.stderr : run.stdout }
     }
-    if (cmd.output === 'image') return await uploadImage($, m, cmd, out)
+    if (cmd.output === 'image') return await uploadImage($, from, m, cmd, out)
     return { ok: true, status: 'exit 0', output: run.stdout }
   } finally {
-    if (template.includes('{out}')) await removeFile($, os, out)
+    if (usesOut) await removeFile($, os, out)
   }
 }
 
-async function executeCommand($: EngineInterface, m: BusMessage, cmd: Command): Promise<Outcome> {
+// Counts runs of this mod's /rename hook, so a Slack !rename can tell whether the hook saw it.
+let renameHookRuns = 0
+
+// Renames this session on the bus after a /rename to args. Returns '' when there's nothing to say
+// (renamed, no name given, or no bus), else a note on why the bus name stayed.
+async function renameOnBus($: EngineInterface, args: string): Promise<string> {
+  const name = args.trim()
+  if (!name || !base || !token || !session) return ''
+  if (!BUS_NAME.test(name)) {
+    return "agentbus: the bus name was not changed: use 1-64 letters, digits, '.', '_' or '-' (no spaces)."
+  }
+  try {
+    const { status, json } = await bus($, 'POST', '/name', { session, name })
+    if (status === 200) {
+      address = (json?.address as string) || address
+      return ''
+    }
+    return status === 409
+      ? `agentbus: the bus name was not changed: ${name} is already taken on the bus.`
+      : `agentbus: the bus name was not changed (HTTP ${status}).`
+  } catch {
+    return 'agentbus: the bus name was not changed: the proxy is unreachable.'
+  }
+}
+
+async function executeCommand($: EngineInterface, from: string, m: BusMessage, cmd: Command): Promise<Outcome> {
   const args = cmd.args ?? ''
   switch (cmd.kind) {
     case 'slash': {
       if (!cmd.command) return { ok: false, status: 'no command to run' }
       // A line break would make the harness read the rest as more input.
       if (LINE_BREAKS.test(args)) return { ok: false, status: 'arguments with a line break are refused' }
+      const hookRuns = renameHookRuns
       const { text } = await $.command.run({ command: cmd.command, args })
-      return { ok: true, status: 'ok', output: text?.trim() ? text : 'done' }
+      let output = text?.trim() ? text : 'done'
+      // A plugin's own $.command.run may skip its own hooks; then the rename hook never saw this
+      // !rename, so rename on the bus here.
+      if (cmd.command === 'rename' && renameHookRuns === hookRuns) {
+        const note = await renameOnBus($, args)
+        if (note) output = `${output}\n${note}`
+      }
+      return { ok: true, status: 'ok', output }
     }
     case 'prompt': {
       // The owner's text, framed like any instruction from them over Slack.
@@ -282,22 +404,25 @@ async function executeCommand($: EngineInterface, m: BusMessage, cmd: Command): 
       return { ok: true, status: 'submitted as a prompt' }
     }
     case 'shell':
-      return runShell($, m, cmd)
+      return runShell($, from, m, cmd)
   }
   return { ok: false, status: `unknown command kind ${oneLine(cmd.kind)}` }
 }
 
-// Runs an owner's command and reports the result in the thread it came from.
+// Runs an owner's command and reports the result in the thread it came from. The session is
+// captured first: a command like !clear moves this session to a new id while it runs, but the
+// reply_to belongs to the session the command was delivered to.
 async function runCommand($: EngineInterface, m: BusMessage, cmd: Command) {
+  const from = session
   let outcome: Outcome
   try {
-    outcome = await executeCommand($, m, cmd)
+    outcome = await executeCommand($, from, m, cmd)
   } catch (err) {
     outcome = { ok: false, status: errorText(err) }
   }
   try {
     await bus($, 'POST', '/send', {
-      from_session: session,
+      from_session: from,
       to: 'slack',
       ...(MESSAGE_ID.test(m.id) ? { reply_to: m.id } : {}),
       body: commandReport(m, cmd, outcome),
@@ -390,27 +515,10 @@ export const register: Register = on => {
   // /rename (typed, or an owner's !rename from Slack) renames the session on the bus too. The
   // title change stands either way; when the bus refuses the name, the output says so.
   on('command.run', { command: 'rename' }, async ($, e, next) => {
+    renameHookRuns++
     const result = await next(e)
-    const name = (e.args ?? '').trim()
-    if (!name || !base || !token || !session) return result
-    let note = ''
-    if (!BUS_NAME.test(name)) {
-      note = "agentbus: the bus name was not changed: use 1-64 letters, digits, '.', '_' or '-' (no spaces)."
-    } else {
-      try {
-        const { status, json } = await bus($, 'POST', '/name', { session, name })
-        if (status === 200) {
-          address = (json?.address as string) || address
-          return result
-        }
-        note =
-          status === 409
-            ? `agentbus: the bus name was not changed: ${name} is already taken on the bus.`
-            : `agentbus: the bus name was not changed (HTTP ${status}).`
-      } catch {
-        note = 'agentbus: the bus name was not changed: the proxy is unreachable.'
-      }
-    }
+    const note = await renameOnBus($, e.args ?? '')
+    if (!note) return result
     // A new answer, without the run's ref, so the engine shows this text.
     const answer: CommandRunResult = { ...result, text: result.text ? `${result.text}\n${note}` : note }
     delete answer.ref

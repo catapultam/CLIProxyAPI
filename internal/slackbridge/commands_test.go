@@ -34,8 +34,10 @@ const (
 	shellYAML  = `description: Screenshot
 kind: shell
 argv:
-  windows: [powershell, -NoProfile, -Command, "capture", "{out}"]
+  windows: [powershell, -NoProfile, -Command, "capture $env:AGENTBUS_OUT"]
   darwin: [screencapture, -x, "{out}"]
+env:
+  AGENTBUS_OUT: "{out}"
 output: image
 `
 	gitLogYAML = `description: Recent commits
@@ -249,6 +251,80 @@ func TestRegistryAcceptsPlaceholdersAsWholeElements(t *testing.T) {
 	}
 	if e, _ := r.lookup("outtext"); e.spec.Output != "text" || e.spec.Timeout != 120 {
 		t.Fatalf("defaults = %+v", e.spec)
+	}
+}
+
+// An interpreter never gets {args} or {out} as script text: after a script
+// flag they are refused at load. A .bat or .cmd program is refused outright
+// (Windows runs it through cmd). {args} anywhere needs an argument rule.
+func TestRegistryKeepsPlaceholdersAwayFromInterpreters(t *testing.T) {
+	const rule = "args_pattern: \"[a-z]+\"\n"
+	for name, content := range map[string]string{
+		"shc":         "kind: shell\nargv:\n  linux: [sh, -c, \"{args}\"]\n" + rule,
+		"shcafter":    "kind: shell\nargv:\n  linux: [sh, -c, \"echo $1\", sh, \"{args}\"]\n" + rule,
+		"bashlc":      "kind: shell\nargv:\n  linux: [/bin/bash, -lc, echo, \"{args}\"]\n" + rule,
+		"zshc":        "kind: shell\nargv:\n  linux: [zsh, -c, x, \"{out}\"]\n",
+		"dashc":       "kind: shell\nargv:\n  linux: [dash, -c, x, \"{out}\"]\n",
+		"kshc":        "kind: shell\nargv:\n  linux: [ksh, -c, x, \"{out}\"]\n",
+		"fishcommand": "kind: shell\nargv:\n  linux: [fish, --command, x, \"{out}\"]\n",
+		"pwshcommand": "kind: shell\nargv:\n  windows: [powershell.exe, -NoProfile, -Command, capture, \"{out}\"]\noutput: image\n",
+		"pwshlower":   "kind: shell\nargv:\n  windows: [pwsh, -command, \"{out}\"]\n",
+		"pwshabbrev":  "kind: shell\nargv:\n  windows: [pwsh, -com, x, \"{out}\"]\n",
+		"pwshenc":     "kind: shell\nargv:\n  windows: [PowerShell, -EncodedCommand, \"{args}\"]\n" + rule,
+		"pwshe":       "kind: shell\nargv:\n  windows: [pwsh, -e, \"{args}\"]\n" + rule,
+		"pwshslash":   "kind: shell\nargv:\n  windows: [powershell, /Command, \"{args}\"]\n" + rule,
+		"cmdc":        "kind: shell\nargv:\n  windows: [cmd, /c, dir, \"{args}\"]\n" + rule,
+		"cmdupper":    "kind: shell\nargv:\n  windows: ['C:\\Windows\\System32\\CMD.EXE', /C, \"{out}\"]\n",
+		"cmdk":        "kind: shell\nargv:\n  windows: [cmd.exe, /k, \"{out}\"]\n",
+		"pythonc":     "kind: shell\nargv:\n  linux: [python3, -c, \"import sys\", \"{args}\"]\n" + rule,
+		"pythonv":     "kind: shell\nargv:\n  linux: [/usr/bin/python3.12, -c, x, \"{args}\"]\n" + rule,
+		"nodee":       "kind: shell\nargv:\n  linux: [node, -e, x, \"{args}\"]\n" + rule,
+		"nodeeval":    "kind: shell\nargv:\n  linux: [node, --eval, x, \"{args}\"]\n" + rule,
+		"perle":       "kind: shell\nargv:\n  linux: [perl, -E, x, \"{args}\"]\n" + rule,
+		"rubye":       "kind: shell\nargv:\n  linux: [ruby, -e, x, \"{args}\"]\n" + rule,
+		"osascripte":  "kind: shell\nargv:\n  darwin: [osascript, -e, \"{args}\"]\n" + rule,
+		"wrapped":     "kind: shell\nargv:\n  linux: [env, sh, -c, x, \"{args}\"]\n" + rule,
+		"bat":         "kind: shell\nargv:\n  windows: [run.bat, \"{args}\"]\n" + rule,
+		"cmdfile":     "kind: shell\nargv:\n  windows: ['C:\\tools\\Run.CMD']\n",
+		"argsnorule":  "kind: shell\nargv:\n  linux: [git, show, \"{args}\"]\n",
+		"envnorule":   "kind: shell\nargv:\n  linux: [tool]\nenv:\n  AGENTBUS_ARGS: \"{args}\"\n",
+		"envembedded": "kind: shell\nargv:\n  linux: [tool]\nenv:\n  AGENTBUS_ARGS: \"x {args}\"\n" + rule,
+		"envembedout": "kind: shell\nargv:\n  linux: [tool]\nenv:\n  AGENTBUS_OUT: \"{out}.png\"\n",
+		"envbadkey":   "kind: shell\nargv:\n  linux: [tool]\nenv:\n  \"1A\": x\n",
+		"envpreload":  "kind: shell\nargv:\n  linux: [tool]\nenv:\n  LD_PRELOAD: \"{args}\"\n" + rule,
+		"envslash":    "kind: slash\ncommand: compact\nenv:\n  A: b\n",
+		"envprompt":   "kind: prompt\ntext: hi\nenv:\n  A: b\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeCommand(t, dir, name+".yaml", content, mtime0)
+			e, ok := newRegistry(dir).lookup(name)
+			if !ok || e.err == nil {
+				t.Fatalf("%s loaded: %+v", content, e.spec)
+			}
+		})
+	}
+}
+
+func TestRegistryAcceptsEnvPassedPlaceholders(t *testing.T) {
+	dir := t.TempDir()
+	writeCommand(t, dir, "gnome.yaml", "kind: shell\nargv:\n  linux: [sh, -c, 'gnome-screenshot -f \"$AGENTBUS_OUT\"']\nenv:\n  AGENTBUS_OUT: \"{out}\"\n  LANG: C\noutput: image\n", mtime0)
+	writeCommand(t, dir, "grep.yaml", "kind: shell\nargv:\n  windows: [powershell, -NoProfile, -Command, 'Select-String -Pattern $env:AGENTBUS_ARGS x.log']\nenv:\n  AGENTBUS_ARGS: \"{args}\"\nargs_pattern: \"[a-z]+\"\n", mtime0)
+	writeCommand(t, dir, "script.yaml", "kind: shell\nargv:\n  linux: [python3, tool.py, \"{args}\"]\n  windows: [pwsh, -NoProfile, -File, tool.ps1, \"{args}\"]\nargs_enum: [a, b]\n", mtime0)
+	r := newRegistry(dir)
+	for _, name := range []string{"gnome", "grep", "script"} {
+		if e, ok := r.lookup(name); !ok || e.err != nil {
+			t.Fatalf("%s = %+v %v", name, e, ok)
+		}
+	}
+	e, _ := r.lookup("gnome")
+	cmd := e.spec.command("")
+	if want := map[string]string{"AGENTBUS_OUT": "{out}", "LANG": "C"}; !reflect.DeepEqual(cmd.Env, want) {
+		t.Fatalf("env = %v, want %v", cmd.Env, want)
+	}
+	e, _ = r.lookup("grep")
+	if cmd = e.spec.command("abc"); cmd.Env["AGENTBUS_ARGS"] != "{args}" || cmd.Args != "abc" {
+		t.Fatalf("grep command = %+v", cmd)
 	}
 }
 
@@ -509,9 +585,9 @@ func TestRegistryCommandShadowsHarness(t *testing.T) {
 		t.Fatalf("slash = %+v", *msgs[1].Command)
 	}
 	shell := agentbus.Command{Name: "screenshot", Kind: "shell", Output: "image", Timeout: 30, Argv: map[string][]string{
-		"windows": {"powershell", "-NoProfile", "-Command", "capture", "{out}"},
+		"windows": {"powershell", "-NoProfile", "-Command", "capture $env:AGENTBUS_OUT"},
 		"darwin":  {"screencapture", "-x", "{out}"},
-	}}
+	}, Env: map[string]string{"AGENTBUS_OUT": "{out}"}}
 	if !reflect.DeepEqual(*msgs[2].Command, shell) {
 		t.Fatalf("shell = %+v", *msgs[2].Command)
 	}

@@ -288,11 +288,25 @@ built in). Fields: `description`; `kind` (`slash`, `prompt` or `shell`);
 `slash`: `command` (without `/`) and optional `args` (may contain `{args}`);
 `prompt`: `text` (may contain `{args}`); `shell`: `argv` (`windows`, `darwin`,
 `linux` → list of strings, where `{args}` and `{out}` may only be whole
-elements and never the program), `output` (`text` default, or `image`, which
-needs an `{out}` element), `timeout_seconds` (1-120, default 30), and at most
+elements and never the program), optional `env` (name → value, names
+`^[A-Za-z_][A-Za-z0-9_]{0,63}$`; a value is a literal without placeholders,
+or exactly `{args}` or `{out}`, and only `AGENTBUS_*` names may take a
+placeholder), `output` (`text` default, or `image`, which needs `{out}` in
+each argv or in `env`), `timeout_seconds` (1-120, default 30), and at most
 one of `args_pattern` (a regex that must compile on its own, then anchored as
-`^(?:…)$`) and `args_enum` (a list). A shell command with neither takes no
-arguments, and a shell argument never contains a line break. A slash `args`
+`^(?:…)$`) and `args_enum` (a list). A command using `{args}` anywhere (argv
+or env) must declare one of them; without `{args}` it takes no arguments,
+and a shell argument never contains a line break. Interpreters never get
+Slack text or the temp path as code: once an argv names an interpreter (sh,
+bash, zsh, dash, ksh, fish, cmd, powershell, pwsh, python*, node, perl, ruby,
+osascript; any directory, `.exe` and case ignored, also behind a wrapper
+like `env`), a placeholder after a script flag (`-c`, `-e`, `-p`, `/c`, `/k`,
+`-Command` and its prefixes, `-EncodedCommand`, `--eval`, a short cluster
+like `-lc` holding c, e or p, …) is refused, and after `cmd` any placeholder
+is. A `.bat` or `.cmd` program is refused. The supported way to hand a value
+to a script is `env`, for example
+`[sh, -c, 'gnome-screenshot -f "$AGENTBUS_OUT"']` with
+`env: {AGENTBUS_OUT: "{out}"}`. A slash `args`
 template without `{args}` takes no arguments either. Files are decoded
 strictly (unknown keys, a second document or an empty file disable it). The
 directory is re-read on lookup when its listing or a file's size or mtime
@@ -349,20 +363,32 @@ mod runs it in the background, so polling continues:
 - `shell`: only where the machine opts in with `AGENTBUS_ALLOW_SHELL=1` in
   its environment; otherwise "shell commands are disabled on `<machine>` (set
   AGENTBUS_ALLOW_SHELL=1 there)". The argv is `windows` when `OS=Windows_NT`,
-  else `darwin` when `uname -s` says `Darwin`, else `linux`. An element that
-  is exactly `{args}` becomes `args` as one element; `{out}` becomes
-  `<TEMP|TMP|TMPDIR|/tmp>/agentbus-<message id>.png`. It runs through
-  `$.process.run` (no shell) with `timeout` seconds. `text` output posts
-  stdout, or stderr (falling back to stdout) on a non-zero exit, which is ❌.
-  `image` output reads `{out}` as bytes (`$.fs.read`, 4 MiB limit), posts it
-  with the JSON upload and `reply_to`, and deletes the file afterwards with
-  `rm -f` or `cmd /c del /q` (the plugin API has no remove).
+  else `darwin` when `uname -s` says `Darwin`, else `linux`. The mod repeats
+  the registry's interpreter, `.bat`/`.cmd` and env checks and refuses a
+  definition that fails them with "unsafe command definition". An argv
+  element or `env` value that is exactly `{args}` becomes `args`, whole;
+  `{out}` becomes `<TEMP|TMP|TMPDIR|/tmp>/agentbus-<message id>.png`. `env` is
+  set over the inherited environment. It runs through `$.process.run` (no
+  shell) with `timeout` seconds. `text` output posts stdout, or stderr
+  (falling back to stdout) on a non-zero exit, which is ❌. For `image`
+  output the mod deletes any file at `{out}` first; afterwards `{out}` must be
+  a non-empty file ("no image produced" otherwise), is read as bytes
+  (`$.fs.read`, 4 MiB limit) and posted with the JSON upload and `reply_to`.
+  Whenever `{out}` was used the file is deleted afterwards (the plugin API
+  has no remove): on Windows by `powershell -NoProfile -NonInteractive
+  -Command "Remove-Item -LiteralPath $env:AGENTBUS_OUT -Force -ErrorAction
+  SilentlyContinue"` with the path in `AGENTBUS_OUT`, elsewhere by
+  `rm -f -- <path>`.
 
 Every run is reported with `/send` to `slack`, `reply_to` the command's
-message id: `✅ !name: <ok|exit 0|…>` or `❌ !name: <error>`, then
-`asked by <slack_user> · ran on <machine> · <!name args>`, then the output
-in a code block cut to 3500 characters. The proxy token is redacted from
-the report; nothing is logged locally. A `command.run` hook on `rename`
-calls `next(e)` first, then, when the trimmed args match
-`^[A-Za-z0-9._-]{1,64}$`, posts `/name`; an invalid or taken bus name keeps
-the new title and appends a note to the command's output.
+message id, from the session the command was delivered to (captured when
+it starts, since `!clear` moves the session to a new id): `✅ !name:
+<ok|exit 0|…>` or `❌ !name: <error>`, then `asked by <slack_user> · ran on
+<machine> · <!name args>`, then the output in a code block cut to 3500
+characters. The proxy token is redacted from every part before anything is
+cut; nothing is logged locally. A `command.run` hook on `rename` calls
+`next(e)` first, then, when the trimmed args match `^[A-Za-z0-9._-]{1,64}$`,
+posts `/name`; an invalid or taken bus name keeps the new title and appends
+a note to the command's output. A plugin's own `$.command.run` may skip the
+plugin's own hooks (the test kit does), so a Slack `!rename` whose run the
+hook didn't see renames on the bus itself, the same way.
