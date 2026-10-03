@@ -224,7 +224,32 @@
 - `docs/agent-commands/README.md` documents the YAML format with one example of each kind.
 - The spec gets the Batch 2 section and the updated manifest (scopes `im:write`, `im:history`, event `message.im`, app_home messages tab).
 
-### Task 5: Verify, review, deploy (controller)
+### Task 5: Read receipts, subagent guard, one-shot hint
+
+User decisions: 📥 (`inbox_tray`) means queued; 👀 (`eyes`) means actually read. Only the main session may talk on the agentbus; subagents report to their parent.
+
+**Read receipts**
+- Record the Slack message's own `ts` in the reply record (state.go), next to channel/thread_ts/session. Persist it.
+- Add an optional bridge interface in agentbus: `Seer{ Seen(msgIDs []string) }`. The store calls it outside its lock in two places:
+  1. after `commitInjection` succeeds (the model received the message in a request);
+  2. when the mod acknowledges. The mod (0.3.3) POSTs `/v1/agentbus/ack {session, ids}` after `$.prompt.submit` resolves for each message it got from `/wait`. Command messages are acked after the command runs.
+  The `/wait` claim itself does NOT count as read.
+- The bridge reacts `eyes` on the original Slack message for each id it knows. Unknown ids are ignored. Apply the same rule to DMs.
+- Messages delivered to sessions without the mod get 👀 only through the injection path.
+- Tests:
+  - injection commit → `Seen`;
+  - `/ack` → `Seen`, only for ids delivered to that session;
+  - an id belonging to another session is ignored;
+  - the reaction is posted to the right channel/ts.
+
+**Subagent guard (mod)**
+- In the `SendMessage` hook, when the target starts with `agentbus:` and the event has `agentId` (a subagent or teammate loop), refuse with `{success:false, message:"Only the main session talks on the agentbus. Report this to your parent agent, and it will send it."}`.
+- Test it.
+
+**One-shot hint (proxy)**
+- In inject.go, when a session has no mod and injected messages include any from Slack, add one line: "This message is shown to you once. If you can't act on it now, write it into your task list."
+
+### Task 6: Verify, review, deploy (controller)
 
 - Full suite, `-race` in a throwaway container on cakebox (then clean up), and a final whole-branch review.
 - Rebase onto `origin/catapultam`, push the branch, and hand it to comms.
