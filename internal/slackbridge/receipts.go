@@ -43,27 +43,43 @@ var (
 	_ agentbus.Worker    = (*Bridge)(nil)
 )
 
-// receiptRank orders receipt reactions; anything else is 0. Done and
-// dismissed are above every reaction advanceReceipts sets (received,
-// working, read), so neither moves back through the normal flow; between
-// themselves, Dismissed and Done each overwrite unconditionally, so the
-// later of the two always wins regardless of rank.
+// receiptRank orders receipt reactions; anything else is 0. received only
+// ever moves a message strictly forward past queued/command. working and
+// read share a rank: they are peers (see advances), and either one replaces
+// the other, whichever was asked for most recently. done and dismissed
+// outrank both, so neither working nor read ever moves a message back to
+// received or below, or replaces done; between done and dismissed
+// themselves, each overwrites the other unconditionally (see doneReceipts,
+// dismissReceipts), so the later of the two always wins regardless of rank.
 func receiptRank(reaction string) int {
 	switch reaction {
 	case reactionQueued, reactionCommand:
 		return 1
 	case reactionReceived:
 		return 2
-	case reactionWorking:
+	case reactionWorking, reactionRead:
 		return 3
-	case reactionRead:
-		return 4
 	case reactionDone:
-		return 5
+		return 4
 	case receiptDismissed:
-		return 6
+		return 5
 	}
 	return 0
+}
+
+// advances reports whether reaction may replace current. received only ever
+// moves a message strictly forward (so it never moves back from working,
+// read, done or dismissed). working and read are peers for this purpose:
+// whichever was asked for most recently always applies, in either
+// direction, as long as the record isn't done or dismissed yet; since both
+// outrank received, this can never move a message back below it either.
+func advances(current, reaction string) bool {
+	switch reaction {
+	case reactionWorking, reactionRead:
+		return receiptRank(current) < receiptRank(reactionDone)
+	default:
+		return receiptRank(reaction) > receiptRank(current)
+	}
 }
 
 // Received marks messages the agent's mod claimed through /wait. It
@@ -96,14 +112,16 @@ func (b *Bridge) Done(sessionID string, ids []string) int {
 }
 
 // Working marks the ids delivered to sessionID (or a session it took over)
-// working, when that is further along than their current receipt. It
-// implements agentbus.Worker and returns how many it marked.
+// working, when the rule in advances allows it. It implements
+// agentbus.Worker and returns how many were owned and unexpired, the same
+// as Done and Dismiss count, whether or not that particular id's state
+// changed.
 func (b *Bridge) Working(sessionID string, ids []string) int {
-	working := b.state.workReceipts(sessionID, ids)
-	for _, id := range working {
+	owned, moved := b.state.workReceipts(sessionID, ids)
+	for _, id := range moved {
 		b.syncReceipt(id)
 	}
-	return len(working)
+	return owned
 }
 
 // advanceReceipts moves ids to reaction and queues a sync of each one that
@@ -130,7 +148,7 @@ func (b *Bridge) syncReceipt(id string) {
 		if r.Group != "" {
 			r.Receipt, r.Shown = b.state.groupReceipt(r.Group)
 		}
-		if r.Receipt == r.Shown {
+		if r.Receipt == r.Shown || (r.Receipt == receiptDismissed && r.Shown == "") {
 			return nil
 		}
 		if r.Receipt == receiptDismissed {
@@ -156,14 +174,15 @@ func (b *Bridge) syncReceipt(id string) {
 }
 
 // advanceReceipts moves each recorded message in ids to receipt reaction
-// when that is further along than its current one, and returns the ids that
-// moved. A receipt never moves back, and never off dismissed. An id with no
-// record yet is kept in early for record; an expired one, or one recorded
-// before receipts (no TS), is ignored.
+// when advances allows it, and returns the ids that moved. received only
+// ever moves a message strictly forward; read and working are peers, so
+// either can replace the other (see advances), but neither moves a message
+// off done or dismissed. An id with no record yet is kept in early for
+// record; an expired one, or one recorded before receipts (no TS), is
+// ignored.
 func (st *state) advanceReceipts(ids []string, reaction string) []string {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	rank := receiptRank(reaction)
 	var out []string
 	for _, id := range ids {
 		if id == "" {
@@ -177,7 +196,7 @@ func (st *state) advanceReceipts(ids []string, reaction string) []string {
 			continue
 		}
 		r := &st.replies[i]
-		if r.TS == "" || rank <= receiptRank(r.Receipt) {
+		if r.TS == "" || !advances(r.Receipt, reaction) {
 			continue
 		}
 		r.Receipt = reaction
@@ -232,31 +251,29 @@ func (st *state) doneReceipts(sid string, ids []string) []string {
 }
 
 // workReceipts marks the unexpired records of ids delivered to sid (as one
-// session across handoffs) working, when that is further along than their
-// current receipt, and returns those ids. Unlike dismissReceipts and
-// doneReceipts, this never moves a receipt back: it is part of the normal
-// advancing flow (queued/command -> received -> working -> read), not a
-// final action either of those can override.
-func (st *state) workReceipts(sid string, ids []string) []string {
+// session across handoffs) working, when advances allows it (working and
+// read are peers: this also moves a record back from read), and reports how
+// many were owned (regardless of whether anything moved, the same as
+// dismissReceipts and doneReceipts count) plus those that actually moved,
+// for the caller to sync.
+func (st *state) workReceipts(sid string, ids []string) (owned int, moved []string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	rank := receiptRank(reactionWorking)
-	var out []string
 	for _, id := range ids {
 		i, ok := st.replyIndexLocked(id)
 		if !ok || !st.sameSessionLocked(st.replies[i].Session, sid) {
 			continue
 		}
-		if st.replies[i].TS == "" || rank <= receiptRank(st.replies[i].Receipt) {
-			continue
+		owned++
+		if advances(st.replies[i].Receipt, reactionWorking) {
+			st.replies[i].Receipt = reactionWorking
+			moved = append(moved, id)
 		}
-		st.replies[i].Receipt = reactionWorking
-		out = append(out, id)
 	}
-	if len(out) > 0 {
+	if len(moved) > 0 {
 		st.dirty = true
 	}
-	return out
+	return owned, moved
 }
 
 // receiptOf returns message id's record (even an expired one, so a late
@@ -298,12 +315,16 @@ func (st *state) setShown(id, shown string) {
 }
 
 // groupReceipt is the receipt a broadcast's message shows (want) and the one
-// it shows now (shown): ✅ once every recipient has marked it done or
-// dismissed it, with at least one done; no reaction once every recipient
-// dismissed it with none done; ⏳ while any recipient is working and none is
-// done yet; 👀 once all read it, where a dismissal counts as read; 📨 once
-// any recipient received it; until then the queued reaction (⚙️ for a
-// command).
+// it shows now (shown): ✅ once every non-dismissed recipient is done, with
+// at least one (and no reaction if every recipient dismissed it instead);
+// otherwise ⏳ while any recipient is working, or is done but not every
+// recipient has read it yet (done counts as read-or-beyond, so a done
+// recipient alone never shows ⏳, but it also never masks another
+// recipient's own ⏳); 👀 once all have read it, a dismissal counting as
+// read; 📨 once any recipient received it; until then the queued reaction
+// (⚙️ for a command). This is monotone in each recipient's own rank: moving
+// forward (including read -> working, since they are peers) never moves
+// the group backward.
 func (st *state) groupReceipt(group string) (want, shown string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -342,7 +363,7 @@ func (st *state) groupReceipt(group string) (want, shown string) {
 	case allDoneOrDismissed:
 		// Every recipient dismissed it, and none marked it done: no reaction.
 		return receiptDismissed, shown
-	case anyWorking && !anyDone:
+	case (anyWorking || anyDone) && !allRead:
 		return reactionWorking, shown
 	case allRead:
 		return reactionRead, shown

@@ -135,17 +135,49 @@ export function quote(body: string | undefined): string {
     .join('\n')
 }
 
-// Splits body at a trailing "done" line, trimmed and lowercased, when there is other non-empty
-// content above it, and returns body with that line (and any blank lines after it) removed.
-// Returns undefined when body has no such line, or is only that line (the bare case, handled
-// separately).
+// Splits body at the line break before a trailing "done" line, trimmed and lowercased, when
+// there is other non-empty content above it that isn't itself a bare control word (ignore, done
+// or working: this is left to the proxy's own guard, untouched) and isn't preceded by an odd
+// number of ``` fences (an unclosed code block, most often a shell loop's own "done" keyword).
+// Returns body sliced at that line break's start, never rejoined, so a CRLF or other line break
+// earlier in the body is untouched. Returns undefined when body has no such line, or nothing else
+// above it.
 export function stripTrailingDone(body: string): string | undefined {
-  const lines = body.split(LINE_BREAKS)
-  let last = lines.length - 1
-  while (last >= 0 && lines[last].trim() === '') last--
-  if (last < 0 || lines[last].trim().toLowerCase() !== DONE_WORD) return undefined
-  const rest = lines.slice(0, last).join('\n').replace(/\n+$/, '')
-  return rest.trim() ? rest : undefined
+  const breaks = new RegExp(LINE_BREAKS.source, 'g')
+  const seps: Array<{ index: number; length: number }> = []
+  let m: RegExpExecArray | null
+  while ((m = breaks.exec(body))) seps.push({ index: m.index, length: m[0].length })
+  const starts = [0, ...seps.map(s => s.index + s.length)]
+  for (let i = starts.length - 1; i >= 0; i--) {
+    const lineEnd = i < seps.length ? seps[i].index : body.length
+    const line = body.slice(starts[i], lineEnd)
+    if (line.trim() === '') continue
+    if (line.trim().toLowerCase() !== DONE_WORD) return undefined
+    if (i === 0) return undefined // The whole body is just this line: the bare case.
+    const rest = body.slice(0, seps[i - 1].index).replace(/\s+$/, '')
+    if (!rest || isBareControlWord(rest) || oddFencesBefore(rest)) return undefined
+    return rest
+  }
+  return undefined
+}
+
+// isBareControlWord reports whether s, trimmed and lowercased, is exactly one of the SendMessage
+// control words (ignore, done or working).
+function isBareControlWord(s: string): boolean {
+  switch (s.trim().toLowerCase()) {
+    case DISMISS_WORD:
+    case DONE_WORD:
+    case WORKING_WORD:
+      return true
+    default:
+      return false
+  }
+}
+
+// oddFencesBefore reports whether rest has an odd number of ``` fences, meaning a matched
+// trailing "done" line would sit inside a still-open code block rather than stand alone.
+function oddFencesBefore(rest: string): boolean {
+  return ((rest.match(/```/g) ?? []).length % 2) === 1
 }
 
 // SendMessage has no reply_to field, so "<target>#<message id>" carries one. Names and addresses
@@ -179,12 +211,12 @@ function slackRules(m: BusMessage): string {
       `instead of replying: SendMessage to "${PREFIX}slack#${m.id}" with message "${DISMISS_WORD}".`
     : ''
   // One short line telling agents how to mark it done, or flag a long task as working, merged
-  // with the dismiss hint above; needs a real id, like dismiss does.
+  // with the dismiss hint above; needs a real id, like dismiss does. The dismiss hint already
+  // says how to send "ignore", so this doesn't repeat it.
   const done = validID
     ? `\nWhen you've fully answered or finished what a Slack message asked, mark it done: reply with ` +
-      `"${DONE_WORD}" on its own last line, or send "${DONE_WORD}" to "${PREFIX}slack#${m.id}". If it wasn't ` +
-      `meant for you, send "${DISMISS_WORD}". Long task? Send "${WORKING_WORD}" to "${PREFIX}slack#${m.id}"; ` +
-      `finish with "${DONE_WORD}".`
+      `"${DONE_WORD}" on its own last line, or send "${DONE_WORD}" to "${PREFIX}slack#${m.id}". Long task? ` +
+      `Send "${WORKING_WORD}" to "${PREFIX}slack#${m.id}"; finish with "${DONE_WORD}".`
     : ''
   return `\n${DISCLOSURE_RULE}${dismiss}${done}`
 }
@@ -813,6 +845,7 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    cancelWorking()
     try {
       await Promise.race([bus($, 'POST', '/bye', { session }), $.clock.sleep(1000)])
     } catch {
@@ -868,11 +901,15 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // Only the main loop's turns count, and one that died on an API error leaves its messages for the
-  // next turn to complete (and schedules a fresh working timer once it's retried, in turn.start).
+  // Only the main loop's turns count: a subagent's own turn.complete must not cancel the main
+  // turn's working timer (it's a different loop entirely). One that died on an API error leaves
+  // its messages for the next turn to complete (and schedules a fresh working timer once it's
+  // retried, in turn.start).
   on('turn.complete', async ($, e, next) => {
-    cancelWorking()
-    if (!e.agentId && e.reason !== 'error') void turnCompleted($)
+    if (!e.agentId) {
+      cancelWorking()
+      if (e.reason !== 'error') void turnCompleted($)
+    }
     return next(e)
   })
 
@@ -926,17 +963,26 @@ export const register: Register = on => {
       body,
     })
     if (status === 200) {
+      // The post went through either way; a failed or zero-count follow-up mark is noted, not
+      // hidden, so the agent knows no ✅ was set.
+      let note = ''
       if (markDoneAfterSend) {
         try {
-          await bus($, 'POST', '/done', { session, ids: [target.reply_to as string] })
+          const marked = await bus($, 'POST', '/done', { session, ids: [target.reply_to as string] })
+          if (marked.status !== 200) {
+            const reason = `HTTP ${marked.status} ${marked.json?.error ?? ''}`.trim()
+            note = ` (not marked done: ${reason})`
+          } else if (Number(marked.json?.done ?? 0) < 1) {
+            note = " (not marked done: that message wasn't delivered to you)"
+          }
         } catch {
-          // Best effort: the post already succeeded; the receipt stays wherever it was.
+          note = ' (not marked done: the proxy is unreachable)'
         }
       }
       return {
         result: {
           success: true,
-          message: `Sent ${json?.id} to ${json?.to} over the agentbus. A reply arrives as a new message in this session.`,
+          message: `Sent ${json?.id} to ${json?.to} over the agentbus. A reply arrives as a new message in this session.${note}`,
         },
       }
     }

@@ -208,9 +208,11 @@ func TestBroadcastAggregateReceipts(t *testing.T) {
 	}
 }
 
-// Task 9 addendum: the aggregate shows ⏳ while any recipient is working and
-// none is done yet, and ✅ once every recipient has marked it done or
-// dismissed it, with at least one done.
+// Task 9 fix round 1 (I3): the aggregate is monotone in each recipient's
+// own rank. It shows ⏳ while any recipient is working, or is done but
+// another isn't done/read/dismissed yet (a recipient reaching done must
+// never drag the group backward to 📨), and ✅ once every non-dismissed
+// recipient is done, with at least one.
 func TestBroadcastAggregateWithWorkingAndDone(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	const ts = "1700011500.000003"
@@ -229,11 +231,32 @@ func TestBroadcastAggregateWithWorkingAndDone(t *testing.T) {
 	step(reactionWorking, func() { b.Working(sidA, []string{idA}) })
 	// One received, one still working: still ⏳.
 	step(reactionWorking, func() { b.Received([]string{idB}) })
-	// idA finishes and marks done, idB is still only received: 📨 (the
-	// existing rules apply once nobody is working any more).
-	step(reactionReceived, func() { bus.Done(sidA, []string{idA}) })
+	// idA finishes and marks done; idB is still only received. The group must not drop below
+	// where it already was: ⏳, not 📨.
+	step(reactionWorking, func() { bus.Done(sidA, []string{idA}) })
 	// idB marks done too: now every recipient is done.
 	step(reactionDone, func() { bus.Done(sidB, []string{idB}) })
+}
+
+// Task 9 fix round 1 (I3): one recipient working and another already done
+// still shows ⏳ — the done recipient never masks the other's working.
+func TestBroadcastAggregateWorkingAndDoneShowsWorking(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	const ts = "1700011500.000005"
+	b.handleEvent("EvBr5", msg("UALEX", "all: ship it", ts, ""))
+	idA := claimBroadcast(t, bus, sidA, "ship it", "").ID
+	idB := claimBroadcast(t, bus, sidB, "ship it", "").ID
+	drainJobs(t, b)
+	if n := bus.Done(sidB, []string{idB}); n != 1 {
+		t.Fatalf("done B = %d", n)
+	}
+	if n := bus.Working(sidA, []string{idA}); n != 1 {
+		t.Fatalf("working A = %d", n)
+	}
+	drainJobs(t, b)
+	if got := f.reactionsOn("CAGENTS", ts); !reflect.DeepEqual(got, []string{reactionWorking}) {
+		t.Fatalf("A working, B done = %v", got)
+	}
 }
 
 // Task 9: when every recipient dismisses a broadcast and none marks it

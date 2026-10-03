@@ -20,23 +20,11 @@ type Worker interface {
 // with these messages yet, and the eventual /ack still has to find them
 // there to move them on to read.
 func (s *Store) Working(id string, ids []string) int {
-	var valid []string
-	for _, msgID := range ids {
-		if validReplyTo.MatchString(msgID) {
-			valid = append(valid, msgID)
-		}
-	}
-	if len(valid) == 0 {
-		return 0
-	}
-	s.mu.Lock()
-	_, ok := s.byID[id]
+	valid, bridge, ok := s.prepareMark(id, ids, false)
 	if !ok {
-		s.mu.Unlock()
 		return 0
 	}
-	w, _ := s.bridge.(Worker)
-	s.mu.Unlock()
+	w, _ := bridge.(Worker)
 	if w == nil {
 		return 0
 	}

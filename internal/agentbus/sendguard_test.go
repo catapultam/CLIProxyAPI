@@ -165,3 +165,118 @@ func TestSendGuardDoesNotApplyWithoutReplyTo(t *testing.T) {
 		t.Fatalf("posts = %+v", b.posts)
 	}
 }
+
+// M7: a foreign reply_to (delivered to someone else) counts zero and posts
+// nothing, the same as a direct /dismiss or /done would.
+func TestSendGuardForeignReplyToCountsZeroNoPost(t *testing.T) {
+	s, r := newTestServer(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.Hello(sidB, "pc", "/b", "", true)
+	b := &guardBridge{fakeBridge: fakeBridge{users: []string{"alex"}}}
+	s.SetBridge(b)
+	_, theirs, err := s.DeliverVia(sidB, "for b", "alex", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.owned = map[string]string{theirs: sidB}
+	w := do(r, http.MethodPost, "/v1/agentbus/send", sendReq(sidA, "slack", theirs, "ignore"))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"dismissed":0`) {
+		t.Fatalf("send = %d %s", w.Code, w.Body)
+	}
+	if len(b.posts) != 0 {
+		t.Fatalf("posts = %+v", b.posts)
+	}
+}
+
+// M7: when the post itself fails (here, an unknown from_session), Done must
+// not be called for the trailing-done-line path.
+func TestSendGuardTrailingDoneNeverMarksDoneWhenSendFails(t *testing.T) {
+	_, b, mine := newGuardServer(t)
+	w := do(b.r, http.MethodPost, "/v1/agentbus/send", sendReq("ghost-session", "slack", mine, "Rebased.\n\ndone\n"))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("send = %d %s", w.Code, w.Body)
+	}
+	if len(b.posts) != 0 {
+		t.Fatalf("posts = %+v", b.posts)
+	}
+	if len(b.marked) != 0 {
+		t.Fatalf("marked done on a failed send = %+v", b.marked)
+	}
+}
+
+// M7: the guard never applies to a DM target ("slack@<label>"), which
+// ignores reply_to entirely; a control word there posts as usual.
+func TestSendGuardDoesNotApplyToSlackDM(t *testing.T) {
+	_, b, mine := newGuardServer(t)
+	w := do(b.r, http.MethodPost, "/v1/agentbus/send", sendReq(sidA, "slack@alex", mine, "ignore"))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"m_`) {
+		t.Fatalf("send = %d %s", w.Code, w.Body)
+	}
+	if len(b.posts) != 1 || b.posts[0].Body != "ignore" {
+		t.Fatalf("posts = %+v", b.posts)
+	}
+}
+
+// M1: CRLF line breaks in the body never leave a stray "\r" or blank line
+// in what gets posted.
+func TestSendGuardTrailingDoneLineHandlesCRLF(t *testing.T) {
+	_, b, mine := newGuardServer(t)
+	w := do(b.r, http.MethodPost, "/v1/agentbus/send", sendReq(sidA, "slack", mine, "Rebased.\r\n\r\ndone\r\n"))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"m_`) {
+		t.Fatalf("send = %d %s", w.Code, w.Body)
+	}
+	if len(b.posts) != 1 || b.posts[0].Body != "Rebased." {
+		t.Fatalf("posts = %+v", b.posts)
+	}
+}
+
+// A body that merely ends with "Done." (trailing punctuation) is not a
+// bare match and has no other content above a bare "done" line either: it
+// posts as ordinary text.
+func TestSendGuardDoneWithPunctuationPostsAsText(t *testing.T) {
+	_, b, mine := newGuardServer(t)
+	w := do(b.r, http.MethodPost, "/v1/agentbus/send", sendReq(sidA, "slack", mine, "Done."))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"m_`) {
+		t.Fatalf("send = %d %s", w.Code, w.Body)
+	}
+	if len(b.posts) != 1 || b.posts[0].Body != "Done." {
+		t.Fatalf("posts = %+v", b.posts)
+	}
+	if len(b.marked) != 0 {
+		t.Fatalf("marked done = %+v", b.marked)
+	}
+}
+
+// M2: a shell loop's own closing "done" keyword, inside a still-open code
+// fence, is never mistaken for the control word.
+func TestSendGuardDoesNotStripDoneInsideOpenFence(t *testing.T) {
+	_, b, mine := newGuardServer(t)
+	body := "Patched the backup script:\n```\nfor f in *.log; do\n  gzip \"$f\"\ndone"
+	w := do(b.r, http.MethodPost, "/v1/agentbus/send", sendReq(sidA, "slack", mine, body))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"m_`) {
+		t.Fatalf("send = %d %s", w.Code, w.Body)
+	}
+	if len(b.posts) != 1 || b.posts[0].Body != body {
+		t.Fatalf("posts = %+v", b.posts)
+	}
+	if len(b.marked) != 0 {
+		t.Fatalf("marked done = %+v", b.marked)
+	}
+}
+
+// M3: a trailing "done" line whose remainder is itself a bare control word
+// is left alone (sent unchanged) rather than posted as text and then
+// marked done on top of it.
+func TestSendGuardDoesNotStripWhenRemainderIsControlWord(t *testing.T) {
+	_, b, mine := newGuardServer(t)
+	w := do(b.r, http.MethodPost, "/v1/agentbus/send", sendReq(sidA, "slack", mine, "ignore\ndone"))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"m_`) {
+		t.Fatalf("send = %d %s", w.Code, w.Body)
+	}
+	if len(b.posts) != 1 || b.posts[0].Body != "ignore\ndone" {
+		t.Fatalf("posts = %+v", b.posts)
+	}
+	if len(b.marked) != 0 {
+		t.Fatalf("marked done = %+v", b.marked)
+	}
+}

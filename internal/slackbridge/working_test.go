@@ -5,11 +5,11 @@ import (
 	"testing"
 )
 
-// Task 9 addendum: a turn still running on a message, 15s after it started,
-// shows ⏳; it sits between received and read in the normal advancing flow,
-// so it never moves a receipt back (a late Received call after Read, or
-// after Working itself, changes nothing), and Read still moves it on.
-func TestWorkingSitsBetweenReceivedAndRead(t *testing.T) {
+// Task 9 fix round 1 (C1): working and read are peers below done and
+// dismissed: a turn still running 15s after it started shows ⏳; the turn
+// completing shows 👀; a later explicit "working" (a long task that
+// continues) shows ⏳ again; done finishes it for good.
+func TestReceiptSequenceWorkingReadWorkingDone(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	root := threadOf(t, b, bus)
 	id := queuedID(t, b, root, "41.1", "please rebase")
@@ -18,6 +18,7 @@ func TestWorkingSitsBetweenReceivedAndRead(t *testing.T) {
 	if got := f.reactionsOn("CAGENTS", "41.1"); !reflect.DeepEqual(got, []string{reactionReceived}) {
 		t.Fatalf("after received = %v", got)
 	}
+	// The 15s timer: ⏳.
 	if n := bus.Working(sidA, []string{id}); n != 1 {
 		t.Fatalf("Working = %d", n)
 	}
@@ -25,29 +26,40 @@ func TestWorkingSitsBetweenReceivedAndRead(t *testing.T) {
 	if got := f.reactionsOn("CAGENTS", "41.1"); !reflect.DeepEqual(got, []string{reactionWorking}) {
 		t.Fatalf("after working = %v", got)
 	}
-	// A late, redundant Received does nothing: working never moves back.
-	b.Received([]string{id})
-	drainJobs(t, b)
-	if got := f.reactionsOn("CAGENTS", "41.1"); !reflect.DeepEqual(got, []string{reactionWorking}) {
-		t.Fatalf("after a late received = %v", got)
-	}
+	// The turn completes: /ack moves it to 👀.
 	b.Read([]string{id})
 	drainJobs(t, b)
 	if got := f.reactionsOn("CAGENTS", "41.1"); !reflect.DeepEqual(got, []string{reactionRead}) {
 		t.Fatalf("after read = %v", got)
 	}
-	// Working after read (a slow /working call) never moves it back either.
-	if n := bus.Working(sidA, []string{id}); n != 0 {
+	// The task continues in a later turn: explicit "working" moves it back to ⏳. Working and
+	// read are peers, so this is allowed, unlike a plain Received trying to move it back.
+	if n := bus.Working(sidA, []string{id}); n != 1 {
 		t.Fatalf("Working after read = %d", n)
 	}
 	drainJobs(t, b)
-	if got := f.reactionsOn("CAGENTS", "41.1"); !reflect.DeepEqual(got, []string{reactionRead}) {
-		t.Fatalf("after a late working = %v", got)
+	if got := f.reactionsOn("CAGENTS", "41.1"); !reflect.DeepEqual(got, []string{reactionWorking}) {
+		t.Fatalf("after working again = %v", got)
+	}
+	// A late, redundant Received never moves it back below working/read.
+	b.Received([]string{id})
+	drainJobs(t, b)
+	if got := f.reactionsOn("CAGENTS", "41.1"); !reflect.DeepEqual(got, []string{reactionWorking}) {
+		t.Fatalf("after a late received = %v", got)
+	}
+	// Done finishes it for good.
+	if n := bus.Done(sidA, []string{id}); n != 1 {
+		t.Fatalf("Done = %d", n)
+	}
+	drainJobs(t, b)
+	if got := f.reactionsOn("CAGENTS", "41.1"); !reflect.DeepEqual(got, []string{reactionDone}) {
+		t.Fatalf("after done = %v", got)
 	}
 }
 
-// Working never overrides a terminal done or dismissed.
-func TestWorkingNeverOverridesDoneOrDismissed(t *testing.T) {
+// Working counts an id as owned (like Done and Dismiss do) even when the record is already done:
+// the state doesn't move, but the id was still delivered to this session.
+func TestWorkingAfterDoneCountsButStaysDone(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	root := threadOf(t, b, bus)
 	id := queuedID(t, b, root, "41.2", "please rebase")
@@ -55,25 +67,51 @@ func TestWorkingNeverOverridesDoneOrDismissed(t *testing.T) {
 		t.Fatalf("Done = %d", n)
 	}
 	drainJobs(t, b)
-	if n := bus.Working(sidA, []string{id}); n != 0 {
+	if n := bus.Working(sidA, []string{id}); n != 1 {
 		t.Fatalf("Working after done = %d", n)
 	}
 	drainJobs(t, b)
 	if got := f.reactionsOn("CAGENTS", "41.2"); !reflect.DeepEqual(got, []string{reactionDone}) {
 		t.Fatalf("after working = %v", got)
 	}
+}
 
-	id2 := queuedID(t, b, root, "41.3", "please rebase again")
-	if n := bus.Dismiss(sidA, []string{id2}); n != 1 {
+// Working after dismiss counts (owned, unexpired), and dismiss still wins: no reaction.
+func TestWorkingAfterDismissShowsNoReaction(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	root := threadOf(t, b, bus)
+	id := queuedID(t, b, root, "41.3", "please rebase again")
+	if n := bus.Dismiss(sidA, []string{id}); n != 1 {
 		t.Fatalf("Dismiss = %d", n)
 	}
 	drainJobs(t, b)
-	if n := bus.Working(sidA, []string{id2}); n != 0 {
+	if n := bus.Working(sidA, []string{id}); n != 1 {
 		t.Fatalf("Working after dismiss = %d", n)
 	}
 	drainJobs(t, b)
 	if got := f.reactionsOn("CAGENTS", "41.3"); len(got) != 0 {
 		t.Fatalf("after working = %v", got)
+	}
+}
+
+// Dismiss after working removes ⏳: dismiss still clears everything.
+func TestDismissAfterWorkingShowsNoReaction(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	root := threadOf(t, b, bus)
+	id := queuedID(t, b, root, "41.5", "please rebase")
+	if n := bus.Working(sidA, []string{id}); n != 1 {
+		t.Fatalf("Working = %d", n)
+	}
+	drainJobs(t, b)
+	if got := f.reactionsOn("CAGENTS", "41.5"); !reflect.DeepEqual(got, []string{reactionWorking}) {
+		t.Fatalf("after working = %v", got)
+	}
+	if n := bus.Dismiss(sidA, []string{id}); n != 1 {
+		t.Fatalf("Dismiss = %d", n)
+	}
+	drainJobs(t, b)
+	if got := f.reactionsOn("CAGENTS", "41.5"); len(got) != 0 {
+		t.Fatalf("after dismiss = %v", got)
 	}
 }
 

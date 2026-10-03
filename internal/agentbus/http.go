@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
@@ -65,13 +66,13 @@ func (s *Store) handleSend(c *gin.Context) {
 	if replyTo := cleanReplyTo(req.ReplyTo); replyTo != "" && isSlackAddress(req.To) {
 		switch strings.ToLower(strings.TrimSpace(req.Body)) {
 		case ignoreWord:
-			c.JSON(http.StatusOK, gin.H{"dismissed": s.Dismiss(from, []string{replyTo})})
+			c.JSON(http.StatusOK, gin.H{"to": SlackAddress, "dismissed": s.Dismiss(from, []string{replyTo})})
 			return
 		case doneWord:
-			c.JSON(http.StatusOK, gin.H{"done": s.Done(from, []string{replyTo})})
+			c.JSON(http.StatusOK, gin.H{"to": SlackAddress, "done": s.Done(from, []string{replyTo})})
 			return
 		case workingWord:
-			c.JSON(http.StatusOK, gin.H{"working": s.Working(from, []string{replyTo})})
+			c.JSON(http.StatusOK, gin.H{"to": SlackAddress, "working": s.Working(from, []string{replyTo})})
 			return
 		}
 		if rest, ok := trailingDoneLine(req.Body); ok {
@@ -88,26 +89,61 @@ func (s *Store) handleSend(c *gin.Context) {
 }
 
 // trailingDoneLine reports whether body's last non-empty line, trimmed and
-// lowercased, is exactly "done", with other non-empty content above it, and
-// returns body with that line (and any blank lines after it) removed. ok is
-// false when body is only that line, or has no such line.
+// lowercased, is exactly "done", with other non-empty content above it that
+// is itself neither a bare control word (ignore, done or working: the mod
+// sends those unstripped and lets this guard handle them directly) nor
+// preceded by an odd number of ``` fences (an unclosed code block, most
+// often a shell loop's own "done" keyword). It returns body sliced at the
+// line break before that line (never rejoined, so a CRLF or other line
+// break earlier in the body is untouched); ok is false otherwise. It reuses
+// inject.go's lineBreaks (the same set the mod's own LINE_BREAKS matches,
+// "\r\n" as a single unit), so a CRLF body is never split into a line with
+// a stray trailing "\r".
 func trailingDoneLine(body string) (rest string, ok bool) {
-	lines := strings.Split(body, "\n")
-	last := -1
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.TrimSpace(lines[i]) != "" {
-			last = i
-			break
+	seps := lineBreaks.FindAllStringIndex(body, -1)
+	starts := make([]int, len(seps)+1)
+	for i, m := range seps {
+		starts[i+1] = m[1]
+	}
+	for i := len(starts) - 1; i >= 0; i-- {
+		lineEnd := len(body)
+		if i < len(seps) {
+			lineEnd = seps[i][0]
 		}
+		line := body[starts[i]:lineEnd]
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(line)) != doneWord {
+			return "", false
+		}
+		if i == 0 {
+			return "", false // The whole body is just this line: the bare case.
+		}
+		rest = strings.TrimRightFunc(body[:seps[i-1][0]], unicode.IsSpace)
+		if rest == "" || isBareControlWord(rest) || oddFencesBefore(rest) {
+			return "", false
+		}
+		return rest, true
 	}
-	if last < 0 || strings.ToLower(strings.TrimSpace(lines[last])) != doneWord {
-		return "", false
+	return "", false
+}
+
+// isBareControlWord reports whether s, trimmed and lowercased, is exactly
+// one of the /send control words (ignore, done or working).
+func isBareControlWord(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case ignoreWord, doneWord, workingWord:
+		return true
 	}
-	rest = strings.TrimRight(strings.Join(lines[:last], "\n"), "\n")
-	if strings.TrimSpace(rest) == "" {
-		return "", false
-	}
-	return rest, true
+	return false
+}
+
+// oddFencesBefore reports whether rest has an odd number of ``` fences,
+// meaning a matched trailing "done" line would sit inside a still-open
+// code block rather than stand alone after the reply.
+func oddFencesBefore(rest string) bool {
+	return strings.Count(rest, "```")%2 == 1
 }
 
 // writeSendResult writes handleSend's response for what Send returned.

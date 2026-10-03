@@ -16,32 +16,11 @@ type Doner interface {
 // id; they no longer count for /ack either. It returns how many were
 // marked; an unknown session marks none.
 func (s *Store) Done(id string, ids []string) int {
-	var valid []string
-	for _, msgID := range ids {
-		if validReplyTo.MatchString(msgID) {
-			valid = append(valid, msgID)
-		}
-	}
-	if len(valid) == 0 {
-		return 0
-	}
-	s.mu.Lock()
-	sess, ok := s.byID[id]
+	valid, bridge, ok := s.prepareMark(id, ids, true)
 	if !ok {
-		s.mu.Unlock()
 		return 0
 	}
-	for _, msgID := range valid {
-		if _, pending := sess.Unacked[msgID]; pending {
-			delete(sess.Unacked, msgID)
-			s.dirty = true
-		}
-	}
-	if len(sess.Unacked) == 0 {
-		sess.Unacked = nil
-	}
-	d, _ := s.bridge.(Doner)
-	s.mu.Unlock()
+	d, _ := bridge.(Doner)
 	if d == nil {
 		return 0
 	}

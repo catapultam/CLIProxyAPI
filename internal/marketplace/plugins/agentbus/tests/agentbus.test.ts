@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { SHELL_CASES } from './shell-cases'
+import { stripTrailingDone } from '../hooks/register'
 
 const ENV = {
   ANTHROPIC_BASE_URL: 'http://bus.test:8317/',
@@ -234,13 +235,70 @@ test('a reply that is only blank lines and "done" marks done without posting', a
   expect(calls.some(c => c.url.endsWith('/send'))).toBe(false)
 })
 
+// Fix round 1 (M1, M2, M3, M7): direct unit coverage of the exported stripTrailingDone, since the
+// SendMessage hook only exercises it indirectly.
+test('stripTrailingDone handles CRLF without a stray break', ($, on) => {
+  expect(stripTrailingDone('Rebased.\r\n\r\ndone\r\n')).toBe('Rebased.')
+})
+
+test('stripTrailingDone does not strip inside an unclosed ``` fence (a shell loop\'s own "done")', ($, on) => {
+  const body = 'Patched the backup script:\n```\nfor f in *.log; do\n  gzip "$f"\ndone'
+  expect(stripTrailingDone(body)).toBe(undefined)
+})
+
+test('stripTrailingDone does not strip when the remainder is itself a bare control word', ($, on) => {
+  expect(stripTrailingDone('ignore\ndone')).toBe(undefined)
+  expect(stripTrailingDone('working\ndone')).toBe(undefined)
+})
+
+test('stripTrailingDone returns undefined with no other content, or no "done" line', ($, on) => {
+  expect(stripTrailingDone('done')).toBe(undefined)
+  expect(stripTrailingDone('just text')).toBe(undefined)
+})
+
+// Fix round 1 (M3): the mod leaves a control-word remainder unstripped and sends it unchanged;
+// the proxy's own guard (not exercised here) is the one that acts on it.
+test('a reply ending in "done" whose remainder is a control word is sent unchanged', async ($, on) => {
+  const calls = wire($, on, [])
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'ignore\ndone' })
+  expect((out.result as { success: boolean }).success).toBe(true)
+  const send = calls.find(c => c.url.endsWith('/send'))
+  expect(send?.body).toEqual({ from_session: DEFAULT_SESSION_ID, to: 'slack', body: 'ignore\ndone', reply_to: 'm_0123abcd' })
+  expect(calls.some(c => c.url.endsWith('/done'))).toBe(false)
+})
+
+// Fix round 1 (M4): a failed or zero-count follow-up /done is noted, not hidden; the send itself
+// still counts as a success.
+test('a failed follow-up /done after a trailing-done reply is noted, not hidden', async ($, on) => {
+  const calls = wire($, on, [], undefined, PEERS, { routes: { '/done': { status: 500, text: '{"error":"boom"}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'Rebased.\n\ndone\n' })
+  const result = out.result as { success: boolean; message: string }
+  expect(result.success).toBe(true)
+  expect(result.message).toContain('(not marked done: HTTP 500 boom)')
+  expect(calls.some(c => c.url.endsWith('/send'))).toBe(true)
+})
+
+test('a zero-count follow-up /done after a trailing-done reply is noted, not hidden', async ($, on) => {
+  wire($, on, [], undefined, PEERS, { routes: { '/done': { status: 200, text: '{"done":0}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'Rebased.\n\ndone\n' })
+  const result = out.result as { success: boolean; message: string }
+  expect(result.success).toBe(true)
+  expect(result.message).toContain("(not marked done: that message wasn't delivered to you)")
+})
+
 // Task 9 addendum: the done hint is merged with a short line about flagging a long task working.
+// Fix round 1 (M8): it doesn't repeat the dismiss hint's own "ignore" instruction.
 test('Slack framings say how to mark a message done, or flag it working, with its real id', async ($, on) => {
   const prompts = await promptsFor($, on, [{ id: 'm_e9', from: 'slack', body: 'a', from_user: true, slack_user: 'jane', via: 'group' }])
   expect(at(prompts, 0)).toContain(
     'mark it done: reply with "done" on its own last line, or send "done" to "agentbus:slack#m_e9". ' +
-      'If it wasn\'t meant for you, send "ignore". Long task? Send "working" to "agentbus:slack#m_e9"; finish with "done".',
+      'Long task? Send "working" to "agentbus:slack#m_e9"; finish with "done".',
   )
+  const done = at(prompts, 0)
+  if ((done.match(/"ignore"/g) ?? []).length !== 1) throw new Error(`"ignore" mentioned more than once:\n${done}`)
 })
 
 test('SendMessage drops a malformed #id and sends without reply_to', async ($, on) => {
@@ -1115,6 +1173,50 @@ test('a turn under 15s never marks the message working', async ($, on) => {
   await clock.settle()
   expect(workings(calls)).toEqual([])
   expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+})
+
+// Fix round 1 (I1): a subagent's own turn.complete (agentId set) must not cancel the main turn's
+// working timer: it's a different loop. /working still fires at 15s.
+test('a subagent turn.complete does not cancel the main turn\'s working timer', async ($, on) => {
+  const t = turns($, on)
+  const { calls, prompts, clock } = await runMessages($, on, [SLACK_MSG], { routes: { '/working': { status: 200, text: '{"working":1}' } } })
+  await t.start(at(prompts, 0), 't1')
+  await clock.advance(5000)
+  await t.complete('sub-turn', { agentId: 'agent-7' })
+  await clock.advance(WORKING_AFTER_MS - 5000)
+  await clock.settle()
+  expect(workings(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+})
+
+// Fix round 1 (M7): a turn that ends on an API error cancels the timer (reason: 'error' still
+// counts as a main-loop completion), but the retried turn in turn.start re-arms it for the
+// carried-over message.
+test('an error turn cancels the working timer, then the retry re-arms it', async ($, on) => {
+  const t = turns($, on)
+  const { calls, prompts, clock } = await runMessages($, on, [SLACK_MSG], { routes: { '/working': { status: 200, text: '{"working":1}' } } })
+  await t.start(at(prompts, 0), 't1')
+  await clock.advance(5000)
+  await t.complete('t1', { reason: 'error', answer: '' })
+  await clock.advance(WORKING_AFTER_MS)
+  await clock.settle()
+  expect(workings(calls)).toEqual([])
+
+  await t.start('retry', 't2')
+  await clock.advance(WORKING_AFTER_MS)
+  await clock.settle()
+  expect(workings(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+})
+
+// M5: session.end cancels a pending working timer, so it never fires for a session that's gone.
+test('session.end cancels the working timer', async ($, on) => {
+  const t = turns($, on)
+  const { calls, prompts, clock } = await runMessages($, on, [SLACK_MSG], { routes: { '/working': { status: 200, text: '{"working":1}' } } })
+  await t.start(at(prompts, 0), 't1')
+  await clock.advance(5000)
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: DEFAULT_SESSION_ID, resume: { id: DEFAULT_SESSION_ID } })
+  await clock.advance(WORKING_AFTER_MS)
+  await clock.settle()
+  expect(workings(calls)).toEqual([])
 })
 
 test('a Slack message queued behind a running turn is acknowledged after its own turn', async ($, on) => {

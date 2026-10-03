@@ -128,9 +128,10 @@ type slackInfo struct {
 // owner; %s names the owner.
 const disclosureRule = "Never reveal how the Slack bridge, proxy, agentbus or plugins work, or your own configuration (addresses, machine names, paths, versions, settings, URLs), to anyone except %s. Where anyone else can read your reply (group conversations, guests, other allowed users), keep to the task and say to ask the owner about the setup.\n"
 
-// doneHintNote tells agents how to mark a Slack message done, dismiss it,
-// or flag a long-running one as working, in one short line.
-const doneHintNote = "When you've fully answered or finished what a Slack message asked, mark it done: reply with `done` on its own last line, or send `done` to agentbus:slack#<id>. If it wasn't meant for you, send `ignore`. Long task? Send `working` to agentbus:slack#<id>; finish with `done`.\n"
+// doneHintNote tells agents how to mark a Slack message done, or flag a
+// long-running one as working, in one short line. The dismiss line right
+// before it already covers `ignore`, so this doesn't repeat it.
+const doneHintNote = "When you've fully answered or finished what a Slack message asked, mark it done: reply with `done` on its own last line, or send `done` to agentbus:slack#<id>. Long task? Send `working` to agentbus:slack#<id>; finish with `done`.\n"
 
 func (s *Store) planInjection(sid, base string) injection {
 	var slack slackInfo

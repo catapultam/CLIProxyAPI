@@ -16,32 +16,11 @@ type Dismisser interface {
 // longer count for /ack either. It returns how many were dismissed; an
 // unknown session dismisses none.
 func (s *Store) Dismiss(id string, ids []string) int {
-	var valid []string
-	for _, msgID := range ids {
-		if validReplyTo.MatchString(msgID) {
-			valid = append(valid, msgID)
-		}
-	}
-	if len(valid) == 0 {
-		return 0
-	}
-	s.mu.Lock()
-	sess, ok := s.byID[id]
+	valid, bridge, ok := s.prepareMark(id, ids, true)
 	if !ok {
-		s.mu.Unlock()
 		return 0
 	}
-	for _, msgID := range valid {
-		if _, pending := sess.Unacked[msgID]; pending {
-			delete(sess.Unacked, msgID)
-			s.dirty = true
-		}
-	}
-	if len(sess.Unacked) == 0 {
-		sess.Unacked = nil
-	}
-	d, _ := s.bridge.(Dismisser)
-	s.mu.Unlock()
+	d, _ := bridge.(Dismisser)
 	if d == nil {
 		return 0
 	}

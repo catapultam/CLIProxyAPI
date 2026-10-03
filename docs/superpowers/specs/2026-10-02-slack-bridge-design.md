@@ -1019,3 +1019,76 @@ main channel is unchanged.
 - `/clanker` ignores any other command name. For moves and `!cmd` the ack
   is "Working… the result arrives in your DM with @<bot>.", and the
   outcome (or the refusal) is posted there once they have been checked.
+
+### Receipts: done, working, the proxy guard, silent refusals (mod 0.3.9)
+
+**Receipt order.** 📥/⚙️ queued → 📨 received → ✅ done or 🚫 dismissed, with
+⏳ working and 👀 read as peers in between: either replaces the other,
+whichever was asked for most recently (an explicit `working` after read,
+or the turn completing after working), but neither ever moves a message
+back to received or below, or past done. `received` only ever moves a
+message strictly forward. Dismissed clears every reaction; between done
+and dismissed themselves, each overwrites the other unconditionally, so
+whichever happens last always wins (`done` after `dismiss` shows ✅ again;
+`dismiss` after `done` clears it). `working` and `done` both count every
+owned, unexpired id as a success the same way `dismiss` does, whether or
+not that id's own state actually changed (e.g. `working` on an
+already-done message still counts, but leaves it ✅).
+
+**The agent side.** An agent marks a message done once it believes it
+fully answered it: reply with `done` on its own last line (stripped before
+posting, then marked), or `SendMessage` to `agentbus:slack#<id>` with
+exactly `done` (nothing posted). `working` the same way flags a message as
+still being worked on, for a task that outlives one turn. The mod also
+sets `working` on its own: when a main-loop turn carrying a delivered
+message is still running 15s after it started, a timer (cancelled if the
+turn ends first, re-armed on `turn.start`, including a retry after an
+`error` turn; a subagent's own `turn.complete` never cancels it) posts
+`/working`. The turn completing posts the usual `/ack`, which moves the
+receipt on to read (or leaves it alone if the agent already marked it
+done).
+
+**Trailing "done" line.** Stripping a trailing `done` line (mod and proxy
+guard alike) skips when the remainder above it is empty, is itself a bare
+control word (`ignore`, `done` or `working` — sent unchanged instead, so
+the guard below handles it directly), or is preceded by an odd number of
+` ``` ` fences (an unclosed code block, most often a shell loop's own
+`done` keyword). Both sides split on the same line-break set and slice the
+original string rather than rejoining lines, so a CRLF body never gets a
+stray trailing `\r` or blank line. A failed or zero-count follow-up
+`/done` after a successful post is noted in the reply
+(" (not marked done: …)"), not hidden; the post still counts as a success.
+
+**Proxy-side guard.** `POST /send` to `slack` with a `reply_to` whose body,
+trimmed and lowercased, is exactly `ignore`, `done` or `working` is
+diverted to `Dismiss`, `Done` or `Working` and nothing is posted; the
+response carries `"to":"slack"` plus the count field (`"dismissed"`,
+`"done"` or `"working"`) instead of `id`/`to`, so an old (≤0.3.8) plugin or
+curl never reports "Sent undefined to undefined". This covers clients that
+predate the mod's own handling of the same words. It never applies to a
+peer send, a DM (`slack@<label>`, which ignores `reply_to` anyway), or a
+send without a `reply_to`. `Dismiss`, `Done` and `Working` share one Store
+helper that validates ids and clears `Unacked` across `MovedTo` handoff
+hops the way `Ack` does (skipped for `Working`, since the turn isn't done
+with the message yet and the eventual `/ack` still needs to find it
+there).
+
+**Broadcast aggregate.** Monotone in each recipient's own rank: ✅ once
+every non-dismissed recipient is done (at least one), no reaction once
+every recipient dismissed it instead, otherwise ⏳ while any recipient is
+working, or is done but not every recipient has read it yet (a recipient
+reaching done never drags the group back down to 📨), else 👀 once all
+have read it (a dismissal counting as read), else 📨 once any recipient
+received it.
+
+**Silent refusals (supersedes the 0.3.8 paragraph above).** The "Ask an
+agent" shortcut and `/clanker`, used by someone not on the allowlist, now
+post and reply with nothing at all — no ephemeral, no DM — and log at
+Debug with the user id only, never a message body. The shortcut's ack
+stays empty (no modal opens) and `/clanker`'s ack is an empty string (the
+slash command shows nothing in Slack). The former rate-limited ephemeral
+("You're not allowed to use this.", at most once every 10 minutes) and its
+backing map are gone.
+
+**Mod 0.3.9.** `register.ts`'s `VERSION` and `.claude-plugin/plugin.json`
+both move to 0.3.9.
