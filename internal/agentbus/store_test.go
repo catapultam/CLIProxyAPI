@@ -417,3 +417,27 @@ func TestNotifyFiresOnSend(t *testing.T) {
 		t.Fatal("notify channel not closed by Send")
 	}
 }
+
+func TestResolvePrefersLiveSessionWhenNameIsReused(t *testing.T) {
+	// The dead holder of a name stays in the store, so a reused name has two
+	// matches. Delivery must go to the live one, every time.
+	for i := 0; i < 50; i++ {
+		s, clock := newTestStore(t)
+		s.Hello(sidA, "pc", "/a", "builder", true)
+		s.Bye(sidA)
+		clock.Advance(time.Second)
+		s.Hello(sidB, "pc", "/b", "builder", true)
+		if got, ok := s.Resolve("builder"); !ok || got != sidB {
+			t.Fatalf("Resolve(builder) = %q, %v; want the live session %q", got, ok, sidB)
+		}
+	}
+}
+
+func TestResolveFallsBackToOfflineSession(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "builder", true)
+	s.Bye(sidA)
+	if got, ok := s.Resolve("builder"); !ok || got != sidA {
+		t.Fatalf("Resolve(builder) = %q, %v; want the offline session so its message queues", got, ok)
+	}
+}

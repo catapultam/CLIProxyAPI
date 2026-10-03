@@ -265,18 +265,30 @@ func (s *Store) resolveLocked(target string) (string, bool) {
 	if target == "" {
 		return "", false
 	}
-	for id, sess := range s.byID {
-		if sess.Name != "" && strings.EqualFold(sess.Name, target) {
-			return id, true
-		}
-	}
 	lower := strings.ToLower(target)
+	return s.bestMatchLocked(func(sess *session) bool {
+		return (sess.Name != "" && strings.EqualFold(sess.Name, target)) || s.addressLocked(sess) == lower
+	})
+}
+
+// bestMatchLocked picks the session to deliver to among those that match.
+// A name can be reused once its holder goes offline, so a live match wins
+// over offline ones, and among equals the most recently seen wins.
+func (s *Store) bestMatchLocked(match func(*session) bool) (string, bool) {
+	now := s.now()
+	bestID, bestLive := "", false
+	var bestSeen time.Time
 	for id, sess := range s.byID {
-		if s.addressLocked(sess) == lower {
-			return id, true
+		if !match(sess) {
+			continue
+		}
+		live := s.statusLocked(sess, now) != StatusOffline
+		seen := sess.lastSeen()
+		if bestID == "" || (live && !bestLive) || (live == bestLive && seen.After(bestSeen)) {
+			bestID, bestLive, bestSeen = id, live, seen
 		}
 	}
-	return "", false
+	return bestID, bestID != ""
 }
 
 func newMessageID() string {
