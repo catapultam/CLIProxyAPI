@@ -35,7 +35,7 @@ func TestSendToSlackDMGoesToBridge(t *testing.T) {
 	if len(fb.posts) != 1 {
 		t.Fatalf("posts = %+v", fb.posts)
 	}
-	want := Outbound{SessionID: sidA, Address: "pc/flyer-aaaaaa", Name: "flyer", Machine: "pc", Body: "private note", DM: "alex"}
+	want := Outbound{ID: msg.ID, SessionID: sidA, Address: "pc/flyer-aaaaaa", Name: "flyer", Machine: "pc", Body: "private note", DM: "alex"}
 	if got := fb.posts[0]; got != want {
 		t.Fatalf("post = %+v, want %+v", got, want)
 	}

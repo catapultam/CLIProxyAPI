@@ -42,8 +42,10 @@ type fakeSlack struct {
 	fail     map[string]string // method -> Slack error code
 	toClient chan string
 	acks     chan string
-	nextFile int
-	uploads  []fakeUpload
+	// ackPayloads holds the payload each ack carried, by envelope id.
+	ackPayloads map[string]string
+	nextFile    int
+	uploads     []fakeUpload
 	// uploadMode makes /upload/<id> answer with an HTTP status ("" is 200)
 	// or, with "hangup", close the connection without answering.
 	uploadMode string
@@ -239,6 +241,16 @@ func (f *fakeSlack) opens() int {
 
 func (f *fakeSlack) push(envelope string) { f.toClient <- envelope }
 
+// ackPayload is the payload the ack of envelope id carried ("" for none).
+func (f *fakeSlack) ackPayload(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if p := f.ackPayloads[id]; p != "null" {
+		return p
+	}
+	return ""
+}
+
 // setFail makes method return a Slack error (under the lock, so -race is clean).
 func (f *fakeSlack) setFail(method, code string) {
 	f.mu.Lock()
@@ -350,6 +362,10 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 			end, next = start+page, strconv.Itoa(start+page)
 		}
 		writeJSON(w, map[string]any{"ok": true, "members": ids[min(start, len(ids)):end], "response_metadata": map[string]any{"next_cursor": next}})
+	case "views.open":
+		writeJSON(w, map[string]any{"ok": true, "view": map[string]any{"id": "V1"}})
+	case "chat.postEphemeral":
+		writeJSON(w, map[string]any{"ok": true, "message_ts": "1700000000.999000"})
 	case "chat.getPermalink":
 		ch, ts := r.PostForm.Get("channel"), r.PostForm.Get("message_ts")
 		writeJSON(w, map[string]any{"ok": true, "channel": ch, "permalink": "https://example.slack.com/archives/" + ch + "/p" + strings.ReplaceAll(ts, ".", "")})
@@ -382,11 +398,18 @@ func (f *fakeSlack) handleSocket(w http.ResponseWriter, r *http.Request) {
 		defer close(done)
 		for {
 			var ack struct {
-				EnvelopeID string `json:"envelope_id"`
+				EnvelopeID string          `json:"envelope_id"`
+				Payload    json.RawMessage `json:"payload"`
 			}
 			if errRead := conn.ReadJSON(&ack); errRead != nil {
 				return
 			}
+			f.mu.Lock()
+			if f.ackPayloads == nil {
+				f.ackPayloads = map[string]string{}
+			}
+			f.ackPayloads[ack.EnvelopeID] = string(ack.Payload)
+			f.mu.Unlock()
 			f.acks <- ack.EnvelopeID
 		}
 	}()

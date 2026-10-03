@@ -51,6 +51,21 @@ type messageEvent struct {
 	Text        string `json:"text"`
 	TS          string `json:"ts"`
 	ThreadTS    string `json:"thread_ts"`
+	// Reaction and Item are a reaction_added event's emoji name and the
+	// message it was added to.
+	Reaction string       `json:"reaction"`
+	Item     reactionItem `json:"item"`
+	// via, when set, is where the bridge says the message came from instead
+	// of viaOf's reading of the conversation: the "Ask an agent" shortcut or
+	// /clanker. It never comes from Slack's JSON.
+	via string
+}
+
+// reactionItem is what a reaction was added to.
+type reactionItem struct {
+	Type    string `json:"type"`
+	Channel string `json:"channel"`
+	TS      string `json:"ts"`
 }
 
 // relayedSubtypes are the message subtypes that are a person writing:
@@ -81,6 +96,10 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		// Someone joined or left: the next guest check looks the members up
 		// again (when the app is subscribed to these; else the cache TTL).
 		b.forgetMembers(ev.Channel)
+		return
+	}
+	if ev.Type == "reaction_added" {
+		b.handleReaction(ev)
 		return
 	}
 	dm := isDM(ev)
@@ -528,9 +547,12 @@ func (b *Bridge) alreadySeen(eventID string) bool {
 }
 
 // viaOf is where ev was written, as agentbus marks it: a DM, a group
-// conversation (a group DM or another channel), or the main channel ("").
+// conversation (a group DM or another channel), or the main channel (""),
+// unless ev came from the shortcut or /clanker (ev.via).
 func (b *Bridge) viaOf(ev messageEvent) string {
 	switch {
+	case ev.via != "":
+		return ev.via
 	case isDM(ev):
 		return agentbus.ViaDM
 	case ev.Channel != b.channelID:

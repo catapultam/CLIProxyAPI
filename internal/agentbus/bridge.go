@@ -20,7 +20,22 @@ const (
 	// ViaGroup marks a message written in a group DM or a channel other than
 	// the main one, where other people can read the answer.
 	ViaGroup = "group"
+	// ViaShortcut marks a message sent with the "Ask an agent" message
+	// shortcut; the answer goes to the user's DM with the bot.
+	ViaShortcut = "shortcut"
+	// ViaSlash marks a message sent with the /clanker slash command; the
+	// answer goes to the user's DM with the bot.
+	ViaSlash = "slash"
 )
+
+// validVia reports whether via is a Via value the bridge sets (or empty).
+func validVia(via string) bool {
+	switch via {
+	case "", ViaDM, ViaGroup, ViaShortcut, ViaSlash:
+		return true
+	}
+	return false
+}
 
 var (
 	// ErrUnknownSlackUser is a "slack@<label>" target whose label isn't an
@@ -33,6 +48,8 @@ var (
 // Outbound is a message a session sent to SlackAddress, with what the bridge
 // needs to label the session's thread.
 type Outbound struct {
+	// ID is the bus id of the message the session sent.
+	ID        string
 	SessionID string
 	Address   string
 	Name      string
@@ -185,6 +202,7 @@ func (s *Store) sendDM(fromID, label, body string) (Message, error) {
 	msg := s.sentLocked(from, body, "")
 	msg.To = SlackAddress + "@" + canonical
 	out := s.outboundLocked(fromID, from, body)
+	out.ID = msg.ID
 	out.DM = canonical
 	s.mu.Unlock()
 	bridge.Post(out)
@@ -201,8 +219,9 @@ func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string
 
 // DeliverVia is Deliver for a message that reached the bridge other than in
 // the channel: via is ViaDM for a direct message, ViaGroup for a group DM or
-// another channel, or empty. Only the Slack bridge calls it, and together
-// with DeliverGuest it is the only way a message gets Via.
+// another channel, ViaShortcut or ViaSlash for the "Ask an agent" shortcut
+// or /clanker, or empty. Only the Slack bridge calls it, and together with
+// DeliverGuest and DeliverCommandVia it is the only way a message gets Via.
 func (s *Store) DeliverVia(target, body, slackUser, via string) (sessionID, msgID string, err error) {
 	return s.deliverFromSlack(target, body, via, func(m *Message) {
 		m.FromUser = true
@@ -222,6 +241,21 @@ func (s *Store) DeliverGuest(target, body, label, via string) (sessionID, msgID 
 	})
 }
 
+// DeliverApproval queues an allowed Slack user's approval (slackUser, their
+// label) of the request message requestID that the session posted with
+// "confirm:". It sets FromUser and Approval. Only the Slack bridge calls it,
+// and it is the only way a message gets Approval.
+func (s *Store) DeliverApproval(target, requestID, body, slackUser string) (sessionID, msgID string, err error) {
+	if !validReplyTo.MatchString(requestID) {
+		return "", "", ErrInvalidApproval
+	}
+	return s.deliverFromSlack(target, body, "", func(m *Message) {
+		m.FromUser = true
+		m.SlackUser = slackUser
+		m.Approval = requestID
+	})
+}
+
 // DeliverNotice queues a notice from the Slack bridge itself, such as "you
 // were linked to a conversation": From is SlackAddress, and it is neither a
 // user's instruction nor a guest's input. Only the Slack bridge calls it.
@@ -232,7 +266,7 @@ func (s *Store) DeliverNotice(target, body string) (sessionID, msgID string, err
 // deliverFromSlack queues a message from SlackAddress for target (id, name
 // or address), with fill marking who it is from.
 func (s *Store) deliverFromSlack(target, body, via string, fill func(*Message)) (string, string, error) {
-	if via != "" && via != ViaDM && via != ViaGroup {
+	if !validVia(via) {
 		return "", "", ErrInvalidVia
 	}
 	if strings.TrimSpace(body) == "" {

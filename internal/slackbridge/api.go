@@ -190,6 +190,19 @@ func (a *api) postMessage(ctx context.Context, token, channel, text, threadTS st
 	return body.Get("ts").String(), nil
 }
 
+// postEphemeral posts text in channel that only user sees.
+func (a *api) postEphemeral(ctx context.Context, token, channel, user, text string) error {
+	_, err := a.call(ctx, token, "chat.postEphemeral", url.Values{"channel": {channel}, "user": {user}, "text": {text}})
+	return err
+}
+
+// openView opens a modal (view, as JSON) for the interaction triggerID
+// came with.
+func (a *api) openView(ctx context.Context, token, triggerID, view string) error {
+	_, err := a.call(ctx, token, "views.open", url.Values{"trigger_id": {triggerID}, "view": {view}})
+	return err
+}
+
 // permalink returns a link to message ts in channel.
 func (a *api) permalink(ctx context.Context, token, channel, ts string) (string, error) {
 	body, err := a.call(ctx, token, "chat.getPermalink", url.Values{"channel": {channel}, "message_ts": {ts}})

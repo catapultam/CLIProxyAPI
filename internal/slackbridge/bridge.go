@@ -142,6 +142,12 @@ type Bridge struct {
 	floodMu sync.Mutex
 	floods  map[string]*guestBucket
 
+	// asks holds the messages "Ask an agent" modals are open for, until
+	// they are submitted (see ask.go). askMu guards it and is never held
+	// across a Slack or Store call.
+	askMu sync.Mutex
+	asks  map[askKey]askEntry
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	jobsWG sync.WaitGroup
@@ -238,8 +244,15 @@ func (b *Bridge) logCommandOutcome(o agentbus.Outbound) {
 	log.Infof("slack: %s !%s on %s", outcome, r.Command, o.Machine)
 }
 
+// postOutbound posts o where threadFor puts it. A "confirm: …" body is an
+// approval request: its text is posted with approvalNote, and the post is
+// recorded so an allowed user's 👍 approves it (see handleReaction).
 func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
+	request, confirm := confirmRequest(o.Body)
 	text := withMentions(o.Body, b.state.mentionIDs())
+	if confirm {
+		text = withMentions(request, b.state.mentionIDs()) + "\n" + approvalNote
+	}
 	t, opened, err := b.threadFor(ctx, o, text)
 	if errors.Is(err, errDMUserGone) {
 		log.Warnf("slack: dropped a DM from %s to @%s: not an allowed user", o.Address, o.DM)
@@ -249,19 +262,37 @@ func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
 		b.noticeUnreachable(o)
 		return nil
 	}
-	if err != nil || opened {
+	if err != nil {
 		return err
 	}
+	if opened {
+		if confirm {
+			b.noteApproval(o, request, t, t.posted)
+		}
+		return nil
+	}
 	ts, err := b.api.postMessage(ctx, b.cfg.BotToken, t.channel, text, t.threadTS)
-	if err == nil && t.threadTS == "" {
+	if err != nil {
+		return err
+	}
+	if t.threadTS == "" {
 		b.state.linkDM(t.channel, ts, o.SessionID, true)
 	}
-	return err
+	if confirm {
+		b.noteApproval(o, request, t, ts)
+	}
+	return nil
 }
 
 // postTarget is where a post goes: a conversation and a thread in it. An
 // empty threadTS is the conversation's top level, where only DM posts go.
-type postTarget struct{ channel, threadTS string }
+// posted is the ts of the post threadFor made when it reports opened; link
+// marks an answer to a message that came through the conversation's link.
+type postTarget struct {
+	channel, threadTS string
+	posted            string
+	link              bool
+}
 
 // threadFor picks where a session's post goes:
 //   - with o.DM, the top level of that allowed user's DM (errDMUserGone when
@@ -293,7 +324,9 @@ func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string
 	}
 	if ok {
 		if t.threadTS == "" {
-			return b.dmTop(ctx, o, t.channel, text)
+			top, opened, errTop := b.dmTop(ctx, o, t.channel, text)
+			top.link = t.link
+			return top, opened, errTop
 		}
 		return t, false, nil
 	}
@@ -319,7 +352,7 @@ func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string
 	}
 	b.state.moveThread(o.SessionID, channel, ts, "")
 	b.noteHomeHeader(channel, ts, o.SessionID)
-	return postTarget{channel: channel, threadTS: ts}, true, nil
+	return postTarget{channel: channel, threadTS: ts, posted: ts}, true, nil
 }
 
 // noteHomeHeader records a home thread's header post in a DM as the
@@ -415,6 +448,7 @@ func (b *Bridge) dmTop(ctx context.Context, o agentbus.Outbound, channel, text s
 		return t, false, err
 	}
 	b.state.linkDM(channel, ts, o.SessionID, true)
+	t.posted = ts
 	return t, true, nil
 }
 
@@ -512,7 +546,7 @@ func (b *Bridge) repliedThread(o agentbus.Outbound) (postTarget, bool, error) {
 			// Answer at the level the message was written at.
 			thread = ""
 		}
-		return postTarget{channel: channel, threadTS: thread}, channel != "", nil
+		return postTarget{channel: channel, threadTS: thread, link: r.Link}, channel != "", nil
 	}
 	if owner, ok := b.state.replyOwner(o.ReplyTo); ok && owner != o.SessionID {
 		other := b.bus.Address(owner)

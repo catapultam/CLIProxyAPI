@@ -191,6 +191,8 @@ type stateFile struct {
 	// when the bus last saw it, or when the bridge first noticed it; see
 	// pruneSessions.
 	Seen map[string]time.Time `json:"seen,omitempty"`
+	// Approvals lists approval requests the bot posted, oldest first.
+	Approvals []pendingApproval `json:"approvals,omitempty"`
 }
 
 // state holds session threads, delivered messages, DM routing and the
@@ -213,6 +215,9 @@ type state struct {
 	users    []allowedUser          // config users first
 	moved    map[string]movedEntry  // old session id -> the session that took it over
 	seen     map[string]time.Time   // session id -> when it was last known on the bus
+	// approvals are the approval requests the bot posted, oldest first, at
+	// most maxApprovals; expired ones are pruned.
+	approvals []pendingApproval
 	// dirty marks changes not written to disk yet.
 	dirty bool
 	// early holds receipts for message ids not recorded yet (a waiter can
@@ -304,6 +309,15 @@ func loadState(path string) (*state, error) {
 		if sid != "" {
 			st.seen[sid] = at
 		}
+	}
+	// Expired requests stay until the next prune; lookups never return them.
+	for _, p := range file.Approvals {
+		if p.Channel != "" && p.TS != "" && p.Session != "" && p.Request != "" {
+			st.approvals = append(st.approvals, p)
+		}
+	}
+	if extra := len(st.approvals) - maxApprovals; extra > 0 {
+		st.approvals = st.approvals[extra:]
 	}
 	st.users = file.Allowed
 	return st, nil
@@ -954,6 +968,9 @@ func (st *state) saveLocked() error {
 	}
 	if len(st.convs) > 0 {
 		file.Conversations = st.convs
+	}
+	if len(st.approvals) > 0 {
+		file.Approvals = st.approvals
 	}
 	cutoff := st.now().Add(-dmLastTTL)
 	for user, e := range st.dmLasts {

@@ -78,6 +78,10 @@ func (b *Bridge) connectOnce(ctx context.Context) (bool, error) {
 		if errRead := conn.ReadJSON(&env); errRead != nil {
 			return connected, fmt.Errorf("read: %w", errRead)
 		}
+		// The handlers only touch memory, the state and the job queues, so the
+		// ack goes out at once. An interaction or slash command's answer rides
+		// on its ack (ackPayload).
+		var ackPayload map[string]any
 		switch env.Type {
 		case "hello":
 			connected = true
@@ -90,9 +94,17 @@ func (b *Bridge) connectOnce(ctx context.Context) (bool, error) {
 			} else {
 				b.handleEvent(p.EventID, p.Event)
 			}
+		case "interactive":
+			ackPayload = b.handleInteractive(env.Payload)
+		case "slash_commands":
+			ackPayload = b.handleSlash(env.Payload)
 		}
 		if env.EnvelopeID != "" {
-			if errAck := conn.WriteJSON(map[string]string{"envelope_id": env.EnvelopeID}); errAck != nil {
+			ack := map[string]any{"envelope_id": env.EnvelopeID}
+			if ackPayload != nil {
+				ack["payload"] = ackPayload
+			}
+			if errAck := conn.WriteJSON(ack); errAck != nil {
 				return connected, fmt.Errorf("ack: %w", errAck)
 			}
 		}

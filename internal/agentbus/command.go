@@ -32,11 +32,11 @@ func (s *Store) DeliverCommand(target string, cmd Command, slackUser, slackUserI
 }
 
 // DeliverCommandVia is DeliverCommand for a command written somewhere other
-// than the bridge's main channel: via is ViaDM or ViaGroup (or empty), as
-// for DeliverVia, so a prompt command from a DM is framed as private and a
-// report in a group conversation leaves the machine out.
+// than the bridge's main channel: via is as for DeliverVia (ViaSlash for
+// /clanker), so a prompt command from a DM is framed as private and a report
+// in a group conversation leaves the machine out.
 func (s *Store) DeliverCommandVia(target string, cmd Command, slackUser, slackUserID, via string) (sessionID, msgID string, err error) {
-	if via != "" && via != ViaDM && via != ViaGroup {
+	if !validVia(via) {
 		return "", "", ErrInvalidVia
 	}
 	if !validCommand(cmd) {

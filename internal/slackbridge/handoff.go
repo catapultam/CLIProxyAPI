@@ -109,6 +109,13 @@ func (st *state) currentLocked(sid string) string {
 	return sid
 }
 
+// current follows sid's handoffs to the session that has it now.
+func (st *state) current(sid string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.currentLocked(sid)
+}
+
 // sameSessionLocked reports whether a and b are one session, across
 // handoffs. The caller holds st.mu.
 func (st *state) sameSessionLocked(a, b string) bool {

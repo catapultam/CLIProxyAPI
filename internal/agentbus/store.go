@@ -62,6 +62,8 @@ var (
 	// run commands (no mod, or older than MinCommandModVersion).
 	ErrCommandUnsupported = errors.New("session can't run commands")
 	ErrInvalidCommand     = errors.New("invalid command")
+	// ErrInvalidApproval is an approval whose request id isn't a message id.
+	ErrInvalidApproval = errors.New("invalid approval request id")
 )
 
 var (
@@ -95,10 +97,15 @@ type Message struct {
 	// It is never an instruction. Only DeliverGuest sets it; clients can
 	// never send it.
 	Guest bool `json:"guest,omitempty"`
-	// Via is ViaDM or ViaGroup when the Slack message was written somewhere
-	// other than the bridge's main channel. Only DeliverVia, DeliverGuest and
-	// DeliverCommandVia set it; clients can never send it.
+	// Via is ViaDM, ViaGroup, ViaShortcut or ViaSlash when the Slack message
+	// reached the bridge other than in its main channel. Only DeliverVia,
+	// DeliverGuest and DeliverCommandVia set it; clients can never send it.
 	Via string `json:"via,omitempty"`
+	// Approval marks an allowed Slack user's approval (their 👍) of the
+	// request the session posted with "confirm:"; it is that request's
+	// message id. Only DeliverApproval sets it, always with FromUser; clients
+	// can never send it.
+	Approval string `json:"approval,omitempty"`
 	// SlackUserID is the Slack user ID of the owner who sent Command. Only
 	// DeliverCommand sets it, and /wait re-checks it before handing the
 	// command out.
@@ -460,6 +467,7 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	msg := s.sentLocked(from, body, replyTo)
 	if b := s.bridge; b != nil && isSlackAddress(to) {
 		out := s.outboundLocked(fromID, from, body)
+		out.ID = msg.ID
 		out.ReplyTo = replyTo
 		s.mu.Unlock()
 		b.Post(out)
@@ -894,18 +902,23 @@ func (s *Store) Load() error {
 	return nil
 }
 
-// cleanLoadedMessage drops an invalid reply_to, any via except ViaDM or
-// ViaGroup on a Slack user's or guest's message and, on a message from a
-// session, a sender name validName rejects (keeping the sender's address).
-// It reports whether it changed m.
+// cleanLoadedMessage drops an invalid reply_to, any via validVia rejects on
+// a Slack user's or guest's message (and every via on anything else), an
+// approval on anything but a Slack user's message or with an invalid request
+// id and, on a message from a session, a sender name validName rejects
+// (keeping the sender's address). It reports whether it changed m.
 func cleanLoadedMessage(m *Message) bool {
 	changed := false
 	if m.ReplyTo != "" && !validReplyTo.MatchString(m.ReplyTo) {
 		m.ReplyTo = ""
 		changed = true
 	}
-	if m.Via != "" && ((m.Via != ViaDM && m.Via != ViaGroup) || (!m.FromUser && !m.Guest)) {
+	if m.Via != "" && (!validVia(m.Via) || (!m.FromUser && !m.Guest)) {
 		m.Via = ""
+		changed = true
+	}
+	if m.Approval != "" && (!m.FromUser || m.Guest || !validReplyTo.MatchString(m.Approval)) {
+		m.Approval = ""
 		changed = true
 	}
 	if m.FromUser || m.Guest {
