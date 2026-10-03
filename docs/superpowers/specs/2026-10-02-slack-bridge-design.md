@@ -462,3 +462,37 @@ make them possible.
   (DM)`, "writing to you privately", with `agentbus:slack#<id>` to answer in
   the DM and `agentbus:slack@<label>` (only for a plain label) to write
   later.
+
+**Receipts, subagent guard, one-shot hint (Task 5; mod 0.3.4).**
+
+- *Receipts.* One reaction on the user's own message (the reply record now
+  keeps its `ts` and the current `receipt`, persisted) shows how far it got,
+  each state replacing the last and never moving back: `inbox_tray` queued
+  (`gear` for a command), `envelope_with_arrow` received (the mod claimed it
+  through `/wait`), `eyes` read. Moving on adds the new reaction, then
+  removes the old one (`reactions.remove`; `no_reaction` is fine). A late
+  "received" after "read" does nothing. DMs work the same way, in the DM.
+- The store reports through the optional `agentbus.Receipts` bridge
+  interface (`Received(ids)`, `Read(ids)`), outside its lock, with Slack
+  messages' ids only. `/wait` (`ClaimForWait`) calls `Received` and records
+  the ids per session as unacknowledged (persisted; 7-day TTL, at most 256).
+  `POST /v1/agentbus/ack {session, ids}` (at most 100 ids) calls `Read` for
+  the ids `/wait` handed to that session and not yet acknowledged; it
+  answers `{"acked": n}`. A successful injection (`commitInjection`, status
+  below 400) calls `Read` directly, skipping "received". A receipt that
+  arrives before the bridge recorded the delivery (the waiter can claim a
+  message first) is kept in memory and applied when the record lands.
+- The mod acks a submitted Slack message when the first main-loop
+  `turn.complete` (no `agentId`, reason other than `error`) ends a turn that
+  carried it: one that started after `$.prompt.submit` resolved, or whose
+  `turn.start` text names the message id. The turn running when a prompt was
+  queued behind it doesn't count. A command is acked after it ran (and its
+  report was sent), for the session it was delivered to. Peer messages and
+  dropped prompts are never acked.
+- *Subagent guard.* The mod's `SendMessage` hook refuses an `agentbus:`
+  target from a call with `agentId` (a subagent or teammate loop):
+  `{success: false, message: "Only the main session talks on the agentbus.
+  Report this to your parent agent, and it will send it."}`.
+- *One-shot hint.* An injection into a session without the mod that carries
+  a Slack user's message adds the line "This message is shown to you once.
+  If you can't act on it now, write it into your task list."

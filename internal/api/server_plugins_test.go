@@ -36,7 +36,7 @@ func TestPluginsMarketplaceJSONNeedsNoAuth(t *testing.T) {
 	if len(doc.Plugins) != 1 || doc.Plugins[0].Name != "agentbus" {
 		t.Fatalf("plugins = %+v", doc.Plugins)
 	}
-	wantURL := "https://cakebox:8317/plugins/agentbus-0.3.3.zip"
+	wantURL := "https://cakebox:8317/plugins/agentbus-0.3.4.zip"
 	if doc.Plugins[0].Source.URL != wantURL {
 		t.Fatalf("url = %q, want %q", doc.Plugins[0].Source.URL, wantURL)
 	}
@@ -56,7 +56,7 @@ func TestPluginsMarketplaceJSONUsesForwardedHost(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(w.Body.Bytes(), &doc); errUnmarshal != nil {
 		t.Fatalf("unmarshal: %v", errUnmarshal)
 	}
-	wantURL := "https://proxy.tailnet:8317/plugins/agentbus-0.3.3.zip"
+	wantURL := "https://proxy.tailnet:8317/plugins/agentbus-0.3.4.zip"
 	if doc.Plugins[0].Source.URL != wantURL {
 		t.Fatalf("url = %q, want %q", doc.Plugins[0].Source.URL, wantURL)
 	}
@@ -75,7 +75,7 @@ func TestPluginsZipMatchesManifestSHA256(t *testing.T) {
 		t.Fatalf("unmarshal: %v", errUnmarshal)
 	}
 
-	zipReq := httptest.NewRequest(http.MethodGet, "/plugins/agentbus-0.3.3.zip", nil)
+	zipReq := httptest.NewRequest(http.MethodGet, "/plugins/agentbus-0.3.4.zip", nil)
 	zipW := httptest.NewRecorder()
 	s.engine.ServeHTTP(zipW, zipReq)
 	if zipW.Code != http.StatusOK {

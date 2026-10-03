@@ -4,13 +4,18 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.3.3'
+export const VERSION = '0.3.4'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
 const DEFAULT_SHELL_TIMEOUT_S = 30
 // $.process.run's own ceiling.
 const MAX_SHELL_TIMEOUT_MS = 10 * 60 * 1000
+// The most Slack messages waiting for their turn to complete before the oldest is forgotten.
+const MAX_PENDING_READS = 100
+// What a subagent's or teammate's SendMessage to the agentbus gets instead.
+export const SUBAGENT_REFUSAL =
+  'Only the main session talks on the agentbus. Report this to your parent agent, and it will send it.'
 
 type Peer = { address: string; name?: string; machine: string; status: string }
 // A remote command, as the proxy's agentbus.Command marshals it.
@@ -470,6 +475,68 @@ async function runCommand($: EngineInterface, m: BusMessage, cmd: Command) {
   } catch {
     // The proxy is unreachable; there's nowhere else to report it.
   }
+  // The command ran: its read receipt, for the session it was delivered to.
+  if (MESSAGE_ID.test(m.id)) await ack($, from, [m.id])
+}
+
+// Read receipts. The proxy shows a Slack user how far their message got; the mod reports "read"
+// (/ack) once the main-loop turn that carried the message completed, and for a command once it ran.
+// A message is tracked from its submit: `resolved` once $.prompt.submit resolved (the prompt
+// entered, or was queued behind the running turn), `started` once a main-loop turn began that
+// carries it: one whose text names the message, or any that starts after the submit resolved.
+// The turn running when a prompt is queued started earlier, so its end never counts.
+type PendingRead = { session: string; resolved: boolean; started: boolean }
+const pendingReads = new Map<string, PendingRead>()
+
+// ack tells the proxy the model read these messages, delivered to session sid. Best effort.
+async function ack($: EngineInterface, sid: string, ids: string[]) {
+  if (!base || !token || !sid || ids.length === 0) return
+  try {
+    await bus($, 'POST', '/ack', { session: sid, ids })
+  } catch {
+    // The proxy is unreachable; the receipt stays at "received".
+  }
+}
+
+// Submits a waited message as a prompt; a Slack user's message is tracked for its read receipt.
+async function submitMessage($: EngineInterface, m: BusMessage) {
+  const tracked = m.from_user === true && MESSAGE_ID.test(m.id)
+  if (tracked) {
+    pendingReads.delete(m.id)
+    pendingReads.set(m.id, { session, resolved: false, started: false })
+    while (pendingReads.size > MAX_PENDING_READS) {
+      const oldest = pendingReads.keys().next().value
+      if (oldest === undefined) break
+      pendingReads.delete(oldest)
+    }
+  }
+  try {
+    const submitted = await $.prompt.submit({ text: formatMessage(m) })
+    const pending = pendingReads.get(m.id)
+    if (!tracked || !pending) return
+    if (submitted.drop !== undefined) pendingReads.delete(m.id)
+    else pending.resolved = true
+  } catch {
+    if (tracked) pendingReads.delete(m.id)
+  }
+}
+
+// A main-loop turn began: the messages it carries are now in it.
+function turnStarted(text: string) {
+  for (const [id, pending] of pendingReads) {
+    if (pending.resolved || text.includes(id)) pending.started = true
+  }
+}
+
+// A main-loop turn completed: acknowledge every message that was in it, per session.
+async function turnCompleted($: EngineInterface) {
+  const bySession = new Map<string, string[]>()
+  for (const [id, pending] of pendingReads) {
+    if (!pending.started) continue
+    pendingReads.delete(id)
+    bySession.set(pending.session, [...(bySession.get(pending.session) ?? []), id])
+  }
+  for (const [sid, ids] of bySession) await ack($, sid, ids)
 }
 
 async function waitOnce($: EngineInterface) {
@@ -483,7 +550,7 @@ async function waitOnce($: EngineInterface) {
         if (m.from_user === true) void runCommand($, m, m.command)
         continue
       }
-      void $.prompt.submit({ text: formatMessage(m) })
+      void submitMessage($, m)
     }
   } else if (status !== 204) {
     // 409: another waiter for this session (the old wait.sh hook) holds the long poll.
@@ -587,9 +654,24 @@ export const register: Register = on => {
     return { result: { listing: listed.result.listing + section } }
   })
 
+  // A turn of a subagent's loop raises no turn.start; agentId is checked anyway.
+  on('turn.start', async ($, e, next) => {
+    if (!(e as { agentId?: string }).agentId) turnStarted(e.text)
+    return next(e)
+  })
+
+  // Only the main loop's turns count, and one that died on an API error leaves its messages for the
+  // next turn to complete.
+  on('turn.complete', async ($, e, next) => {
+    if (!e.agentId && e.reason !== 'error') void turnCompleted($)
+    return next(e)
+  })
+
   on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
     const to = typeof e.to === 'string' ? e.to.trim() : ''
     if (!to.startsWith(PREFIX)) return next(e)
+    // Only the main session talks on the agentbus: a subagent or teammate loop has agentId.
+    if (e.agentId) return { result: { success: false, message: SUBAGENT_REFUSAL } }
     if (!base || !token || !session) {
       return { result: { success: false, message: 'agentbus is not configured in this session.' } }
     }

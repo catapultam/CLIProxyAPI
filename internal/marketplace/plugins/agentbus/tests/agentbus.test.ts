@@ -51,6 +51,7 @@ function wire(
     if (e.url.endsWith('/bye')) return { value: { status: 204, ok: true, headers: {}, text: '' } }
     if (e.url.endsWith('/name')) return { value: { status: 200, ok: true, headers: {}, text: '{"address":"cplt-4a/comms-3a9e9c"}' } }
     if (e.url.endsWith('/slack/upload')) return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+    if (e.url.endsWith('/ack')) return { value: { status: 200, ok: true, headers: {}, text: '{"acked":1}' } }
     if (e.url.includes('/wait?')) {
       const next = waits.shift() ?? { status: 204, text: '' }
       return { value: { ...next, ok: next.status < 300, headers: {} } }
@@ -241,7 +242,7 @@ test('session.end with clear says bye, then the next tick follows the session to
   calls.length = 0
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.3' })
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.4' })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
@@ -258,11 +259,11 @@ test('both hellos and every wait carry the mod version', async ($, on) => {
 
   const hellos = calls.filter(c => c.url.endsWith('/hello'))
   expect(hellos.length).toBe(2)
-  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.3' })
-  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.3' })
+  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.4' })
+  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.4' })
   const waits = calls.filter(c => c.url.includes('/wait?'))
   expect(waits.length).toBeGreaterThan(0)
-  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.3')
+  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.4')
 })
 
 test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {
@@ -386,7 +387,7 @@ async function runMessages($: TestArgs[0], on: TestArgs[1], msgs: object[], opti
   await clock.advance(1000)
   await clock.settle()
   const sends = calls.filter(c => c.url.endsWith('/send')).map(c => c.body as { from_session: string; to: string; body: string; reply_to?: string })
-  return { calls, prompts, sends }
+  return { calls, prompts, sends, clock }
 }
 
 function proc(exitCode: number, stdout: string, stderr = '') {
@@ -892,4 +893,139 @@ test('other commands pass through the rename hook untouched', async ($, on) => {
   const out = await runSlash($, 'compact', 'x')
   expect(out.text).toBe('compacted')
   expect(calls.some(c => c.url.endsWith('/name'))).toBe(false)
+})
+
+// Only the main session talks on the agentbus; a subagent or teammate loop reports to its parent.
+
+test('a subagent cannot SendMessage on the agentbus, but its other SendMessages pass through', async ($, on) => {
+  const calls = wire($, on, [])
+  on('tool.call', () => ({ result: { success: true, message: 'delivered locally' } }))
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+
+  for (const to of ['agentbus:slack', 'agentbus:shoggoth/art-0f7de4', 'agentbus:slack@alex']) {
+    const out = await $.tool.call({ tool: 'SendMessage', to, message: 'hi', agentId: 'agent-7' })
+    expect(out.result).toEqual({
+      success: false,
+      message: 'Only the main session talks on the agentbus. Report this to your parent agent, and it will send it.',
+    })
+  }
+  expect(calls.some(c => c.url.endsWith('/send'))).toBe(false)
+
+  const local = await $.tool.call({ tool: 'SendMessage', to: 'hollowedoath-3e', message: 'hi', agentId: 'agent-7' })
+  expect((local.result as { message: string }).message).toBe('delivered locally')
+})
+
+// Read receipts: the mod acknowledges a Slack message once the main-loop turn that carried it
+// completes, and a command once it ran.
+
+// turns stands in for the engine's turn events.
+function turns($: TestArgs[0], on: TestArgs[1]) {
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  return {
+    start: (text: string, turnId: string) => $.turn.start({ text, turnId }),
+    complete: (turnId: string, extra: object = {}) =>
+      $.turn.complete({ answer: 'ok', durationMs: 5, isAborted: false, turnId, reason: 'answer', ...extra } as Parameters<TestArgs[0]['turn']['complete']>[0]),
+  }
+}
+
+function acks(calls: Call[]) {
+  return calls.filter(c => c.url.endsWith('/ack')).map(c => c.body as { session: string; ids: string[] })
+}
+
+const SLACK_MSG = { id: 'm_a1', from: 'slack', body: 'please rebase', from_user: true, slack_user: 'jane' }
+
+test('a Slack message is acknowledged when the main-loop turn that carried it completes', async ($, on) => {
+  const t = turns($, on)
+  const { calls, prompts, clock } = await runMessages($, on, [SLACK_MSG])
+  expect(prompts.length).toBe(1)
+  expect(acks(calls)).toEqual([])
+
+  // A subagent's turn ending is not the main loop's.
+  await t.complete('sub-turn', { agentId: 'agent-7' })
+  await t.start(at(prompts, 0), 't1')
+  await clock.settle()
+  expect(acks(calls)).toEqual([])
+  await t.complete('t1')
+  await clock.settle()
+  expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+
+  // Acknowledged once.
+  await t.start('next', 't2')
+  await t.complete('t2')
+  await clock.settle()
+  expect(acks(calls).length).toBe(1)
+})
+
+test('a Slack message queued behind a running turn is acknowledged after its own turn', async ($, on) => {
+  const t = turns($, on)
+  const clock = mock.clock(on)
+  const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: [SLACK_MSG] }) }])
+  const prompts: string[] = []
+  on('prompt.submit', (_$, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  // The person's turn is running when the message arrives.
+  await t.start('fix the build', 't0')
+  await clock.advance(1000)
+  await clock.settle()
+  expect(prompts.length).toBe(1)
+  await t.complete('t0')
+  await clock.settle()
+  expect(acks(calls)).toEqual([])
+  await t.start(at(prompts, 0), 't1')
+  await t.complete('t1')
+  await clock.settle()
+  expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+})
+
+test('a turn that ends on an API error leaves the ack for the next completed turn', async ($, on) => {
+  const t = turns($, on)
+  const { calls, prompts, clock } = await runMessages($, on, [SLACK_MSG])
+  await t.start(at(prompts, 0), 't1')
+  await t.complete('t1', { reason: 'error', answer: '' })
+  await clock.settle()
+  expect(acks(calls)).toEqual([])
+  await t.start('retry', 't2')
+  await t.complete('t2')
+  await clock.settle()
+  expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+})
+
+test('peer messages and dropped prompts are never acknowledged', async ($, on) => {
+  const t = turns($, on)
+  const clock = mock.clock(on)
+  const peer = { id: 'm_b1', from: 'vm-shoggoth (shoggoth/art-0f7de4)', body: 'build is green' }
+  const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: [peer, SLACK_MSG] }) }])
+  on('prompt.submit', (_$, e) => (e.text.includes('m_a1') ? { drop: 'refused' } : { text: e.text }))
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  await clock.advance(1000)
+  await clock.settle()
+  await t.start('agentbus message m_b1 and m_a1', 't1')
+  await t.complete('t1')
+  await clock.settle()
+  expect(acks(calls)).toEqual([])
+})
+
+test('a command message is acknowledged once it has run, to the session it was delivered to', async ($, on) => {
+  const clock = mock.clock(on)
+  const session = { id: DEFAULT_SESSION_ID }
+  const msg = commandMessage('m_c1', { name: 'clear', kind: 'slash', command: 'clear' })
+  const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: [msg] }) }], session)
+  let finish: (() => void) | undefined
+  on('command.run', () => {
+    session.id = 'cleared3-0000-0000-0000-000000000000'
+    return new Promise<{ text: string }>(resolve => {
+      finish = () => resolve({ text: 'cleared' })
+    })
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  await clock.advance(1000)
+  await clock.settle()
+  expect(acks(calls)).toEqual([])
+  finish?.()
+  await clock.settle()
+  expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_c1'] }])
 })
