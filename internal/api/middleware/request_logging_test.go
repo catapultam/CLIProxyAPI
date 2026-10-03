@@ -598,6 +598,17 @@ func TestManagementV8RequestsAreNotLogged(t *testing.T) {
 	}
 }
 
+func TestPluginMarketplaceRequestsAreNotLogged(t *testing.T) {
+	for _, path := range []string{"/plugins/marketplace.json", "/plugins/agentbus-1.2.3.zip"} {
+		if shouldLogRequest(path) {
+			t.Errorf("plugin marketplace request would be logged: %s", path)
+		}
+	}
+	if !shouldLogRequest("/v1/messages") {
+		t.Error("API request would not be logged")
+	}
+}
+
 type spyRequestLogger struct {
 	lastLogRequestID       string
 	lastStreamingRequestID string

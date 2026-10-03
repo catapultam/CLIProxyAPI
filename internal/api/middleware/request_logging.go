@@ -462,6 +462,11 @@ func shouldLogRequest(path string) bool {
 	if strings.HasPrefix(path, "/v0/management") || strings.HasPrefix(path, "/v8/management") || strings.HasPrefix(path, "/management") {
 		return false
 	}
+	// The plugin marketplace serves static manifests and zip archives, which are
+	// noise in request logs.
+	if strings.HasPrefix(path, "/plugins/") {
+		return false
+	}
 
 	return true
 }
