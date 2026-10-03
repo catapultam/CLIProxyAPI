@@ -3,6 +3,7 @@ package agentbus
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -57,6 +58,9 @@ func (s *Store) DeliverCommand(target string, cmd Command, slackUser, slackUserI
 	}
 	if cmd.Env != nil {
 		cmd.Env = maps.Clone(cmd.Env)
+	}
+	if cmd.ArgsEnum != nil {
+		cmd.ArgsEnum = slices.Clone(cmd.ArgsEnum)
 	}
 	msg.Command = &cmd
 	s.enqueueLocked(sess, msg)

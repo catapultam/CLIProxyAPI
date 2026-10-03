@@ -1,6 +1,8 @@
 package slackbridge
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -43,7 +45,9 @@ output: image
 	gitLogYAML = `description: Recent commits
 kind: shell
 argv:
-  linux: [git, log, --oneline, -n, "{args}"]
+  linux: [sh, -c, 'git log --oneline -n "$AGENTBUS_ARGS"']
+env:
+  AGENTBUS_ARGS: "{args}"
 args_pattern: "[0-9]{1,3}"
 `
 	branchYAML = `description: Switch branch
@@ -258,7 +262,8 @@ func TestRegistryAcceptsPlaceholdersAsWholeElements(t *testing.T) {
 // picks its script from its arguments, so they go through env. A script file
 // as the program is refused outright. {args} anywhere needs an argument rule.
 func TestRegistryKeepsPlaceholdersAwayFromInterpreters(t *testing.T) {
-	const rule = "args_pattern: \"[a-z]+\"\n"
+	// args_enum, so the interpreter rule (not the free-text rule) is what refuses.
+	const rule = "args_enum: [x]\n"
 	for name, content := range map[string]string{
 		"shc":         "kind: shell\nargv:\n  linux: [sh, -c, \"{args}\"]\n" + rule,
 		"shcafter":    "kind: shell\nargv:\n  linux: [sh, -c, \"echo $1\", sh, \"{args}\"]\n" + rule,
@@ -443,7 +448,7 @@ func TestShellArgsRules(t *testing.T) {
 	writeCommand(t, dir, "branch.yaml", branchYAML, mtime0)
 	writeCommand(t, dir, "screenshot.yaml", shellYAML, mtime0)
 	writeCommand(t, dir, "review.yaml", promptYAML, mtime0)
-	writeCommand(t, dir, "anytext.yaml", "kind: shell\nargv:\n  linux: [echo, \"{args}\"]\nargs_pattern: \"(?s).{1,20}\"\n", mtime0)
+	writeCommand(t, dir, "anytext.yaml", "kind: shell\nargv:\n  linux: [tool]\nenv:\n  AGENTBUS_ARGS: \"{args}\"\nargs_pattern: \"(?s).{1,20}\"\n", mtime0)
 	writeCommand(t, dir, "focus.yaml", slashYAML, mtime0)
 	writeCommand(t, dir, "opus.yaml", "kind: slash\ncommand: model\nargs: opus\n", mtime0)
 	writeCommand(t, dir, "raw.yaml", "kind: slash\ncommand: model\n", mtime0)
@@ -643,7 +648,7 @@ func TestShellArgsRefusedAtDelivery(t *testing.T) {
 	}
 	b.handleEvent("EvS3", msg("UALEX", "flyer: !gitlog 5", "11.3", ""))
 	msgs := bus.Claim(sidA)
-	if len(msgs) != 1 || msgs[0].Command.Args != "5" || !reflect.DeepEqual(msgs[0].Command.Argv["linux"], []string{"git", "log", "--oneline", "-n", "{args}"}) {
+	if len(msgs) != 1 || msgs[0].Command.Args != "5" || !reflect.DeepEqual(msgs[0].Command.Argv["linux"], []string{"sh", "-c", `git log --oneline -n "$AGENTBUS_ARGS"`}) || msgs[0].Command.Env["AGENTBUS_ARGS"] != "{args}" {
 		t.Fatalf("msgs = %+v", msgs)
 	}
 }
@@ -766,5 +771,73 @@ func TestPlainMessagesStillDeliveredAsText(t *testing.T) {
 	msgs := bus.Claim(sidA)
 	if len(msgs) != 2 || msgs[0].Command != nil || msgs[1].Command != nil {
 		t.Fatalf("msgs = %+v", msgs)
+	}
+}
+
+// shellCase is one row of the parity table shared with the agentbus mod's
+// tests (tests/shell-cases.ts), which hold the run-time side of the check.
+type shellCase struct {
+	Name        string            `json:"name"`
+	OK          bool              `json:"ok"`
+	Argv        []string          `json:"argv"`
+	Env         map[string]string `json:"env,omitempty"`
+	ArgsPattern string            `json:"args_pattern,omitempty"`
+	ArgsEnum    []string          `json:"args_enum,omitempty"`
+	Output      string            `json:"output,omitempty"`
+}
+
+func loadShellCases(t *testing.T) []shellCase {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join("..", "marketplace", "plugins", "agentbus", "tests", "shell-cases.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const begin, end = "/* BEGIN SHELL CASES */", "/* END SHELL CASES */"
+	i, j := strings.Index(string(src), begin), strings.Index(string(src), end)
+	if i < 0 || j < i {
+		t.Fatal("shell-cases.ts lacks its markers")
+	}
+	var cases []shellCase
+	if err = json.Unmarshal(src[i+len(begin):j], &cases); err != nil {
+		t.Fatalf("shell-cases.ts: %v", err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("shell-cases.ts has no cases")
+	}
+	return cases
+}
+
+// The registry judges every shared case as the table says; the mod's tests
+// run the same table at run time.
+func TestRegistryShellParityCases(t *testing.T) {
+	for i, tc := range loadShellCases(t) {
+		def := map[string]any{"kind": "shell", "argv": map[string][]string{"windows": tc.Argv}}
+		if tc.Env != nil {
+			def["env"] = tc.Env
+		}
+		if tc.ArgsPattern != "" {
+			def["args_pattern"] = tc.ArgsPattern
+		}
+		if tc.ArgsEnum != nil {
+			def["args_enum"] = tc.ArgsEnum
+		}
+		if tc.Output != "" {
+			def["output"] = tc.Output
+		}
+		// JSON is YAML, so the definition is written as it is.
+		content, err := json.Marshal(def)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		name := fmt.Sprintf("case%d", i)
+		writeCommand(t, dir, name+".yaml", string(content), mtime0)
+		e, ok := newRegistry(dir).lookup(name)
+		if !ok {
+			t.Fatalf("%s: not listed", tc.Name)
+		}
+		if (e.err == nil) != tc.OK {
+			t.Errorf("%s: load error = %v, want ok=%v", tc.Name, e.err, tc.OK)
+		}
 	}
 }

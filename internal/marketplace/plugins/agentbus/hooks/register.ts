@@ -22,6 +22,7 @@ type Command = {
   text?: string
   argv?: Record<string, string[]>
   env?: Record<string, string>
+  args_enum?: string[]
   output?: string
   timeout?: number
 }
@@ -194,40 +195,66 @@ function commandReport(m: BusMessage, cmd: Command, o: Outcome): string {
   return redact(lines.join('\n'))
 }
 
-// Programs that run code from their arguments, by base name (lowercased, .exe or .com removed),
-// wrappers that run another program from theirs included. The proxy refuses the same definitions
-// when it loads the registry; this is the mod's own check.
+// Programs that run code, or another program, from their arguments. The proxy refuses the same
+// definitions when it loads the registry (internal/slackbridge/commands.go); this is the mod's own
+// check, and tests/shell-cases.ts holds the cases both must agree on. The list can't be complete:
+// the primary defence is that free text never becomes an argv element.
 const SHELL_INTERPRETERS = new Set([
-  'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh',
-  'cmd', 'powershell', 'pwsh',
-  'python', 'python2', 'python3', 'py', 'pythonw',
-  'node', 'deno', 'bun', 'perl', 'ruby', 'php', 'lua', 'tclsh',
+  'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'rbash', 'ash', 'mksh', 'yash',
+  'cmd', 'powershell', 'pwsh', 'powershell_ise', 'pwsh-preview',
+  'python', 'python2', 'python3', 'py', 'pythonw', 'pypy', 'pypy3',
+  'node', 'nodejs', 'deno', 'bun', 'perl', 'ruby', 'php', 'lua', 'tclsh', 'r', 'rscript',
   'osascript', 'wscript', 'cscript', 'mshta',
   'awk', 'gawk', 'mawk', 'sed',
-  'ssh', 'wsl', 'env', 'xargs', 'busybox', 'rscript',
+  'ssh', 'wsl', 'ubuntu', 'debian', 'env', 'xargs', 'busybox',
+  'sudo', 'su', 'doas', 'runas', 'watch', 'script', 'flock',
+  'nice', 'nohup', 'timeout', 'stdbuf', 'time', 'chroot', 'setsid', 'unbuffer',
+  'conhost', 'forfiles', 'rundll32', 'regsvr32', 'wt',
 ])
-const PYTHON_VERSIONED = /^python[0-9][0-9.]*w?$/
 // Program files Windows hands to an interpreter.
 const SCRIPT_EXTENSIONS = ['.bat', '.cmd', '.ps1', '.vbs', '.js', '.wsf', '.hta']
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
 const PLACEHOLDER = /\{args\}|\{out\}/
 
-function isInterpreter(el: string): boolean {
-  const base = el
+// el's file name as Windows runs it: the base name, trailing dots and spaces dropped (Win32 ignores
+// them), lowercased, and any .exe or .com suffixes removed (python.com.exe is python).
+export function programFile(el: string): string {
+  let base = el
     .slice(Math.max(el.lastIndexOf('/'), el.lastIndexOf('\\')) + 1)
+    .replace(/[. ]+$/, '')
     .toLowerCase()
-    .replace(/\.(exe|com)$/, '')
-  return SHELL_INTERPRETERS.has(base) || PYTHON_VERSIONED.test(base)
+  while (base.endsWith('.exe') || base.endsWith('.com')) base = base.slice(0, -4).replace(/[. ]+$/, '')
+  return base
 }
 
-// Whether a shell definition could hand {args} or {out} to an interpreter. An interpreter picks its
-// script from its arguments (powershell's first bare argument is -Command; sh, python or node run
-// the file their first argument names), so once one appears, as the program or behind a wrapper,
-// no placeholder may follow: env (AGENTBUS_*) is the only way in. A script file as the program is
-// refused, and so is a placeholder that isn't a whole element or value.
-export function unsafeShellCommand(argv: readonly string[], env: Record<string, string> | undefined): boolean {
-  const program = (argv[0] ?? '').trim().toLowerCase()
-  if (!program || SCRIPT_EXTENSIONS.some(ext => program.endsWith(ext)) || PLACEHOLDER.test(program)) return true
+// programFile without a -preview suffix or a version run after the letters (python3.12, tclsh8.6).
+export function programBase(el: string): string {
+  return programFile(el)
+    .replace(/-preview$/, '')
+    .replace(/([a-z])[.0-9]*[0-9]$/, '$1')
+}
+
+function isInterpreter(el: string): boolean {
+  return SHELL_INTERPRETERS.has(programFile(el)) || SHELL_INTERPRETERS.has(programBase(el))
+}
+
+// Whether a shell definition is unsafe to run with args:
+// - {args} as an argv element is only for args the owner wrote into args_enum (the proxy sends the
+//   list); free text goes through env;
+// - once an interpreter or wrapper appears, as the program or later, no placeholder may follow it,
+//   since an interpreter picks its script from its arguments;
+// - a script file as the program (.bat, .ps1, ...) runs through an interpreter;
+// - a placeholder must be a whole element or env value, and only AGENTBUS_* variables take one.
+export function unsafeShellCommand(
+  argv: readonly string[],
+  env: Record<string, string> | undefined,
+  argsEnum: readonly string[] | undefined,
+  args: string,
+): boolean {
+  const program = argv[0] ?? ''
+  if (!programFile(program) || PLACEHOLDER.test(program)) return true
+  if (SCRIPT_EXTENSIONS.some(ext => programFile(program).endsWith(ext))) return true
+  if (argv.includes('{args}') && !(Array.isArray(argsEnum) && argsEnum.includes(args))) return true
   let interpreter = false
   for (const el of argv) {
     if (el === '{args}' || el === '{out}') {
@@ -323,7 +350,7 @@ async function runShell($: EngineInterface, from: string, m: BusMessage, cmd: Co
   const os = await osKey($)
   const template = cmd.argv?.[os]
   if (!template || template.length === 0) return { ok: false, status: `this command has no argv for ${os}` }
-  if (unsafeShellCommand(template, cmd.env)) return { ok: false, status: 'unsafe command definition' }
+  if (unsafeShellCommand(template, cmd.env, cmd.args_enum, cmd.args ?? '')) return { ok: false, status: 'unsafe command definition' }
   const args = cmd.args ?? ''
   const out = await tempPath($, os, m.id)
   const fill = (v: string) => (v === '{args}' ? args : v === '{out}' ? out : v)

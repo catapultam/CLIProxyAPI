@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { SHELL_CASES } from './shell-cases'
 
 const ENV = {
   ANTHROPIC_BASE_URL: 'http://bus.test:8317/',
@@ -331,7 +332,7 @@ test('a session message body with a bus-style Message header is quoted', async (
 
 // Remote commands. Only the proxy's Slack bridge sets command, on a from_user message.
 
-type Cmd = { name: string; kind: string; command?: string; args?: string; text?: string; argv?: Record<string, string[]>; env?: Record<string, string>; output?: string; timeout?: number }
+type Cmd = { name: string; kind: string; command?: string; args?: string; text?: string; argv?: Record<string, string[]>; env?: Record<string, string>; args_enum?: string[]; output?: string; timeout?: number }
 
 function commandMessage(id: string, command: Cmd, extra: object = {}) {
   const body = `!${command.name}${command.args ? ` ${command.args}` : ''}`
@@ -469,7 +470,7 @@ test('a shell command is refused unless the machine opts in', async ($, on) => {
     argvs.push([...e.argv])
     return proc(0, 'ran')
   })
-  const msg = commandMessage('m_e0', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args: 'x', output: 'text', timeout: 30 })
+  const msg = commandMessage('m_e0', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args: 'x', args_enum: ['x'], output: 'text', timeout: 30 })
   const { sends } = await runMessages($, on, [msg], { env: { OS: 'Windows_NT' } })
   expect(argvs).toEqual([])
   expect(sends.length).toBe(1)
@@ -484,7 +485,7 @@ test('a shell command on Windows runs the windows argv with {args} as one elemen
     return proc(0, 'tool says hi')
   })
   const args = 'two words; rm -rf / && "quoted" $(x)'
-  const msg = commandMessage('m_e1', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args, output: 'text', timeout: 45 })
+  const msg = commandMessage('m_e1', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args, args_enum: [args], output: 'text', timeout: 45 })
   const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
   expect(runs).toEqual([{ argv: ['tool.exe', '--name', args], timeoutMs: 45000 }])
   expect(sends.length).toBe(1)
@@ -500,7 +501,7 @@ for (const [uname, program] of [['Darwin', 'mactool'], ['Linux', 'lintool'], ['F
       argvs.push([...e.argv])
       return e.argv[0] === 'uname' ? proc(0, `${uname}\n`) : proc(0, 'ok')
     })
-    const msg = commandMessage('m_e2', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args: 'a b', output: 'text', timeout: 30 })
+    const msg = commandMessage('m_e2', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args: 'a b', args_enum: ['a b'], output: 'text', timeout: 30 })
     const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1' } })
     expect(argvs).toEqual([['uname', '-s'], [program, 'a b']])
     expect(at(sends, 0).body.split('\n')[0]).toBe('✅ !tool: exit 0')
@@ -509,7 +510,7 @@ for (const [uname, program] of [['Darwin', 'mactool'], ['Linux', 'lintool'], ['F
 
 test('a shell command that exits non-zero reports ❌ with stderr', async ($, on) => {
   on('process.run', () => proc(2, 'partial', 'boom: no such thing'))
-  const msg = commandMessage('m_e3', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, output: 'text', timeout: 30 })
+  const msg = commandMessage('m_e3', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args_enum: [''], output: 'text', timeout: 30 })
   const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
   expect(sends.length).toBe(1)
   expect(at(sends, 0).body.split('\n')[0]).toBe('❌ !tool: exit 2')
@@ -532,7 +533,7 @@ test('a shell command without an argv for this OS is refused', async ($, on) => 
 
 test('long output is cut to 3500 characters', async ($, on) => {
   on('process.run', () => proc(0, 'x'.repeat(5000)))
-  const msg = commandMessage('m_e5', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, output: 'text', timeout: 30 })
+  const msg = commandMessage('m_e5', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args_enum: [''], output: 'text', timeout: 30 })
   const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
   const body = at(sends, 0).body
   expect(body).toContain('x'.repeat(3500))
@@ -688,7 +689,7 @@ const UNSAFE: Array<[string, Record<string, string[]>, Record<string, string> | 
 for (const [label, argv, env] of UNSAFE) {
   test(`an unsafe shell definition is refused: ${label}`, async ($, on) => {
     const runs = recordRuns(on)
-    const msg = commandMessage('m_e7', { name: 'tool', kind: 'shell', argv, env, args: 'x', output: 'text', timeout: 30 })
+    const msg = commandMessage('m_e7', { name: 'tool', kind: 'shell', argv, env, args: 'x', args_enum: ['x'], output: 'text', timeout: 30 })
     const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
     expect(runs).toEqual([])
     expect(at(at(sends, 0).body.split('\n'), 0)).toBe('❌ !tool: unsafe command definition')
@@ -704,13 +705,43 @@ test('an interpreter with flags and no placeholders runs', async ($, on) => {
   expect(at(at(sends, 0).body.split('\n'), 0)).toBe('✅ !tool: exit 0')
 })
 
-test('a program that is not an interpreter takes {args} and {out} as whole elements', async ($, on) => {
+test('a program that is not an interpreter takes an args_enum value and {out} as whole elements', async ($, on) => {
   const runs = recordRuns(on, proc(0, 'ok'))
   const argv = { windows: ['screencapture', '-x', '{out}', '{args}'] }
-  const msg = commandMessage('m_ea', { name: 'tool', kind: 'shell', argv, args: 'a b; c', output: 'text', timeout: 30 })
+  const msg = commandMessage('m_ea', { name: 'tool', kind: 'shell', argv, args: 'a b; c', args_enum: ['a b; c'], output: 'text', timeout: 30 })
   await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT', TEMP: 'C:\\Temp' } })
   expect(at(runs, 0)).toEqual({ argv: ['screencapture', '-x', 'C:\\Temp\\agentbus-m_ea.png', 'a b; c'] })
 })
+
+// Free text never becomes an argv element: without args_enum, or with args outside it, {args} in
+// argv is refused at run time too.
+for (const [label, argsEnum] of [['no args_enum', undefined], ['args outside args_enum', ['main', 'dev']]] as const) {
+  test(`{args} as an argv element is refused with ${label}`, async ($, on) => {
+    const runs = recordRuns(on, proc(0, 'ok'))
+    const msg = commandMessage('m_eb', { name: 'tool', kind: 'shell', argv: { windows: ['git', 'switch', '{args}'] }, args: '--orphan x', args_enum: argsEnum ? [...argsEnum] : undefined, output: 'text', timeout: 30 })
+    const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
+    expect(runs).toEqual([])
+    expect(at(at(sends, 0).body.split('\n'), 0)).toBe('❌ !tool: unsafe command definition')
+  })
+}
+
+// The cases the proxy's registry judges the same way (internal/slackbridge/commands_test.go).
+for (const c of SHELL_CASES) {
+  test(`parity: ${c.name} is ${c.ok ? 'run' : 'refused'}`, async ($, on) => {
+    const runs = recordRuns(on, proc(0, 'ok'))
+    const args = c.args_enum?.[0] ?? (c.args_pattern ? 'abc' : '')
+    const msg = commandMessage('m_ec', { name: 'tool', kind: 'shell', argv: { windows: c.argv }, env: c.env, args, args_enum: c.args_enum, output: c.output ?? 'text', timeout: 30 })
+    const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT', TEMP: 'C:\\Temp' } })
+    const head = at(at(sends, 0).body.split('\n'), 0)
+    if (c.ok) {
+      expect(head).not.toBe('❌ !tool: unsafe command definition')
+      expect(runs.some(r => r.argv[0] === c.argv[0])).toBe(true)
+    } else {
+      expect(head).toBe('❌ !tool: unsafe command definition')
+      expect(runs).toEqual([])
+    }
+  })
+}
 
 test('a command reports from the session it was delivered to, even after !clear moves it', async ($, on) => {
   const clock = mock.clock(on)
@@ -779,7 +810,7 @@ for (const position of [3490, 3492, 3495, 3499]) {
   test(`the token is redacted before the output is cut (token at ${position})`, async ($, on) => {
     const token = ENV.ANTHROPIC_AUTH_TOKEN
     recordRuns(on, proc(0, 'x'.repeat(position) + token + 'y'.repeat(50)))
-    const msg = commandMessage('m_e9', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, output: 'text', timeout: 30 })
+    const msg = commandMessage('m_e9', { name: 'tool', kind: 'shell', argv: SHELL_ARGV, args_enum: [''], output: 'text', timeout: 30 })
     const { sends } = await runMessages($, on, [msg], { env: { AGENTBUS_ALLOW_SHELL: '1', OS: 'Windows_NT' } })
     const body = at(sends, 0).body
     for (let k = 4; k <= token.length; k++) expect(body).not.toContain(token.slice(0, k))

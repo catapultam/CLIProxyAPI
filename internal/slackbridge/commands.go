@@ -139,6 +139,7 @@ func (c *commandSpec) command(rest string) agentbus.Command {
 	case agentbus.CommandShell:
 		cmd.Argv = c.Argv
 		cmd.Env = c.Env
+		cmd.ArgsEnum = c.argsEnum
 		cmd.Output = c.Output
 		cmd.Timeout = c.Timeout
 		cmd.Args = rest
@@ -226,7 +227,8 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 	if len(f.Argv) == 0 {
 		return errors.New("argv is required")
 	}
-	usesArgs, envOut := false, false
+	// usesArgs: {args} anywhere; argvArgs: {args} as an argv element.
+	usesArgs, argvArgs, envOut := false, false, false
 	for name, value := range f.Env {
 		if !shellEnvName.MatchString(name) {
 			return fmt.Errorf("env name %q must be letters, digits and _ (not starting with a digit)", name)
@@ -258,7 +260,9 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 				if i == 0 {
 					return fmt.Errorf("argv.%s: %s can't be the program", osKey, el)
 				}
-				usesArgs = usesArgs || el == argsPlaceholder
+				if el == argsPlaceholder {
+					usesArgs, argvArgs = true, true
+				}
 				continue
 			}
 			if strings.Contains(el, argsPlaceholder) || strings.Contains(el, outPlaceholder) {
@@ -279,6 +283,11 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 	if usesArgs && f.ArgsPattern == "" && len(f.ArgsEnum) == 0 {
 		return errors.New("{args} needs args_pattern or args_enum")
 	}
+	// Free text (args_pattern) never becomes an argv element: only the
+	// owner-written values of args_enum do. Free text goes through env.
+	if argvArgs && len(f.ArgsEnum) == 0 {
+		return fmt.Errorf("{args} as an argv element needs args_enum; pass free text in an %s* env variable", shellEnvPrefix)
+	}
 	if f.ArgsPattern != "" {
 		// Compile the pattern on its own first: one with unbalanced groups,
 		// like "a)|(.*", would otherwise close the wrapper's group and
@@ -297,16 +306,16 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 }
 
 // unsafeShellArgv refuses an argv that could hand {args} or {out} to an
-// interpreter as code. An interpreter picks its script from its arguments
+// interpreter. An interpreter picks its script from its arguments
 // (powershell's first bare argument is -Command; sh, python or node run the
 // file their first argument names; python -m names a module), so once an
-// interpreter appears, as the program or behind a wrapper such as sudo, no
-// placeholder may follow it: env (AGENTBUS_*) is the only way to hand an
-// interpreter a value. A script file as the program (.bat, .ps1, .js, ...)
-// is refused outright, since Windows runs it through an interpreter.
-// Other programs take placeholders as whole argv elements.
+// interpreter or wrapper appears, as the program or later, no placeholder
+// may follow it: env (AGENTBUS_*) is the only way in. A script file as the
+// program (.bat, .ps1, .js, ...) is refused outright, since Windows runs it
+// through an interpreter. Names are compared as Windows resolves them (see
+// programFile and programBase). The mod repeats this check at run time.
 func unsafeShellArgv(argv []string) error {
-	if ext := scriptExtension(argv[0]); ext != "" {
+	if ext := scriptExtension(programFile(argv[0])); ext != "" {
 		return fmt.Errorf("a %s program runs through an interpreter; call the interpreter with the script instead", ext)
 	}
 	interpreter := ""
@@ -318,47 +327,65 @@ func unsafeShellArgv(argv []string) error {
 			continue
 		}
 		if interpreter == "" && isInterpreter(el) {
-			interpreter = programBase(el)
+			interpreter = programFile(el)
 		}
 	}
 	return nil
 }
 
-// shellInterpreters are programs that run code from their arguments, by
-// base name (lowercased, .exe or .com removed). Wrappers that run another
-// program from their arguments (env, xargs, wsl, busybox, ssh) count too.
-var shellInterpreters = map[string]bool{
-	"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true, "fish": true, "csh": true, "tcsh": true,
-	"cmd": true, "powershell": true, "pwsh": true,
-	"python": true, "python2": true, "python3": true, "py": true, "pythonw": true,
-	"node": true, "deno": true, "bun": true, "perl": true, "ruby": true, "php": true, "lua": true, "tclsh": true,
-	"osascript": true, "wscript": true, "cscript": true, "mshta": true,
-	"awk": true, "gawk": true, "mawk": true, "sed": true,
-	"ssh": true, "wsl": true, "env": true, "xargs": true, "busybox": true, "rscript": true,
+// isInterpreter reports whether el names an interpreter or wrapper, by its
+// file name (rundll32) or without a version (tclsh8.6 is tclsh).
+func isInterpreter(el string) bool {
+	return shellInterpreters[programFile(el)] || shellInterpreters[programBase(el)]
 }
 
-// pythonVersioned is a versioned python, like python3.12.
-var pythonVersioned = regexp.MustCompile(`^python[0-9][0-9.]*w?$`)
+// shellInterpreters are programs that run code, or another program, from
+// their arguments, by programBase. The list can't be complete; the primary
+// defence is that free text never becomes an argv element (args_enum only).
+var shellInterpreters = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true, "fish": true, "csh": true, "tcsh": true,
+	"rbash": true, "ash": true, "mksh": true, "yash": true,
+	"cmd": true, "powershell": true, "pwsh": true, "powershell_ise": true, "pwsh-preview": true,
+	"python": true, "python2": true, "python3": true, "py": true, "pythonw": true, "pypy": true, "pypy3": true,
+	"node": true, "nodejs": true, "deno": true, "bun": true, "perl": true, "ruby": true, "php": true, "lua": true, "tclsh": true,
+	"r": true, "rscript": true,
+	"osascript": true, "wscript": true, "cscript": true, "mshta": true,
+	"awk": true, "gawk": true, "mawk": true, "sed": true,
+	"ssh": true, "wsl": true, "ubuntu": true, "debian": true, "env": true, "xargs": true, "busybox": true,
+	"sudo": true, "su": true, "doas": true, "runas": true, "watch": true, "script": true, "flock": true,
+	"nice": true, "nohup": true, "timeout": true, "stdbuf": true, "time": true, "chroot": true, "setsid": true, "unbuffer": true,
+	"conhost": true, "forfiles": true, "rundll32": true, "regsvr32": true, "wt": true,
+}
 
 // scriptExtensions are program files Windows hands to an interpreter.
 var scriptExtensions = []string{".bat", ".cmd", ".ps1", ".vbs", ".js", ".wsf", ".hta"}
 
-// programBase is el's base name, lowercased, without .exe or .com.
+// programVersion is a version run right after the letters of a name, as in
+// python3.12, tclsh8.6 or perl5.36.
+var programVersion = regexp.MustCompile(`([a-z])[.0-9]*[0-9]$`)
+
+// programFile is el's file name as Windows runs it: the base name, trailing
+// dots and spaces dropped (Win32 ignores them), lowercased, and any .exe or
+// .com suffixes removed (python.com.exe is python).
+func programFile(el string) string {
+	base := strings.ToLower(strings.TrimRight(el[strings.LastIndexAny(el, `/\`)+1:], ". "))
+	for strings.HasSuffix(base, ".exe") || strings.HasSuffix(base, ".com") {
+		base = strings.TrimRight(base[:len(base)-len(".exe")], ". ")
+	}
+	return base
+}
+
+// programBase is programFile without a -preview suffix or a version, the
+// name an interpreter goes by.
 func programBase(el string) string {
-	base := strings.ToLower(el[strings.LastIndexAny(el, `/\`)+1:])
-	return strings.TrimSuffix(strings.TrimSuffix(base, ".exe"), ".com")
+	base := strings.TrimSuffix(programFile(el), "-preview")
+	return programVersion.ReplaceAllString(base, "$1")
 }
 
-func isInterpreter(el string) bool {
-	base := programBase(el)
-	return shellInterpreters[base] || pythonVersioned.MatchString(base)
-}
-
-// scriptExtension returns program's script extension, or "".
-func scriptExtension(program string) string {
-	lower := strings.ToLower(strings.TrimSpace(program))
+// scriptExtension returns file's script extension, or "".
+func scriptExtension(file string) string {
 	for _, ext := range scriptExtensions {
-		if strings.HasSuffix(lower, ext) {
+		if strings.HasSuffix(file, ext) {
 			return ext
 		}
 	}

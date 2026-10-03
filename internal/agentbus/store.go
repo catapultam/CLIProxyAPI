@@ -102,18 +102,21 @@ type Message struct {
 //   - shell: Argv (OS key -> argv), where an element that is exactly {args}
 //     becomes Args as one argv value and {out} a temp file path; Env is
 //     set for the process, where a value that is exactly {args} or {out}
-//     is replaced the same way; Output is text or image; Timeout is in
+//     is replaced the same way; ArgsEnum is the owner-written list Args
+//     must be in when an argv element is {args} (free text only goes
+//     through Env); Output is text or image; Timeout is in
 //     seconds.
 type Command struct {
-	Name    string              `json:"name"`
-	Kind    string              `json:"kind"`
-	Command string              `json:"command,omitempty"`
-	Args    string              `json:"args,omitempty"`
-	Text    string              `json:"text,omitempty"`
-	Argv    map[string][]string `json:"argv,omitempty"`
-	Env     map[string]string   `json:"env,omitempty"`
-	Output  string              `json:"output,omitempty"`
-	Timeout int                 `json:"timeout,omitempty"`
+	Name     string              `json:"name"`
+	Kind     string              `json:"kind"`
+	Command  string              `json:"command,omitempty"`
+	Args     string              `json:"args,omitempty"`
+	Text     string              `json:"text,omitempty"`
+	Argv     map[string][]string `json:"argv,omitempty"`
+	Env      map[string]string   `json:"env,omitempty"`
+	ArgsEnum []string            `json:"args_enum,omitempty"`
+	Output   string              `json:"output,omitempty"`
+	Timeout  int                 `json:"timeout,omitempty"`
 }
 
 // Command kinds.

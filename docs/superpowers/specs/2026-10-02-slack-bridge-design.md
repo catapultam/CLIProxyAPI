@@ -296,21 +296,31 @@ each argv or in `env`), `timeout_seconds` (1-120, default 30), and at most
 one of `args_pattern` (a regex that must compile on its own, then anchored as
 `^(?:…)$`) and `args_enum` (a list). A command using `{args}` anywhere (argv
 or env) must declare one of them; without `{args}` it takes no arguments,
-and a shell argument never contains a line break. Interpreters never get
-Slack text or the temp path as an argument, since an interpreter picks its
-script from its arguments (PowerShell 5.1 runs its first bare argument as
-`-Command`; sh, python or node run the file their first argument names;
-`python -m` names a module). When an argv element's base name (any
-directory, case, `.exe` or `.com` ignored) is an interpreter, no `{args}`
-or `{out}` may follow it: sh, bash, zsh, dash, ksh, fish, csh, tcsh, cmd,
-powershell, pwsh, python, python2, python3, `python3.12`-style versions,
-py, pythonw, node, deno, bun, perl, ruby, php, lua, tclsh, osascript,
-wscript, cscript, mshta, awk, gawk, mawk, sed, ssh, wsl, env, xargs,
-busybox, rscript. That covers the program itself and an interpreter behind
-a wrapper such as `sudo`. A program ending in `.bat`, `.cmd`, `.ps1`,
-`.vbs`, `.js`, `.wsf` or `.hta` is refused. Other programs (`screencapture`,
-`git`, …) take placeholders as whole elements. The supported way to hand a
-value to a script is `env`, for example
+and a shell argument never contains a line break. Free text never becomes
+an argv element: `{args}` may be one only when the command declares
+`args_enum` (owner-written values); with `args_pattern` it may only go
+through `env`. The proxy sends `args_enum` with the command, and the mod
+refuses `{args}` in argv unless `args` is in it. `{out}` (a temp path the mod
+makes) may be an argv element. As defence in depth, interpreters and
+wrappers never get either placeholder as an argument, since an interpreter
+picks its script from its arguments (PowerShell 5.1 runs its first bare
+argument as `-Command`; sh, python or node run the file their first argument
+names; `python -m` names a module). Names are compared as Windows runs them:
+base name, trailing dots and spaces dropped, lowercased, `.exe`/`.com`
+suffixes removed repeatedly (re-trimming after each); an element matches as
+that file name or with a `-preview` suffix and then a version run after its
+letters removed (`python3.12`, `tclsh8.6`, `pwsh-preview`). Once an argv
+element matches, no placeholder may follow it: sh, bash, zsh, dash, ksh,
+fish, csh, tcsh, rbash, ash, mksh, yash, cmd, powershell, pwsh,
+powershell_ise, python, python2, python3, py, pythonw, pypy, pypy3, node,
+nodejs, deno, bun, perl, ruby, php, lua, tclsh, r, rscript, osascript,
+wscript, cscript, mshta, awk, gawk, mawk, sed, ssh, wsl, ubuntu, debian,
+env, xargs, busybox, sudo, su, doas, runas, watch, script, flock, nice,
+nohup, timeout, stdbuf, time, chroot, setsid, unbuffer, conhost, forfiles,
+rundll32, regsvr32, wt. A program whose normalized file name ends in `.bat`,
+`.cmd`, `.ps1`, `.vbs`, `.js`, `.wsf` or `.hta` is refused (`run.bat.`
+included). `tests/shell-cases.ts` in the mod is a table both sides' tests
+run. The supported way to hand a value to a script is `env`, for example
 `[sh, -c, 'gnome-screenshot -f "$AGENTBUS_OUT"']` with
 `env: {AGENTBUS_OUT: "{out}"}`. A slash `args`
 template without `{args}` takes no arguments either. Files are decoded

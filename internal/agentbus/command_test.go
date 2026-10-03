@@ -49,7 +49,7 @@ func capableSession(s *Store, id, cwd, name string) {
 func TestDeliverCommandSetsFields(t *testing.T) {
 	s, _ := newTestStore(t)
 	capableSession(s, sidA, "/a", "flyer")
-	cmd := Command{Name: "shot", Kind: "shell", Args: "full", Argv: map[string][]string{"linux": {"grim", "{out}"}}, Env: map[string]string{"AGENTBUS_OUT": "{out}"}, Output: "image", Timeout: 30}
+	cmd := Command{Name: "shot", Kind: "shell", Args: "full", Argv: map[string][]string{"linux": {"grim", "{out}"}}, Env: map[string]string{"AGENTBUS_OUT": "{out}"}, ArgsEnum: []string{"full", "window"}, Output: "image", Timeout: 30}
 	sid, msgID, err := s.DeliverCommand("flyer", cmd, "alex", "UALEX")
 	if err != nil || sid != sidA || !validReplyTo.MatchString(msgID) {
 		t.Fatalf("DeliverCommand = %q, %q, %v", sid, msgID, err)
@@ -68,7 +68,8 @@ func TestDeliverCommandSetsFields(t *testing.T) {
 	// The queued command owns its maps: the caller's later edits don't reach it.
 	cmd.Env["AGENTBUS_OUT"] = "changed"
 	cmd.Argv["linux"][0] = "changed"
-	if m.Command.Env["AGENTBUS_OUT"] != "{out}" || m.Command.Argv["linux"][0] != "grim" {
+	cmd.ArgsEnum[0] = "changed"
+	if m.Command.Env["AGENTBUS_OUT"] != "{out}" || m.Command.Argv["linux"][0] != "grim" || m.Command.ArgsEnum[0] != "full" {
 		t.Fatalf("queued command shares the caller's maps: %+v", m.Command)
 	}
 	if m.Body != "!shot full" {
@@ -89,12 +90,12 @@ func TestDeliverDoesNotSetCommandOrUserID(t *testing.T) {
 }
 
 func TestCommandJSONShape(t *testing.T) {
-	cmd := Command{Name: "n", Kind: "shell", Command: "c", Args: "a", Text: "t", Argv: map[string][]string{"linux": {"x"}}, Env: map[string]string{"AGENTBUS_ARGS": "{args}"}, Output: "text", Timeout: 5}
+	cmd := Command{Name: "n", Kind: "shell", Command: "c", Args: "a", Text: "t", Argv: map[string][]string{"linux": {"x"}}, Env: map[string]string{"AGENTBUS_ARGS": "{args}"}, ArgsEnum: []string{"a"}, Output: "text", Timeout: 5}
 	raw, err := json.Marshal(Message{ID: "m_1", Command: &cmd, SlackUserID: "U1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"command":{`, `"name":"n"`, `"kind":"shell"`, `"command":"c"`, `"args":"a"`, `"text":"t"`, `"argv":{"linux":["x"]}`, `"env":{"AGENTBUS_ARGS":"{args}"}`, `"output":"text"`, `"timeout":5`, `"slack_user_id":"U1"`} {
+	for _, want := range []string{`"command":{`, `"name":"n"`, `"kind":"shell"`, `"command":"c"`, `"args":"a"`, `"text":"t"`, `"argv":{"linux":["x"]}`, `"env":{"AGENTBUS_ARGS":"{args}"}`, `"args_enum":["a"]`, `"output":"text"`, `"timeout":5`, `"slack_user_id":"U1"`} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("%s lacks %s", raw, want)
 		}
