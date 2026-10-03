@@ -27,8 +27,17 @@ a new command needs no restart and no plugin redeploy.
   once per change. It never falls through to the slash command of the same
   name.
 
-`screenshot.yaml` in this directory is a ready-made `!screenshot`. Copy it
-into the state directory's `agent-commands/` to install it.
+A file here defines programs that run on agents' machines, so only root may
+change the registry. The directory and its files must be owned by root and
+not group- or world-writable:
+
+```sh
+install -d -m 755 -o root -g root <state dir>/agent-commands
+install -m 644 -o root -g root screenshot.yaml <state dir>/agent-commands/
+```
+
+`screenshot.yaml` in this directory is a ready-made `!screenshot`. Install it
+with the second command.
 
 ## Fields
 
@@ -88,11 +97,13 @@ A shell command that takes free text, passed through `env`:
 description: Recent commits in the agent's directory
 kind: shell
 argv:
-  linux: [sh, -c, 'git log --oneline -n "$AGENTBUS_ARGS"']
-  darwin: [sh, -c, 'git log --oneline -n "$AGENTBUS_ARGS"']
-  windows: [powershell, -NoProfile, -NonInteractive, -Command, 'git log --oneline -n $env:AGENTBUS_ARGS']
+  linux: [/bin/sh, -c, 'git log --oneline -n "$AGENTBUS_ARGS"']
+  darwin: [/bin/sh, -c, 'git log --oneline -n "$AGENTBUS_ARGS"']
+  windows: ['C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe', -NoProfile, -NonInteractive, -Command, 'git log --oneline -n $env:AGENTBUS_ARGS']
 env:
   AGENTBUS_ARGS: "{args}"
+# Digits only: no quote, no whitespace and no leading -, so git gets one
+# plain value even from Windows PowerShell.
 args_pattern: "[0-9]{1,3}"
 ```
 
@@ -103,11 +114,16 @@ A shell command with a fixed list of arguments, as an argv element:
 description: Switch the agent's branch
 kind: shell
 argv:
-  linux: [git, switch, "{args}"]
-  darwin: [git, switch, "{args}"]
-  windows: [git, switch, "{args}"]
+  linux: [/usr/bin/git, switch, "{args}"]
+  darwin: [/usr/bin/git, switch, "{args}"]
+  windows: ['C:\Program Files\Git\cmd\git.exe', switch, "{args}"]
 args_enum: [main, dev]
 ```
+
+Use absolute program paths, as above, so nothing earlier in `PATH` or in the
+agent's working directory can stand in for the program. The same goes for a
+script an interpreter runs: `-File 'C:\agent-tools\tool.ps1'`, not
+`-File tool.ps1`.
 
 ## Passing values safely
 
@@ -134,20 +150,32 @@ something that parses it as code. Both apply the same rules.
 - **No script file as the program.** A program ending in `.bat`, `.cmd`,
   `.ps1`, `.vbs`, `.js`, `.wsf` or `.hta` is refused, because Windows runs it
   through an interpreter. Call the interpreter with the script instead, for
-  example `[pwsh, -NoProfile, -File, tool.ps1]`, with the values in `env`.
+  example `['C:\Program Files\PowerShell\7\pwsh.exe', -NoProfile, -File,
+  'C:\agent-tools\tool.ps1']`, with the values in `env`.
+- **No `%AGENTBUS_` or `!AGENTBUS_` anywhere.** An argv element containing
+  either, in any case, is refused whatever the program, because cmd may run
+  from inside the script (see cmd below).
 
-Read the variables in the script like this:
+The rules can't see what a script does with a variable. Read it like this:
 
 - **sh**: always `"$AGENTBUS_ARGS"`, in double quotes. Unquoted, the shell
-  splits the value and expands its wildcards.
-- **PowerShell**: `$env:AGENTBUS_ARGS` as an argument to a cmdlet or a
-  program, for example `Select-String -Pattern $env:AGENTBUS_ARGS x.log`. Never
-  pass it to `Invoke-Expression`, `iex`, `Invoke-Command -ScriptBlock
-  ([scriptblock]::Create(...))` or `powershell -Command`, which run it as
-  code.
-- **cmd**: don't reference the variable. cmd expands `%VAR%` (and `!VAR!`
+  splits the value and expands its wildcards. Quoting is not enough on its
+  own: a value starting with `-` is read as an option, and some options run
+  commands (`--pre=`, `--upload-pack=`, `-exec`, `--checkpoint-action=`).
+  Put `--` before it where the program supports that (`grep -r --
+  "$AGENTBUS_ARGS" /var/log/app`), or make `args_pattern` refuse a leading
+  `-` (for example `[a-z0-9][a-z0-9 ._]*`).
+- **PowerShell**: pass `$env:AGENTBUS_ARGS` only to cmdlets, for example
+  `Select-String -Pattern $env:AGENTBUS_ARGS C:\logs\app.log`. Windows
+  PowerShell 5.1 re-splits a value it passes to an `.exe` at embedded double
+  quotes, so a native program could get extra arguments. Let a native
+  program read the variable from its own environment, or use an
+  `args_pattern` that excludes `"`, whitespace and a leading `-` (as
+  `gitlog` above does). Never pass the value to `Invoke-Expression`, `iex`,
+  `[scriptblock]::Create(...)` or `powershell -Command`,
+  which run it as code.
+- **cmd**: never reference the variable. cmd expands `%VAR%` (and `!VAR!`
   with delayed expansion) before it parses the line, so the value would be
-  parsed as cmd syntax. When any argv element is `cmd`, the loader and the
-  mod refuse every element containing `%AGENTBUS_` or `!AGENTBUS_`, in any
-  case. Let the program cmd starts read the variable itself, or use
-  PowerShell.
+  parsed as cmd syntax. That includes a `cmd /c ...` that a PowerShell or sh
+  script starts, and `forfiles /c`. Let the program cmd starts read the
+  variable itself, or use PowerShell with a cmdlet.

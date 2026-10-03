@@ -8,8 +8,12 @@
 # Windows: the script walks up from its parent process (Claude Code) to the
 # first ancestor with a main window (the terminal: Windows Terminal, conhost,
 # VS Code) and captures that window with PrintWindow (PW_RENDERFULLCONTENT),
-# so it works when the window is covered. With no such window, or one that is
-# minimized, it captures the primary screen. The PNG is scaled down until it
+# so it works when the window is covered. The walk stops at explorer.exe and
+# services.exe. With no such window, one that is minimized, or a capture
+# whose 8x8 grid of sampled pixels is all black (a DirectComposition window
+# PrintWindow couldn't render), it captures the primary screen instead.
+# PowerShell is called by its absolute path, so nothing earlier in PATH or
+# the working directory can stand in for it. The PNG is scaled down until it
 # is under 3.5 MiB (the mod reads at most 4 MiB), with JPEG quality 85 as the
 # last resort. The script holds no double quote (it builds the one C# needs
 # from [char]34) and no # comment, so Windows command-line quoting can't
@@ -28,7 +32,7 @@ env:
   AGENTBUS_OUT: "{out}"
 argv:
   windows:
-    - powershell
+    - C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
     - -NoProfile
     - -NonInteractive
     - -ExecutionPolicy
@@ -47,6 +51,7 @@ argv:
         for ($i = 0; $i -lt 32 -and $child -and $child.ParentProcessId -gt 0; $i++) {
           $parent = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $child.ParentProcessId)
           if (-not $parent -or -not $parent.CreationDate -or $parent.CreationDate -gt $child.CreationDate) { break }
+          if ($parent.Name -in 'explorer.exe', 'services.exe') { break }
           $child = $parent
           $proc = Get-Process -Id $parent.ProcessId -ErrorAction SilentlyContinue
           if (-not $proc -or $proc.MainWindowHandle -eq [IntPtr]::Zero) { continue }
@@ -62,7 +67,14 @@ argv:
           $ok = [AgentbusShot.User32]::PrintWindow($hwnd, $dc, 2)
           $g.ReleaseHdc($dc)
           $g.Dispose()
-          if (-not $ok) { $bmp.Dispose(); $bmp = $null }
+          $lit = $false
+          for ($x = 0; $ok -and -not $lit -and $x -lt 8; $x++) {
+            for ($y = 0; -not $lit -and $y -lt 8; $y++) {
+              $px = $bmp.GetPixel([int][Math]::Floor($w * (2 * $x + 1) / 16), [int][Math]::Floor($h * (2 * $y + 1) / 16))
+              $lit = $px.R -ne 0 -or $px.G -ne 0 -or $px.B -ne 0
+            }
+          }
+          if (-not $lit) { $bmp.Dispose(); $bmp = $null }
           break
         }
       } catch {

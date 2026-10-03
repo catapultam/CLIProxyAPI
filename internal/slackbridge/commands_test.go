@@ -843,8 +843,10 @@ func TestRegistryShellParityCases(t *testing.T) {
 }
 
 // cmd expands %VAR% (and !VAR! with delayed expansion) before it parses the
-// line, so an AGENTBUS_* reference in a cmd argv would run Slack text as
-// cmd syntax. Once any element is cmd, no element may name one that way.
+// line, so an AGENTBUS_* reference would run Slack text as cmd syntax. cmd
+// can be reached from inside any script (powershell -Command 'cmd /c ...',
+// forfiles /c), so no argv element may name one that way, whatever the
+// program.
 func TestRegistryRefusesCmdExpandedAgentbusVariables(t *testing.T) {
 	const free = "env:\n  AGENTBUS_ARGS: \"{args}\"\nargs_pattern: \"[a-z ]+\"\n"
 	for name, content := range map[string]string{
@@ -853,6 +855,11 @@ func TestRegistryRefusesCmdExpandedAgentbusVariables(t *testing.T) {
 		"delayed":   "kind: shell\nargv:\n  windows: ['C:\\Windows\\System32\\CMD.EXE.', /v:on, /c, 'tool.exe !AGENTBUS_ARGS!']\n" + free,
 		"substring": "kind: shell\nargv:\n  windows: [cmd, /c, 'echo %AGENTBUS_ARGS:~0,5%']\n" + free,
 		"cmdlater":  "kind: shell\nargv:\n  windows: [tool.exe, '%AGENTBUS_OUT%', cmd]\nenv:\n  AGENTBUS_OUT: \"{out}\"\noutput: image\n",
+		"nocmd":     "kind: shell\nargv:\n  windows: [tool.exe, '--fmt=%AGENTBUS_ARGS%']\n" + free,
+		"pwshcmd":   "kind: shell\nargv:\n  windows: [powershell, -Command, 'cmd /c tool %AGENTBUS_ARGS%']\n" + free,
+		"forfiles":  "kind: shell\nargv:\n  windows: [forfiles, /p, 'C:\\logs', /c, 'cmd /c type @file %AGENTBUS_ARGS%']\n" + free,
+		"shcmd":     "kind: shell\nargv:\n  linux: [sh, -c, 'cmd.exe /c tool !agentbus_args!']\n" + free,
+		"mixedcase": "kind: shell\nargv:\n  windows: [tool.exe, '%AgentBus_Args%']\n" + free,
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -867,12 +874,13 @@ func TestRegistryRefusesCmdExpandedAgentbusVariables(t *testing.T) {
 		})
 	}
 	dir := t.TempDir()
-	// cmd that leaves the variable to the program, and a %AGENTBUS_...% that
-	// no cmd expands, are fine.
+	// cmd that leaves the variable to the program, and the variable named
+	// without % or !, are fine.
 	writeCommand(t, dir, "cmdtool.yaml", "kind: shell\nargv:\n  windows: [cmd, /c, tool.exe]\n"+free, mtime0)
-	writeCommand(t, dir, "literal.yaml", "kind: shell\nargv:\n  windows: [tool.exe, '--fmt=%AGENTBUS_ARGS%']\n"+free, mtime0)
+	writeCommand(t, dir, "pwshenv.yaml", "kind: shell\nargv:\n  windows: [powershell, -Command, 'Select-String -Pattern $env:AGENTBUS_ARGS x.log']\n"+free, mtime0)
+	writeCommand(t, dir, "percentother.yaml", "kind: shell\nargv:\n  windows: [cmd, /c, 'echo %PATH% AGENTBUS_ARGS']\n"+free, mtime0)
 	r := newRegistry(dir)
-	for _, name := range []string{"cmdtool", "literal"} {
+	for _, name := range []string{"cmdtool", "pwshenv", "percentother"} {
 		if e, ok := r.lookup(name); !ok || e.err != nil {
 			t.Fatalf("%s = %+v %v", name, e, ok)
 		}
@@ -912,7 +920,7 @@ func TestShippedAgentCommandsLoad(t *testing.T) {
 		t.Fatalf("linux = %q", linux)
 	}
 	win := s.Argv["windows"]
-	if len(win) != 7 || !reflect.DeepEqual(win[:6], []string{"powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"}) {
+	if len(win) != 7 || !reflect.DeepEqual(win[:6], []string{`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"}) {
 		t.Fatalf("windows = %q", win)
 	}
 	if !strings.Contains(win[6], "$env:AGENTBUS_OUT") || strings.Contains(win[6], `"`) {

@@ -313,12 +313,17 @@ func parseShell(f *commandFile, spec *commandSpec) error {
 // may follow it: env (AGENTBUS_*) is the only way in. A script file as the
 // program (.bat, .ps1, .js, ...) is refused outright, since Windows runs it
 // through an interpreter. Names are compared as Windows resolves them (see
-// programFile and programBase). The mod repeats this check at run time.
+// programFile and programBase). No element may name an AGENTBUS_* variable
+// the way cmd expands it (see cmdExpandsAgentbusVar). The mod repeats these
+// checks at run time.
 func unsafeShellArgv(argv []string) error {
 	if ext := scriptExtension(programFile(argv[0])); ext != "" {
 		return fmt.Errorf("a %s program runs through an interpreter; call the interpreter with the script instead", ext)
 	}
-	interpreter, cmd := "", false
+	if slices.ContainsFunc(argv, cmdExpandsAgentbusVar) {
+		return fmt.Errorf("cmd expands %%%s...%% and !%s...! before it parses the line, also from inside a script; let the program read the variable", shellEnvPrefix, shellEnvPrefix)
+	}
+	interpreter := ""
 	for _, el := range argv {
 		if el == argsPlaceholder || el == outPlaceholder {
 			if interpreter != "" {
@@ -329,19 +334,22 @@ func unsafeShellArgv(argv []string) error {
 		if interpreter == "" && isInterpreter(el) {
 			interpreter = programFile(el)
 		}
-		cmd = cmd || programBase(el) == "cmd"
-	}
-	if cmd && slices.ContainsFunc(argv, cmdExpandsAgentbusVar) {
-		return fmt.Errorf("cmd expands %%%s...%% and !%s...! before it parses the line; let the program read the variable", shellEnvPrefix, shellEnvPrefix)
 	}
 	return nil
 }
 
 // cmdExpandsAgentbusVar reports whether el names an AGENTBUS_* variable the
-// way cmd expands one (%VAR%, or !VAR! with delayed expansion; any case),
-// which would put Slack text into cmd's parser.
+// way cmd expands one (%VAR%, or !VAR! with delayed expansion; ASCII letters
+// in any case, as the mod matches them), which would put Slack text into
+// cmd's parser. cmd can run from any script (powershell -Command 'cmd /c
+// ...', forfiles /c), so this applies whatever the program.
 func cmdExpandsAgentbusVar(el string) bool {
-	upper := strings.ToUpper(el)
+	upper := strings.Map(func(r rune) rune {
+		if 'a' <= r && r <= 'z' {
+			return r - 'a' + 'A'
+		}
+		return r
+	}, el)
 	return strings.Contains(upper, "%"+shellEnvPrefix) || strings.Contains(upper, "!"+shellEnvPrefix)
 }
 

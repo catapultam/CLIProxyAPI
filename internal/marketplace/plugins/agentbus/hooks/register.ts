@@ -4,7 +4,7 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.3.5'
+export const VERSION = '0.3.6'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
@@ -283,8 +283,9 @@ const SHELL_INTERPRETERS = new Set([
 const SCRIPT_EXTENSIONS = ['.bat', '.cmd', '.ps1', '.vbs', '.js', '.wsf', '.hta']
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
 const PLACEHOLDER = /\{args\}|\{out\}/
-// An AGENTBUS_* variable as cmd expands it (%VAR%, or !VAR! with delayed expansion; any case),
-// before it parses the line.
+// An AGENTBUS_* variable as cmd expands it (%VAR%, or !VAR! with delayed expansion; ASCII letters in
+// any case), before it parses the line. cmd can run from inside any script (powershell -Command
+// 'cmd /c ...', forfiles /c), so this is refused whatever the program.
 const CMD_EXPANDED_VAR = /[%!]AGENTBUS_/i
 
 // el's file name as Windows runs it: the base name, trailing dots and spaces dropped (Win32 ignores
@@ -316,7 +317,7 @@ function isInterpreter(el: string): boolean {
 //   since an interpreter picks its script from its arguments;
 // - a script file as the program (.bat, .ps1, ...) runs through an interpreter;
 // - a placeholder must be a whole element or env value, and only AGENTBUS_* variables take one;
-// - when cmd is in argv, no element may name an AGENTBUS_* variable as %VAR% or !VAR!.
+// - no element may name an AGENTBUS_* variable as %VAR% or !VAR!, whatever the program.
 export function unsafeShellCommand(
   argv: readonly string[],
   env: Record<string, string> | undefined,
@@ -336,7 +337,7 @@ export function unsafeShellCommand(
     if (PLACEHOLDER.test(el)) return true
     interpreter = interpreter || isInterpreter(el)
   }
-  if (argv.some(el => programBase(el) === 'cmd') && argv.some(el => CMD_EXPANDED_VAR.test(el))) return true
+  if (argv.some(el => CMD_EXPANDED_VAR.test(el))) return true
   for (const [name, value] of Object.entries(env ?? {})) {
     if (!ENV_NAME.test(name)) return true
     if (value === '{args}' || value === '{out}') {
@@ -371,13 +372,17 @@ async function tempPath($: EngineInterface, os: string, id: string): Promise<str
   return `${dir.replace(/\/+$/, '')}/${file}`
 }
 
+// Windows PowerShell by its absolute path, so a powershell.exe earlier in PATH or in the working
+// directory can't stand in for it.
+const WINDOWS_POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+
 // The plugin API has no file removal, so the OS deletes it. The path never meets a command-line
 // parser: PowerShell reads it from the environment, and rm gets it after --.
 async function removeFile($: EngineInterface, os: string, path: string) {
   try {
     if (os === 'windows') {
       await $.process.run(
-        ['powershell', '-NoProfile', '-NonInteractive', '-Command', 'Remove-Item -LiteralPath $env:AGENTBUS_OUT -Force -ErrorAction SilentlyContinue'],
+        [WINDOWS_POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', 'Remove-Item -LiteralPath $env:AGENTBUS_OUT -Force -ErrorAction SilentlyContinue'],
         { env: { AGENTBUS_OUT: path } },
       )
     } else {
