@@ -57,6 +57,7 @@ func (s *Store) HandOff(previous, id string) error {
 	if len(old.Inbox) > 0 {
 		cur.Inbox = append(append([]Message(nil), old.Inbox...), cur.Inbox...)
 		old.Inbox = nil
+		s.capGuestLocked(cur)
 		if cur.notify != nil {
 			close(cur.notify)
 			cur.notify = nil

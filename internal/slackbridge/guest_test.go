@@ -486,6 +486,9 @@ func TestLinkPrunedAfterSevenDaysAbsent(t *testing.T) {
 	}
 	// The next save leaves it out of the file.
 	b.state.setDMLast("UALEX", sidA)
+	if errFlush := b.state.flush(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
 	reloaded, err := loadState(b.cfg.StatePath)
 	if err != nil {
 		t.Fatal(err)
@@ -528,6 +531,9 @@ func TestLinkPrunedOnLoad(t *testing.T) {
 	}
 	if l, ok := reloaded.conversation("GNEW"); !ok || l.Session != sidB || !l.Seen.Equal(clock.t) {
 		t.Fatalf("live link = %+v %v", l, ok)
+	}
+	if errFlush := reloaded.flush(); errFlush != nil {
+		t.Fatal(errFlush)
 	}
 	again, err := loadState(path)
 	if err != nil {

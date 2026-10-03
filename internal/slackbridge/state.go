@@ -176,11 +176,17 @@ type stateFile struct {
 	// Moved maps a session id that handed off (/clear, /resume, /branch) to
 	// the session that took it over.
 	Moved map[string]movedEntry `json:"moved,omitempty"`
+	// Seen maps a session id the state routes to (threads, links, homes) to
+	// when the bus last saw it, or when the bridge first noticed it; see
+	// pruneSessions.
+	Seen map[string]time.Time `json:"seen,omitempty"`
 }
 
 // state holds session threads, delivered messages, DM routing and the
-// allowlist. Every change is written through to disk; changes are rare
-// (human-paced).
+// allowlist. Changes to the allowlist and to conversation links are written
+// through to disk at once (their callers report a failed save); every other
+// change only marks the state dirty, and the bridge flushes it every
+// flushEvery and on Stop.
 type state struct {
 	path     string
 	now      func() time.Time
@@ -194,6 +200,9 @@ type state struct {
 	convs    map[string]convLink    // channel ID -> the session the conversation is linked to
 	users    []allowedUser          // config users first
 	moved    map[string]movedEntry  // old session id -> the session that took it over
+	seen     map[string]time.Time   // session id -> when it was last known on the bus
+	// dirty marks changes not written to disk yet.
+	dirty bool
 	// early holds receipts for message ids not recorded yet (a waiter can
 	// claim a message before deliver records it); record applies them. Not
 	// persisted; earlyRing evicts the oldest past maxEarlyReceipts.
@@ -204,7 +213,7 @@ type state struct {
 // loadState reads path; a missing file is an empty state. On a corrupt file it
 // returns an empty state and the error.
 func loadState(path string) (*state, error) {
-	st := &state{path: path, now: time.Now, threads: map[string]threadRef{}, homes: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, moved: map[string]movedEntry{}, early: map[string]string{}}
+	st := &state{path: path, now: time.Now, threads: map[string]threadRef{}, homes: map[string]string{}, sessions: map[string]string{}, dmLasts: map[string]dmLastEntry{}, convs: map[string]convLink{}, moved: map[string]movedEntry{}, seen: map[string]time.Time{}, early: map[string]string{}}
 	if path == "" {
 		return st, nil
 	}
@@ -268,6 +277,11 @@ func loadState(path string) (*state, error) {
 	for old, e := range file.Moved {
 		if old != "" && e.To != "" && old != e.To {
 			st.moved[old] = e
+		}
+	}
+	for sid, at := range file.Seen {
+		if sid != "" {
+			st.seen[sid] = at
 		}
 	}
 	st.users = file.Allowed
@@ -431,9 +445,7 @@ func (st *state) setThread(sid, channel, ts string, canBeHome bool) bool {
 		return false
 	}
 	st.sessions[ts] = sid
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 	return first
 }
 
@@ -448,9 +460,7 @@ func (st *state) moveThread(sid, channel, ts, home string) {
 	if home != "" {
 		st.homes[sid] = home
 	}
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 }
 
 // home returns where an owner moved session sid's home thread (homeChannel
@@ -478,9 +488,7 @@ func (st *state) fillThreadChannels(channel string) {
 	if !changed {
 		return
 	}
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 }
 
 // record remembers delivered message r (stamped now): where it came from
@@ -510,9 +518,7 @@ func (st *state) record(r replyRecord) string {
 		kept = kept[:copy(kept, kept[extra:])]
 	}
 	st.replies = kept
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 	return r.Receipt
 }
 
@@ -575,9 +581,7 @@ func (st *state) advanceReceipts(ids []string, reaction string) []receiptChange 
 		r.Receipt = reaction
 	}
 	if len(out) > 0 {
-		if errSave := st.saveLocked(); errSave != nil {
-			logSaveError(errSave)
-		}
+		st.dirty = true
 	}
 	return out
 }
@@ -651,9 +655,7 @@ func (st *state) linkDM(channel, ts, sid string, agent bool) {
 		kept = kept[:copy(kept, kept[extra:])]
 	}
 	st.dmLinks = kept
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 }
 
 // dmSession returns the session an unexpired top-level DM message ts in
@@ -692,9 +694,7 @@ func (st *state) setDMLast(userID, sid string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.dmLasts[userID] = dmLastEntry{Session: sid, At: st.now()}
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 }
 
 // dmLast returns the agent userID last talked to in their DM, unless that
@@ -802,9 +802,7 @@ func (st *state) noteMember(channel, userID string) {
 	}
 	l.Members = append(slices.Clone(l.Members), userID)
 	st.convs[channel] = l
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 }
 
 // conversations lists the live links, oldest first.
@@ -863,9 +861,7 @@ func (st *state) refreshConversation(channel, sid string, seen time.Time, known 
 		return live, true
 	}
 	delete(st.convs, channel)
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 	return convLink{}, false
 }
 
@@ -902,9 +898,7 @@ func (st *state) touchConversations(seen map[string]time.Time) {
 		}
 	}
 	if st.pruneConvsLocked() {
-		if errSave := st.saveLocked(); errSave != nil {
-			logSaveError(errSave)
-		}
+		st.dirty = true
 	}
 }
 
@@ -921,6 +915,8 @@ func (st *state) pruneConvsLocked() bool {
 	return pruned
 }
 
+// saveLocked writes the whole state to disk now and clears dirty. The
+// caller holds st.mu.
 func (st *state) saveLocked() error {
 	if st.path == "" {
 		return nil
@@ -934,6 +930,9 @@ func (st *state) saveLocked() error {
 	}
 	if len(st.moved) > 0 {
 		file.Moved = st.moved
+	}
+	if len(st.seen) > 0 {
+		file.Seen = st.seen
 	}
 	if len(st.convs) > 0 {
 		file.Conversations = st.convs
@@ -963,5 +962,9 @@ func (st *state) saveLocked() error {
 	if errWrite := os.WriteFile(tmp, data, 0o600); errWrite != nil {
 		return errWrite
 	}
-	return os.Rename(tmp, st.path)
+	if errRename := os.Rename(tmp, st.path); errRename != nil {
+		return errRename
+	}
+	st.dirty = false
+	return nil
 }

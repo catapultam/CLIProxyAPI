@@ -126,6 +126,11 @@ type Bridge struct {
 	guestNames  map[string]string
 	guestQueued map[string]int
 
+	// floods holds each linked conversation's guest rate-limit bucket.
+	// floodMu guards it and is never held across a Slack or Store call.
+	floodMu sync.Mutex
+	floods  map[string]*guestBucket
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	jobsWG sync.WaitGroup
@@ -711,10 +716,14 @@ func (b *Bridge) Start() {
 		}
 		b.bus.SetBridge(b)
 		log.Infof("slack: bridge on, %s, allowed users %s", b.homeDescription(), strings.Join(b.Users(), ", "))
-		b.jobsWG.Add(1)
+		b.jobsWG.Add(2)
 		go func() {
 			defer b.jobsWG.Done()
 			b.runJobs(ctx)
+		}()
+		go func() {
+			defer b.jobsWG.Done()
+			b.runMaintenance(ctx)
 		}()
 		b.runSocket(ctx)
 	}()
@@ -722,14 +731,17 @@ func (b *Bridge) Start() {
 
 // Stop closes the connection, waits for the bridge's goroutines, then
 // detaches from the bus. Detaching last means a resolve that finishes while
-// Stop runs can't re-attach the bridge afterwards.
+// Stop runs can't re-attach the bridge afterwards. Pending state changes
+// are written last, also when the bridge never started.
 func (b *Bridge) Stop() {
-	if b.cancel == nil {
-		return
+	if b.cancel != nil {
+		b.cancel()
+		<-b.done
+		b.jobsWG.Wait()
+		b.bus.SetBridge(nil)
+		b.cancel = nil
 	}
-	b.cancel()
-	<-b.done
-	b.jobsWG.Wait()
-	b.bus.SetBridge(nil)
-	b.cancel = nil
+	if errFlush := b.state.flush(); errFlush != nil {
+		logSaveError(errFlush)
+	}
 }

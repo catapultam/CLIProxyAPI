@@ -426,8 +426,12 @@ func (b *Bridge) noticeUnlinked(sid string, owner allowedUser) {
 // input, never as an instruction, and never another agent (no tags). A
 // guest can't run commands. The guest's label needs a users.info lookup
 // the first time, which runs as a job; while one of a guest's messages
-// waits for it, the later ones queue behind it.
+// waits for it, the later ones queue behind it. Guests' messages are rate
+// limited per conversation (guestFlooded).
 func (b *Bridge) routeGuest(ev messageEvent, link convLink) {
+	if b.guestFlooded(ev) {
+		return
+	}
 	cmd, rest, mentioned := parseCommand(ev.Text, b.botUserID)
 	if cmd.verb != "" {
 		log.Infof("slack: refused %s by guest %s in %s", cmd.verb, ev.User, ev.Channel)

@@ -207,6 +207,9 @@ func TestReceiptsArePersisted(t *testing.T) {
 	st, _ := loadState(path)
 	st.record(replyRecord{ID: "m_aa", Channel: "CAGENTS", ThreadTS: "1.1", TS: "1.5", Session: "s", Receipt: reactionQueued})
 	st.advanceReceipts([]string{"m_aa"}, reactionRead)
+	if errFlush := st.flush(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
 	loaded, errLoad := loadState(path)
 	if errLoad != nil {
 		t.Fatal(errLoad)

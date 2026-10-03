@@ -37,6 +37,10 @@ const (
 	unknownMachine  = "unknown"
 	fallbackFolder  = "session"
 	addressIDLength = 6
+	// maxQueuedGuest caps the guest messages queued for one session; the
+	// oldest go first, so a flood in a linked conversation can't fill an
+	// inbox.
+	maxQueuedGuest = 50
 )
 
 // Peer statuses.
@@ -499,11 +503,39 @@ func cleanReplyTo(replyTo string) string {
 
 func (s *Store) enqueueLocked(target *session, msg Message) {
 	target.Inbox = append(target.Inbox, msg)
+	if msg.Guest {
+		s.capGuestLocked(target)
+	}
 	if target.notify != nil {
 		close(target.notify)
 		target.notify = nil
 	}
 	s.dirty = true
+}
+
+// capGuestLocked drops sess's oldest queued guest messages beyond
+// maxQueuedGuest, logging each (never the body). The caller holds s.mu.
+func (s *Store) capGuestLocked(sess *session) {
+	guests := 0
+	for _, m := range sess.Inbox {
+		if m.Guest {
+			guests++
+		}
+	}
+	if guests <= maxQueuedGuest {
+		return
+	}
+	drop := guests - maxQueuedGuest
+	kept := sess.Inbox[:0]
+	for _, m := range sess.Inbox {
+		if m.Guest && drop > 0 {
+			drop--
+			log.Warnf("agentbus: dropped guest message %s for %s: more than %d guest messages queued", m.ID, m.To, maxQueuedGuest)
+			continue
+		}
+		kept = append(kept, m)
+	}
+	sess.Inbox = kept
 }
 
 // expireLocked drops a session's messages older than messageTTL, and command

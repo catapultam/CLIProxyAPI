@@ -89,9 +89,7 @@ func (st *state) moveSession(oldID, newID string) {
 	}
 	delete(st.moved, newID)
 	st.moved[oldID] = movedEntry{To: newID, At: st.now()}
-	if errSave := st.saveLocked(); errSave != nil {
-		logSaveError(errSave)
-	}
+	st.dirty = true
 }
 
 // currentLocked follows sid's handoffs to the session that has it now. The

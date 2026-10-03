@@ -285,6 +285,9 @@ func TestFollowUpTopLevelThreadReachesTheAgent(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].Body != "and also this" || !msgs[0].FromUser {
 		t.Fatalf("reply in the second thread = %+v", msgs)
 	}
+	if errFlush := b.state.flush(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
 	reloaded, err := loadState(b.state.path)
 	if err != nil {
 		t.Fatal(err)

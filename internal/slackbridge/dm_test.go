@@ -408,6 +408,9 @@ func TestDMStatePersists(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	sendDM(t, b, bus, sidA, "alex", "hello")
 	rootTS := lastPostTS(f)
+	if errFlush := b.state.flush(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
 	reloaded, err := loadState(b.cfg.StatePath)
 	if err != nil {
 		t.Fatal(err)

@@ -201,6 +201,9 @@ func TestBareThreadTSMigratesOnLoad(t *testing.T) {
 		t.Fatalf("legacy thread not linked: %q %v", sid, ok)
 	}
 	st.fillThreadChannels("CAGENTS")
+	if errFlush := st.flush(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
 	data, errRead := os.ReadFile(path)
 	if errRead != nil {
 		t.Fatal(errRead)

@@ -102,6 +102,9 @@ func TestReplyMapBoundedAndPersisted(t *testing.T) {
 		}
 	}
 	check("live", st)
+	if errFlush := st.flush(); errFlush != nil {
+		t.Fatal(errFlush)
+	}
 	reloaded, err := loadState(path)
 	if err != nil {
 		t.Fatal(err)
@@ -166,6 +169,9 @@ func TestStateSeedAllowRemove(t *testing.T) {
 	}
 	if sid, ok := st.session("2.2"); !ok || sid != "sid-a" {
 		t.Fatalf("second thread not linked: %q %v", sid, ok)
+	}
+	if errFlush := st.flush(); errFlush != nil {
+		t.Fatal(errFlush)
 	}
 
 	reloaded, err := loadState(path)
