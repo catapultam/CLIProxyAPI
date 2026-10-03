@@ -78,6 +78,47 @@ func VerifyPassword(hash, password string) (bool, error) {
 		return false, fmt.Errorf("mgmtauth: decode hash digest: %w", err)
 	}
 
+	if err := validateArgon2Params(timeCost, memory, threads, len(salt), len(expected)); err != nil {
+		return false, err
+	}
+
 	actual := argon2.IDKey([]byte(password), salt, timeCost, memory, threads, uint32(len(expected)))
 	return subtle.ConstantTimeCompare(actual, expected) == 1, nil
+}
+
+// Bounds enforced by validateArgon2Params on a stored hash's parameters
+// before they are ever passed to argon2.IDKey. A hash is persisted only by
+// HashPassword, which always produces values well inside these bounds; this
+// guards against a corrupted or maliciously edited sidecar file driving
+// argon2 into a huge allocation (an attacker-controlled "m") or a panic
+// (argon2 requires time>=1, parallelism>=1, and memory>=8*parallelism KiB).
+const (
+	minArgon2Time        = 1
+	minArgon2Parallelism = 1
+	maxArgon2MemoryKiB   = 1 << 20 // 1 GiB, expressed in KiB
+	minArgon2KeyLen      = 16
+	maxArgon2KeyLen      = 64
+)
+
+func validateArgon2Params(timeCost, memory uint32, threads uint8, saltLen, keyLen int) error {
+	if timeCost < minArgon2Time {
+		return fmt.Errorf("mgmtauth: invalid hash parameters: t must be >= %d", minArgon2Time)
+	}
+	if threads < minArgon2Parallelism {
+		return fmt.Errorf("mgmtauth: invalid hash parameters: p must be >= %d", minArgon2Parallelism)
+	}
+	minMemory := uint64(8) * uint64(threads)
+	if uint64(memory) < minMemory {
+		return fmt.Errorf("mgmtauth: invalid hash parameters: m must be >= 8*p (%d)", minMemory)
+	}
+	if memory > maxArgon2MemoryKiB {
+		return fmt.Errorf("mgmtauth: invalid hash parameters: m must be <= %d KiB", maxArgon2MemoryKiB)
+	}
+	if keyLen < minArgon2KeyLen || keyLen > maxArgon2KeyLen {
+		return fmt.Errorf("mgmtauth: invalid hash parameters: key length must be between %d and %d bytes", minArgon2KeyLen, maxArgon2KeyLen)
+	}
+	if saltLen == 0 {
+		return fmt.Errorf("mgmtauth: invalid hash parameters: salt must not be empty")
+	}
+	return nil
 }

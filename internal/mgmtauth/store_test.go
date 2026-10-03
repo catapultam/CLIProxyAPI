@@ -1,6 +1,8 @@
 package mgmtauth
 
 import (
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,7 +17,7 @@ func newTestStore(t *testing.T) (*Store, string) {
 	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
 		t.Fatalf("write config.yaml: %v", err)
 	}
-	return NewStore(configPath), configPath
+	return NewStore(configPath, ""), configPath
 }
 
 func TestStoreMissingFileMeansNoAccount(t *testing.T) {
@@ -26,15 +28,97 @@ func TestStoreMissingFileMeansNoAccount(t *testing.T) {
 	}
 }
 
-func TestStoreCorruptFileMeansNoAccount(t *testing.T) {
+func TestStoreCorruptFileMeansNoAccountAndBroken(t *testing.T) {
 	store, configPath := newTestStore(t)
-	sidecarPath := StorePath(configPath)
+	sidecarPath := ResolveStorePath(configPath, "")
 	if err := os.WriteFile(sidecarPath, []byte("not json"), 0o600); err != nil {
 		t.Fatalf("write corrupt sidecar: %v", err)
 	}
 	store.Load()
 	if got := store.Get(); got != nil {
 		t.Fatalf("Get() = %+v, want nil for a corrupt sidecar file", got)
+	}
+
+	// S6: a corrupt file must never be overwritten. Mutate refuses with a
+	// 503 MutationError instead of calling fn.
+	called := false
+	_, err := store.Mutate(func(current *Account) (*Account, error) {
+		called = true
+		return &Account{Username: "admin", PasswordHash: "hash"}, nil
+	})
+	if called {
+		t.Fatal("Mutate must not call fn while the store is broken")
+	}
+	var mutErr *MutationError
+	if !errors.As(err, &mutErr) || mutErr.Status != http.StatusServiceUnavailable {
+		t.Fatalf("Mutate error = %v, want a 503 MutationError", err)
+	}
+
+	// The on-disk corrupt content must be untouched.
+	raw, errRead := os.ReadFile(sidecarPath)
+	if errRead != nil {
+		t.Fatalf("read sidecar: %v", errRead)
+	}
+	if string(raw) != "not json" {
+		t.Fatalf("sidecar content = %q, want it untouched", raw)
+	}
+}
+
+// TestStoreUnreadableFileIsBroken covers the "unreadable" half of S6: a
+// sidecar that exists but cannot be read (here, a directory in its place)
+// must also leave the store broken rather than silently proceeding.
+func TestStoreUnreadableFileIsBroken(t *testing.T) {
+	store, configPath := newTestStore(t)
+	sidecarPath := ResolveStorePath(configPath, "")
+	if err := os.Mkdir(sidecarPath, 0o700); err != nil {
+		t.Fatalf("mkdir in place of sidecar: %v", err)
+	}
+	store.Load()
+	if got := store.Get(); got != nil {
+		t.Fatalf("Get() = %+v, want nil", got)
+	}
+	_, err := store.Mutate(func(current *Account) (*Account, error) {
+		return &Account{Username: "admin", PasswordHash: "hash"}, nil
+	})
+	var mutErr *MutationError
+	if !errors.As(err, &mutErr) || mutErr.Status != http.StatusServiceUnavailable {
+		t.Fatalf("Mutate error = %v, want a 503 MutationError", err)
+	}
+}
+
+func TestResolveStorePathPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	// 4. Config file's directory, lowest precedence.
+	if got := ResolveStorePath(configPath, ""); got != filepath.Join(dir, StoreFileName) {
+		t.Fatalf("config-dir fallback = %q, want %q", got, filepath.Join(dir, StoreFileName))
+	}
+
+	// 3. authDir beats the config file's directory.
+	authDir := filepath.Join(dir, "auths")
+	if got := ResolveStorePath(configPath, authDir); got != filepath.Join(authDir, StoreFileName) {
+		t.Fatalf("authDir = %q, want %q", got, filepath.Join(authDir, StoreFileName))
+	}
+
+	// 2. WRITABLE_PATH beats authDir.
+	writable := filepath.Join(dir, "writable")
+	t.Setenv("WRITABLE_PATH", writable)
+	if got := ResolveStorePath(configPath, authDir); got != filepath.Join(filepath.Clean(writable), StoreFileName) {
+		t.Fatalf("WRITABLE_PATH = %q, want %q", got, filepath.Join(filepath.Clean(writable), StoreFileName))
+	}
+
+	// 1. MANAGEMENT_LOGIN_FILE (a full path) beats everything.
+	explicit := filepath.Join(dir, "explicit-login-store.dat")
+	t.Setenv(managementLoginFileEnv, explicit)
+	if got := ResolveStorePath(configPath, authDir); got != explicit {
+		t.Fatalf("MANAGEMENT_LOGIN_FILE = %q, want %q", got, explicit)
+	}
+}
+
+func TestResolveStorePathEmptyWithoutConfigOrOverride(t *testing.T) {
+	if got := ResolveStorePath("", ""); got != "" {
+		t.Fatalf("ResolveStorePath(\"\", \"\") = %q, want empty", got)
 	}
 }
 
@@ -55,7 +139,7 @@ func TestStoreMutateCreatesAndPersists(t *testing.T) {
 		t.Fatalf("Username = %q, want admin", acct.Username)
 	}
 
-	sidecarPath := StorePath(configPath)
+	sidecarPath := ResolveStorePath(configPath, "")
 	info, err := os.Stat(sidecarPath)
 	if err != nil {
 		t.Fatalf("stat sidecar: %v", err)
@@ -114,7 +198,7 @@ func TestStoreRoundTripsAcrossReload(t *testing.T) {
 
 	// Reload from a brand new Store instance pointed at the same path,
 	// simulating a process restart.
-	reloaded := NewStore(configPath)
+	reloaded := NewStore(configPath, "")
 	reloaded.Load()
 	got := reloaded.Get()
 	if got == nil {
@@ -154,7 +238,7 @@ func TestStoreMutatePersistFailureLeavesStateUnchanged(t *testing.T) {
 	// component, so persist's CreateTemp fails deterministically and
 	// portably (no permission trickery needed).
 	validPath := store.path
-	store.path = filepath.Join(validPath, "nested", "management-login.json")
+	store.path = filepath.Join(validPath, "nested", StoreFileName)
 
 	_, err := store.Mutate(func(current *Account) (*Account, error) {
 		next := current.Clone()

@@ -124,7 +124,7 @@ func NewWebAuthn(rpID, displayName string, origins []string) (*webauthn.WebAuthn
 
 // BeginAddPasskey returns WebAuthn creation options and session data for
 // registering a new passkey: resident key required, user verification
-// preferred, with the account's existing passkeys excluded so a device
+// required, with the account's existing passkeys excluded so a device
 // cannot register the same passkey twice.
 func BeginAddPasskey(w *webauthn.WebAuthn, user User) (*protocol.CredentialCreation, *webauthn.SessionData, error) {
 	exclude := make([]protocol.CredentialDescriptor, 0, len(user.Credentials))
@@ -139,7 +139,7 @@ func BeginAddPasskey(w *webauthn.WebAuthn, user User) (*protocol.CredentialCreat
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			ResidentKey:        protocol.ResidentKeyRequirementRequired,
 			RequireResidentKey: &requireResidentKey,
-			UserVerification:   protocol.VerificationPreferred,
+			UserVerification:   protocol.VerificationRequired,
 		}),
 		webauthn.WithExclusions(exclude),
 	)
@@ -157,9 +157,9 @@ func FinishAddPasskey(w *webauthn.WebAuthn, user User, session webauthn.SessionD
 
 // BeginPasskeyLogin returns assertion options for a discoverable (usernameless)
 // passkey login: no allowCredentials, so the authenticator itself picks the
-// credential to present.
+// credential to present, with user verification required.
 func BeginPasskeyLogin(w *webauthn.WebAuthn) (*protocol.CredentialAssertion, *webauthn.SessionData, error) {
-	return w.BeginDiscoverableLogin()
+	return w.BeginDiscoverableLogin(webauthn.WithUserVerification(protocol.VerificationRequired))
 }
 
 // FinishPasskeyLogin validates a discoverable login response, resolving the
@@ -178,8 +178,9 @@ type Ceremony struct {
 	ExpiresAt time.Time
 }
 
-// MaxPendingCeremonies caps the number of outstanding ceremonies, so an
-// attacker spamming begin endpoints cannot grow the cache without bound.
+// MaxPendingCeremonies caps the number of outstanding ceremonies: once
+// reached, Begin evicts the oldest pending ceremony to make room rather than
+// growing further or rejecting the new one.
 const MaxPendingCeremonies = 256
 
 // ceremonyPurgeMinInterval bounds how often Begin scans for expired entries
@@ -187,18 +188,18 @@ const MaxPendingCeremonies = 256
 // does not pay an O(n) purge scan on every single call.
 const ceremonyPurgeMinInterval = 10 * time.Second
 
-// ErrTooManyCeremonies is returned by Begin when MaxPendingCeremonies
-// pending ceremonies already exist, even after purging expired ones.
-var ErrTooManyCeremonies = errors.New("mgmtauth: too many pending ceremonies")
-
 // CeremonyCache holds single-use, TTL-bound WebAuthn ceremonies in memory
 // only, as the management login design requires: no persistence, so a
-// restart mid-ceremony just means pressing the button again.
+// restart mid-ceremony just means pressing the button again. Login and
+// registration ceremonies are expected to live in separate CeremonyCache
+// instances (see Handler), so a burst of one kind can never evict or starve
+// the other.
 type CeremonyCache struct {
 	clock Clock
 
 	mu        sync.Mutex
 	items     map[string]Ceremony
+	order     []string // insertion order, oldest first; may contain stale ids
 	lastPurge time.Time
 }
 
@@ -212,20 +213,22 @@ func NewCeremonyCache(clock Clock) *CeremonyCache {
 }
 
 // Begin stores session under a fresh random ceremony id and returns the id.
-// It returns ErrTooManyCeremonies when MaxPendingCeremonies are already
-// outstanding even after an expiry purge.
+// Once MaxPendingCeremonies are outstanding (even after an expiry purge),
+// the oldest pending ceremony is evicted to make room: an attacker spamming
+// begin cannot grow the cache without bound, but also cannot use it to deny
+// service by exhausting it, since the real cost of eviction falls on the
+// least-recently-started (most likely already-abandoned) ceremony.
 func (c *CeremonyCache) Begin(session webauthn.SessionData) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := c.clock.Now()
-	atCapacity := len(c.items) >= MaxPendingCeremonies
-	if atCapacity || now.Sub(c.lastPurge) >= ceremonyPurgeMinInterval {
+	if len(c.items) >= MaxPendingCeremonies || now.Sub(c.lastPurge) >= ceremonyPurgeMinInterval {
 		c.purgeExpiredLocked(now)
 		c.lastPurge = now
 	}
 	if len(c.items) >= MaxPendingCeremonies {
-		return "", ErrTooManyCeremonies
+		c.evictOldestLocked()
 	}
 
 	id, err := randomCeremonyID()
@@ -233,6 +236,7 @@ func (c *CeremonyCache) Begin(session webauthn.SessionData) (string, error) {
 		return "", err
 	}
 	c.items[id] = Ceremony{Session: session, ExpiresAt: now.Add(CeremonyTTL)}
+	c.order = append(c.order, id)
 	return id, nil
 }
 
@@ -259,6 +263,37 @@ func (c *CeremonyCache) purgeExpiredLocked(now time.Time) {
 		if !now.Before(ceremony.ExpiresAt) {
 			delete(c.items, id)
 		}
+	}
+	c.trimStaleOrderPrefixLocked()
+}
+
+// evictOldestLocked removes the single oldest still-pending ceremony,
+// skipping over any ids at the front of order that were already removed by
+// Take or a purge.
+func (c *CeremonyCache) evictOldestLocked() {
+	for len(c.order) > 0 {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		if _, ok := c.items[oldest]; ok {
+			delete(c.items, oldest)
+			return
+		}
+	}
+}
+
+// trimStaleOrderPrefixLocked drops the leading run of order entries that no
+// longer exist in items, bounding order's growth without needing to scan or
+// rewrite the whole slice on every Take.
+func (c *CeremonyCache) trimStaleOrderPrefixLocked() {
+	i := 0
+	for i < len(c.order) {
+		if _, ok := c.items[c.order[i]]; ok {
+			break
+		}
+		i++
+	}
+	if i > 0 {
+		c.order = c.order[i:]
 	}
 }
 

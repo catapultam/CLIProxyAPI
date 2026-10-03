@@ -81,8 +81,10 @@ management:
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
   panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 
-  # The management panel's username/password and passkey login account is not configured here: it
-  # lives in management-login.json next to this config file, and is set up entirely from the panel.
+  # The management panel's username/password and passkey login account is not configured here. It is
+  # set up from the panel and stored in management-login.dat (JSON content). Location, first match wins:
+  # $MANAGEMENT_LOGIN_FILE (full path), then $WRITABLE_PATH, then the resolved auth-dir, then the
+  # directory of this config file. Hand edits need a restart; the file is never read as an auth credential.
 
 # Client authentication for the proxy API. These are not upstream provider keys.
 access:

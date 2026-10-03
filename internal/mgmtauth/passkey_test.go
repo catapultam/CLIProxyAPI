@@ -321,28 +321,41 @@ func TestCeremonyCacheUnknownID(t *testing.T) {
 	}
 }
 
-// TestCeremonyCacheCapsPendingCeremonies verifies Begin refuses to grow the
-// cache past MaxPendingCeremonies, protecting against an unbounded-memory
-// DoS from a client that only ever calls begin.
-func TestCeremonyCacheCapsPendingCeremonies(t *testing.T) {
+// TestCeremonyCacheCapsPendingCeremoniesByEvictingOldest verifies Begin
+// never rejects once MaxPendingCeremonies are outstanding: it evicts the
+// single oldest pending ceremony to make room instead, so a client that
+// only ever calls begin cannot grow the cache without bound, and also
+// cannot use it to deny service to others by exhausting it.
+func TestCeremonyCacheCapsPendingCeremoniesByEvictingOldest(t *testing.T) {
 	clock := newMockClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	cache := NewCeremonyCache(clock)
 
-	for i := 0; i < MaxPendingCeremonies; i++ {
+	firstID, err := cache.Begin(webauthn.SessionData{Challenge: "first"})
+	if err != nil {
+		t.Fatalf("Begin() #0: %v", err)
+	}
+	for i := 1; i < MaxPendingCeremonies; i++ {
 		if _, err := cache.Begin(webauthn.SessionData{Challenge: "abc"}); err != nil {
 			t.Fatalf("Begin() #%d: %v", i, err)
 		}
 	}
-
-	if _, err := cache.Begin(webauthn.SessionData{Challenge: "overflow"}); err != ErrTooManyCeremonies {
-		t.Fatalf("Begin() at capacity: err = %v, want ErrTooManyCeremonies", err)
+	if len(cache.items) != MaxPendingCeremonies {
+		t.Fatalf("len(items) = %d, want %d", len(cache.items), MaxPendingCeremonies)
 	}
 
-	// Expiring everything and advancing past the cache's internal purge
-	// interval frees room again; a purge can happen even without reaching
-	// the interval once the cache is at capacity.
-	clock.Advance(CeremonyTTL + time.Second)
-	if _, err := cache.Begin(webauthn.SessionData{Challenge: "after-purge"}); err != nil {
-		t.Fatalf("Begin() after expiry: %v", err)
+	overflowID, err := cache.Begin(webauthn.SessionData{Challenge: "overflow"})
+	if err != nil {
+		t.Fatalf("Begin() at capacity: unexpected error %v, want eviction instead of rejection", err)
+	}
+	if len(cache.items) != MaxPendingCeremonies {
+		t.Fatalf("len(items) after eviction = %d, want it to stay at the cap %d", len(cache.items), MaxPendingCeremonies)
+	}
+
+	// The oldest ceremony was evicted; the newly begun one survives.
+	if _, ok := cache.Take(firstID); ok {
+		t.Fatal("expected the oldest ceremony to have been evicted")
+	}
+	if _, ok := cache.Take(overflowID); !ok {
+		t.Fatal("expected the newly begun ceremony to still be present")
 	}
 }

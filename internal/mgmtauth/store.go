@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,8 +19,51 @@ import (
 // account, kept next to the active config file rather than inside it: a
 // writer that mutates config.yaml (e.g. a stale PUT /v8/management/config)
 // can no longer resurrect a revoked session-secret or a deleted passkey,
-// and the account never leaks through a config view.
-const StoreFileName = "management-login.json"
+// and the account never leaks through a config view. The extension is
+// deliberately not .json: the auth-file watcher and the /v8/management
+// credentials endpoints only ever look at *.json files, so this name keeps
+// the store invisible to both without needing any extra filtering code. The
+// content is still plain JSON.
+const StoreFileName = "management-login.dat"
+
+// managementLoginFileEnv, when set, is the full path to the sidecar file,
+// overriding every other resolution rule.
+const managementLoginFileEnv = "MANAGEMENT_LOGIN_FILE"
+
+// writablePathEnvVars mirrors internal/util.WritablePath's own lookup,
+// duplicated here (rather than imported) to keep this package's dependency
+// footprint limited to stdlib, go-webauthn, x/crypto, and logrus.
+var writablePathEnvVars = []string{"WRITABLE_PATH", "writable_path"}
+
+// ResolveStorePath picks the sidecar file location, in order:
+//  1. MANAGEMENT_LOGIN_FILE, a full path, if set.
+//  2. WRITABLE_PATH (or writable_path), a directory, if set.
+//  3. authDir, the resolved auth-dir, if non-empty (persistent in the
+//     default docker-compose, which mounts auths but only a single config
+//     file).
+//  4. The active config file's own directory.
+//
+// It returns "" (persistence unavailable) only when none of the above
+// apply, i.e. configFilePath is itself empty and no override is set.
+func ResolveStorePath(configFilePath, authDir string) string {
+	if envPath := strings.TrimSpace(os.Getenv(managementLoginFileEnv)); envPath != "" {
+		return envPath
+	}
+	for _, key := range writablePathEnvVars {
+		if value, ok := os.LookupEnv(key); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return filepath.Join(filepath.Clean(trimmed), StoreFileName)
+			}
+		}
+	}
+	if authDir != "" {
+		return filepath.Join(authDir, StoreFileName)
+	}
+	if configFilePath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(configFilePath), StoreFileName)
+}
 
 // PasskeyRecord is the subset of a webauthn.Credential persisted for one
 // registered passkey. Sign counters are intentionally not stored: synced
@@ -88,16 +134,6 @@ type MutationError struct {
 
 func (e *MutationError) Error() string { return e.Message }
 
-// StorePath returns the sidecar file path for a given config file path: the
-// same directory, named StoreFileName. An empty configFilePath yields an
-// empty path, which Store treats as "persistence unavailable".
-func StorePath(configFilePath string) string {
-	if configFilePath == "" {
-		return ""
-	}
-	return filepath.Join(filepath.Dir(configFilePath), StoreFileName)
-}
-
 // Store holds the management panel login account in memory, backed by a
 // JSON sidecar file. It is loaded once at startup (Load); there is no file
 // watcher, so a hand edit to the sidecar file needs a process restart to
@@ -105,22 +141,30 @@ func StorePath(configFilePath string) string {
 // current account, runs the caller's function, persists the result
 // atomically, and only then publishes it to readers. A persist failure
 // leaves the live in-memory state unchanged and is reported to the caller.
+//
+// If Load hits a non-missing-file error (unreadable or corrupt), the store
+// enters a "broken" state: Get reports no account (so the management key
+// keeps working), and Mutate refuses outright rather than ever writing over
+// a file whose content it could not safely read first.
 type Store struct {
 	path string
 
-	mu      sync.RWMutex
-	account *Account
+	mu        sync.RWMutex
+	account   *Account
+	broken    bool
+	brokenErr error
 }
 
-// NewStore creates a Store backed by the sidecar file next to
-// configFilePath. Call Load once before serving requests.
-func NewStore(configFilePath string) *Store {
-	return &Store{path: StorePath(configFilePath)}
+// NewStore creates a Store backed by the sidecar file resolved from
+// configFilePath/authDir via ResolveStorePath. Call Load once before
+// serving requests.
+func NewStore(configFilePath, authDir string) *Store {
+	return &Store{path: ResolveStorePath(configFilePath, authDir)}
 }
 
 // Load reads the sidecar file into memory. A missing file means no account
 // is configured, which is not an error. An unreadable or corrupt file is
-// logged and also treated as no account: the management key still works.
+// logged and puts the store into the "broken" state described on Store.
 func (s *Store) Load() {
 	if s.path == "" {
 		s.mu.Lock()
@@ -131,20 +175,26 @@ func (s *Store) Load() {
 
 	data, err := os.ReadFile(s.path)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.WithError(err).WithField("path", s.path).Error("mgmtauth: failed to read management login store; treating as no account")
-		}
 		s.mu.Lock()
 		s.account = nil
+		if !os.IsNotExist(err) {
+			s.broken = true
+			s.brokenErr = err
+		}
 		s.mu.Unlock()
+		if !os.IsNotExist(err) {
+			log.WithError(err).WithField("path", s.path).Error("mgmtauth: failed to read management login store; the store is unavailable until this is fixed and the process restarts")
+		}
 		return
 	}
 
 	var acct Account
 	if err := json.Unmarshal(data, &acct); err != nil {
-		log.WithError(err).WithField("path", s.path).Error("mgmtauth: management login store is corrupt; treating as no account")
+		log.WithError(err).WithField("path", s.path).Error("mgmtauth: management login store is corrupt; the store is unavailable until this is fixed and the process restarts")
 		s.mu.Lock()
 		s.account = nil
+		s.broken = true
+		s.brokenErr = err
 		s.mu.Unlock()
 		return
 	}
@@ -154,7 +204,8 @@ func (s *Store) Load() {
 	s.mu.Unlock()
 }
 
-// Get returns a deep copy of the current account, or nil if none exists.
+// Get returns a deep copy of the current account, or nil if none exists
+// (including when the store is broken).
 func (s *Store) Get() *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -165,10 +216,20 @@ func (s *Store) Get() *Account {
 // exists), persists the result fn returns, and only then publishes it as
 // the new in-memory state. If fn returns an error (including a
 // *MutationError), or persistence fails, the live state is left exactly as
-// it was and the error is returned to the caller.
+// it was and the error is returned to the caller. If the store is broken
+// (Load hit an unreadable/corrupt file), Mutate refuses immediately with a
+// 503 *MutationError without calling fn, so it never writes over content it
+// never safely read.
 func (s *Store) Mutate(fn func(current *Account) (*Account, error)) (*Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.broken {
+		return nil, &MutationError{
+			Status:  http.StatusServiceUnavailable,
+			Message: fmt.Sprintf("management login store is unavailable: %v", s.brokenErr),
+		}
+	}
 
 	next, err := fn(s.account.Clone())
 	if err != nil {
@@ -227,5 +288,16 @@ func (s *Store) persist(acct *Account) error {
 		return err
 	}
 	cleanup = false
+
+	// Best-effort: fsync the directory entry too, so the rename itself
+	// survives a crash immediately after. Windows has no equivalent (and
+	// os.Open of a directory there isn't usable for this), so this is a
+	// no-op there.
+	if runtime.GOOS != "windows" {
+		if dirFile, errOpen := os.Open(dir); errOpen == nil {
+			_ = dirFile.Sync()
+			_ = dirFile.Close()
+		}
+	}
 	return nil
 }
