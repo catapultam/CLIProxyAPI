@@ -140,3 +140,19 @@ test('session.end with clear says bye, then the next tick follows the session to
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
+
+test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {
+  const calls: Call[] = []
+  mock.env(on, { ANTHROPIC_BASE_URL: ENV.ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN: ENV.ANTHROPIC_AUTH_TOKEN })
+  on('session.id', () => ({ value: DEFAULT_SESSION_ID }))
+  on('session.start', () => ({ cwd: '/home/u/comms' }))
+  on('ui.log', () => ({ value: undefined }))
+  on('fs.read', () => ({ value: 'Fedora.localdomain\n' }))
+  on('http.fetch', (_$, e) => {
+    calls.push({ url: e.url, method: e.init?.method ?? 'GET', body: e.init?.body ? JSON.parse(e.init.body) : undefined, auth: undefined })
+    return { value: { status: 200, ok: true, headers: {}, text: '{"address":"fedora/comms-3a9e9c"}' } }
+  })
+  await $.session.start({ surface: null, isInteractive: false, cwd: '/home/u/comms' })
+  const hello = calls.find(c => c.url.endsWith('/hello'))
+  expect((hello?.body as { machine: string }).machine).toBe('fedora')
+})

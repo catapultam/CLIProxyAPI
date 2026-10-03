@@ -61,6 +61,26 @@ export function formatMessage(m: BusMessage): string {
   )
 }
 
+// Windows exports COMPUTERNAME, but on Linux and macOS HOSTNAME is only a shell variable, so fall
+// back to /etc/hostname and then the hostname command. Peers on machine "unknown" are never listed.
+async function machineName($: EngineInterface): Promise<string> {
+  const fromEnv = (await $.env.get('COMPUTERNAME')) ?? (await $.env.get('HOSTNAME'))
+  if (fromEnv?.trim()) return fromEnv.trim().toLowerCase()
+  try {
+    const file = (await $.fs.read('/etc/hostname')).trim()
+    if (file) return file.split('.')[0].toLowerCase()
+  } catch {
+    // No /etc/hostname (macOS); try the command.
+  }
+  try {
+    const { exitCode, stdout } = await $.process.run(['hostname'])
+    if (exitCode === 0 && stdout.trim()) return stdout.trim().split('.')[0].toLowerCase()
+  } catch {
+    // Fall through.
+  }
+  return 'unknown'
+}
+
 async function waitOnce($: EngineInterface) {
   const query = `?session=${encodeURIComponent(session)}&machine=${encodeURIComponent(machine)}&mod=1`
   const { status, json } = await bus($, 'GET', `/wait${query}`)
@@ -78,7 +98,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     base = ((await $.env.get('ANTHROPIC_BASE_URL')) ?? '').replace(/\/+$/, '')
     token = (await $.env.get('ANTHROPIC_AUTH_TOKEN')) ?? ''
-    machine = ((await $.env.get('COMPUTERNAME')) ?? (await $.env.get('HOSTNAME')) ?? 'unknown').toLowerCase()
+    machine = await machineName($)
     session = await $.session.id()
     ended = false
     if (base && token && session) {
