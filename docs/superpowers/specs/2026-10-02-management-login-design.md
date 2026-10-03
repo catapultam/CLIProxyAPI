@@ -47,18 +47,26 @@ management:
     username: admin
     password-hash: "$argon2id$v=19$m=65536,t=3,p=4$..."   # plaintext is hashed on load, like secret-key
     session-secret: "<base64, auto-generated>"            # signs session cookies/tokens
+    user-handle: "<base64url, 32 random bytes>"           # WebAuthn user.id, generated with the account
     passkey-rp-id: cakebox.wyrm-cat.ts.net                # empty = passkeys disabled
-    passkey-origins: ["https://cakebox.wyrm-cat.ts.net"]
+    passkey-origins: ["https://cakebox.wyrm-cat.ts.net:8443", "https://cakebox.wyrm-cat.ts.net"]
     passkeys:
       - id: "<base64url credential id>"
         public-key: "<base64url COSE key>"
+        attestation-type: "none"
+        transports: ["internal", "hybrid"]
+        aaguid: "<base64url>"
+        backup-eligible: true
+        backup-state: true
         name: "Pixel 9"
         created: 2026-10-02T21:00:00Z
 ```
 
+Store whatever fields go-webauthn's `webauthn.Credential` needs to validate a later assertion (notably the backup-eligible/backup-state flags, which go-webauthn checks for consistency), except the sign counter.
+
 - **Password hashing:** use argon2id (`golang.org/x/crypto/argon2`, already a dependency). A plaintext `password` value written by hand is hashed on load and written back. This is the same mechanism `secret-key` already uses in `config_load.go`.
 - **Passkey sign counters are not persisted.** Synced passkeys (iCloud, Google, 1Password) always report 0, and persisting the counter would rewrite `config.yaml` on every login.
-- **`session-secret`** is generated the first time an account is created. "Sign out all devices", a password change and deleting a passkey all regenerate it, which invalidates every existing session.
+- **`session-secret`** is generated the first time an account is created. "Sign out all devices" and a password change regenerate it, which invalidates every existing session. On a password change the caller immediately gets a fresh session (cookie + token in the response) so they stay logged in.
 
 ### Sessions
 
@@ -69,11 +77,12 @@ management:
 - **Lifetime:** 30 days, sliding. When less than half the lifetime remains, the middleware reissues the token: it sets a fresh cookie, or returns the new value in the `X-CPA-Session-Refresh` header for bearer clients.
 - **Cookie:**
   - Name `cpa_mgmt_session`, attributes `HttpOnly`, `SameSite=Strict`, `Path=/`.
-  - `Secure` is set when the request is HTTPS, either direct TLS or `X-Forwarded-Proto: https` from a trusted proxy.
+  - `Secure` is set when the request is HTTPS: direct TLS, `X-Forwarded-Proto: https` from a trusted proxy, or an `Origin` header with the `https` scheme. The last case matters on cakebox, where `tailscale serve` terminates TLS in front of an nginx that forwards `X-Forwarded-Proto: http`.
+  - Max-Age matches the token expiry.
 - **Bearer fallback:** login returns the same token in the response body. The panel uses it as `Authorization: Bearer cpas_...` when its API base is cross-origin. Same-origin panels ignore the body value and rely on the cookie.
 - **CSRF guard:** applies only to cookie-authenticated requests whose method is not GET, HEAD or OPTIONS.
   - The request must carry `Sec-Fetch-Site: same-origin`.
-  - If that header is absent, `Origin` must match the request host (or `X-Forwarded-Host` from a trusted proxy, since the nginx panel container rewrites `Host`) or a configured passkey origin.
+  - If that header is absent, the `Origin` host must equal the request `Host` (the nginx panel container preserves `Host`), or `Origin` must be one of the configured passkey origins. A request with neither header is rejected.
   - Bearer-authenticated requests are not cookie-driven, so they need no CSRF check.
 
 ### Middleware change
@@ -87,25 +96,34 @@ Session auth bypasses the `allow-remote` check, because the session itself is th
 
 ### Routes
 
-Public, under `/v8/management/session/`, with no key required:
+This is the exact contract the panel codes against. All bodies are JSON. Errors are `{"error": "<message>"}` with a meaningful status. A "session response" means: set the `cpa_mgmt_session` cookie and return `{"token": "cpas_...", "expires_at": "<RFC3339>"}`.
 
-| Route | Purpose |
-|---|---|
-| `GET status` | `{account: bool, passkeys: bool (for this request's origin), authenticated: bool, username}` |
-| `POST login` | `{username, password}`; on success sets the cookie and returns `{token, expires}` |
-| `POST passkey/begin` | Returns WebAuthn assertion options (discoverable, no username) |
-| `POST passkey/finish` | Verifies the assertion; sets the cookie and returns `{token, expires}` |
-| `POST logout` | Clears the cookie |
+Public, under `/v8/management/session/`. No key is required, but they still return 404 when management is unavailable (same availability rule as the rest of `/v8/management`):
+
+| Route | Request | Response |
+|---|---|---|
+| `GET status` | none | `200 {"account": bool, "authenticated": bool, "method": "password"\|"passkey"\|"key"\|"", "passkeys_available": bool, "passkey_origins": [..]}`. `account` = a username and password hash exist. `authenticated` = a valid session cookie/bearer token, or a valid management key, came with the request. `passkeys_available` = rp-id set and at least one passkey registered. |
+| `POST login` | `{"username", "password"}` | `200` session response. `401` wrong credentials, `409` no account, `429 {"error", "retry_after": seconds}` when throttled |
+| `POST passkey/begin` | none | `200 {"ceremony_id": "...", "options": <go-webauthn protocol.CredentialAssertion JSON, i.e. {"publicKey": {...}}>}`. Discoverable login: no allowCredentials. `409` when passkeys are unavailable |
+| `POST passkey/finish` | `{"ceremony_id", "credential": <PublicKeyCredential JSON as produced by credential.toJSON()>}` | `200` session response, `401` on failure. The ceremony is single-use either way |
+| `POST logout` | none | `204`; clears the cookie (Max-Age=0) |
 
 Authenticated (key or session), under `/v8/management/account`:
 
-| Route | Purpose |
-|---|---|
-| `GET` | Username and passkey list (no secrets) |
-| `PUT` | Set or change the username and password. Changing an existing password over a session requires the current password; over the key it does not, which is the recovery path |
-| `POST passkeys/begin`, `POST passkeys/finish` | Register a passkey |
-| `PATCH passkeys/:id`, `DELETE passkeys/:id` | Rename or delete a passkey |
-| `POST sign-out-all` | Regenerate `session-secret` |
+| Route | Request | Response |
+|---|---|---|
+| `GET /account` | none | `200 {"configured": bool, "username": "", "passkeys": [{"id", "name", "created_at"}], "passkey_rp_id": "", "passkey_origins": []}` |
+| `PUT /account` | `{"username", "password", "current_password"?}` | `200` session response for the caller. On first setup it generates `session-secret` and `user-handle`. Changing an existing password over a session requires the correct `current_password` (`403` otherwise); over the management key it is not required. `400` for policy failures (password < 12 chars, empty username) |
+| `PUT /account/passkey-settings` | `{"rp_id", "origins": []}` | `200` updated account view. Lets the panel configure passkeys; the panel pre-fills from `window.location` |
+| `POST /account/passkeys/begin` | none | `200 {"ceremony_id", "options": <protocol.CredentialCreation JSON>}`. Uses resident key = required, user verification = preferred, and excludeCredentials = existing passkeys. `409` when rp-id is not set or no account exists |
+| `POST /account/passkeys/finish` | `{"ceremony_id", "name", "credential": <toJSON() output>}` | `200 {"id", "name", "created_at"}` |
+| `PATCH /account/passkeys/:id` | `{"name"}` | `200` the passkey |
+| `DELETE /account/passkeys/:id` | none | `204` |
+| `POST /account/sign-out-all` | none | `204`; rotates `session-secret` and clears the caller's cookie |
+
+These routes persist through the same path the other management config writers use: mutate the config under the handler's lock, then save with comment preservation. The existing watcher/store sync then takes over.
+
+The origin check: WebAuthn verification must accept every origin in `passkey-origins`. If that list is empty, it defaults to `https://<rp-id>`.
 
 - **Passkey library:** `github.com/go-webauthn/webauthn` (new dependency).
 - **Ceremony challenges:** kept in memory with a 5-minute TTL and are single-use. A restart in the middle of a ceremony just means pressing the button again.
@@ -114,7 +132,7 @@ Authenticated (key or session), under `/v8/management/account`:
 
 Every client on the tailnet TCP forwards reaches the proxy as localhost or the Docker gateway, so per-IP bans would lock out the admin along with an attacker. Instead:
 
-- Failed password logins add a delay to the next attempt (1s, 2s, 4s… capped at 30s).
+- Failed password logins open a wait window before the next attempt is accepted (1s, 2s, 4s… capped at 30s). Attempts inside the window get `429` with `retry_after`; the handler never sleeps.
 - The counter is global to the single account and resets on success.
 - There is no ban.
 - Passkey logins are not throttled; they cannot be guessed.
@@ -147,14 +165,17 @@ Today management routes are registered only when a `secret-key`, `MANAGEMENT_PAS
 - **Logout** calls `POST session/logout` and then clears local state.
 - **Rebase:** the user's `ui-refresh` branch in CPAMC is uncommitted and in progress. The panel work must be based on it (or wait for it to land) to avoid conflicts.
 
-## Open deployment choice (needs the user's approval before anyone touches cakebox)
+## Deployment (decided)
 
-Passkeys need the panel on HTTPS. There are two options:
+The user said to make the call. The choice is to add an HTTPS `tailscale serve` for the existing nginx panel container: `https://cakebox.wyrm-cat.ts.net:8443 -> http://127.0.0.1:8318`.
 
-1. **Open the panel at `https://cakebox.wyrm-cat.ts.net/management.html`.** This works today. That page is downloaded from `panel-github-repository`, so that setting must point at a release built from the user's CPAMC fork.
-2. **Add an HTTPS `tailscale serve` for the nginx panel container**, for example `https://cakebox.wyrm-cat.ts.net:8443 -> 127.0.0.1:8318`. Then add that origin to `passkey-origins`.
+- This keeps the user's own panel build. The proxy-served `/management.html` on 443 is the upstream release.
+- It leaves the existing HTTP `:8318` URL working for password login.
+- Cakebox config sets `passkey-rp-id: cakebox.wyrm-cat.ts.net` and `passkey-origins: ["https://cakebox.wyrm-cat.ts.net:8443"]`.
 
-Passkeys registered on either origin work on both, because the RP ID is the hostname.
+Because the RP ID is the hostname, passkeys would also work on any other HTTPS origin on that host that gets added to the list later.
+
+Panel cookie vs bearer mode: the panel uses cookie mode when its API base has the same origin as `window.location`, and bearer mode otherwise.
 
 ## Testing
 
