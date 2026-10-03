@@ -767,6 +767,10 @@ export const register: Register = on => {
     ) {
       const dismissed = await bus($, 'POST', '/dismiss', { session, ids: [target.reply_to] })
       if (dismissed.status === 200) {
+        // The proxy counts only messages delivered to this session.
+        if (Number(dismissed.json?.dismissed ?? 0) < 1) {
+          return { result: { success: false, message: "Nothing to dismiss (that message wasn't delivered to you)" } }
+        }
         return { result: { success: true, message: 'Dismissed: the sender sees no reaction, so they know you ignored it.' } }
       }
       return {

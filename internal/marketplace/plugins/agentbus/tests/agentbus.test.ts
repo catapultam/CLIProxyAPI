@@ -144,6 +144,13 @@ test('SendMessage of "ignore" to agentbus:slack#<id> dismisses it and posts noth
   expect(calls.filter(c => c.url.endsWith('/dismiss')).length).toBe(1)
 })
 
+test('"ignore" to a message that was not delivered to this session says there was nothing to dismiss', async ($, on) => {
+  wire($, on, [], undefined, PEERS, { routes: { '/dismiss': { status: 200, text: '{"dismissed":0}' } } })
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'ignore' })
+  expect(out.result).toEqual({ success: false, message: "Nothing to dismiss (that message wasn't delivered to you)" })
+})
+
 test('a subagent cannot dismiss either', async ($, on) => {
   const calls = wire($, on, [])
   await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })

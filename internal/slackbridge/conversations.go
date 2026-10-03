@@ -452,7 +452,7 @@ func (b *Bridge) noticeLinked(channel, sid, body string) {
 // noticeUnlinked tells sid that a conversation it was linked to no longer
 // is. A session that has left the bus is skipped.
 func (b *Bridge) noticeUnlinked(sid string, owner allowedUser) {
-	body := fmt.Sprintf("@%s unlinked a Slack conversation you were linked to. Messages from there no longer reach you, and answers to its guests go to your own thread.", owner.Label)
+	body := fmt.Sprintf("@%s unlinked a Slack conversation you were linked to. Messages from there no longer reach you, and answers to it are dropped.", owner.Label)
 	if _, _, err := b.bus.DeliverNotice(sid, body); err != nil && !errors.Is(err, agentbus.ErrUnknownTarget) {
 		log.Warnf("slack: unlink notice for %s not delivered: %v", b.bus.Address(sid), err)
 	}

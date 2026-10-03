@@ -198,17 +198,23 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 func (b *Bridge) deliverAddressed(ev messageEvent, target, body string, user allowedUser, notFound string) {
 	sid, ok := b.deliver(ev, target, body, user, notFound, true)
 	if ok && b.bus.SessionStatus(sid) == agentbus.StatusOffline {
-		b.replyInThread(ev, fmt.Sprintf("`%s` is offline; it gets this when it's back.", escape(b.agentLabel(sid))))
+		b.replyInThread(ev, fmt.Sprintf("`%s` is offline; it gets this when it's back.", escape(b.agentLabel(ev, sid))))
 	}
 }
 
-// agentLabel names session sid as people address it: its name, else its
-// address.
-func (b *Bridge) agentLabel(sid string) string {
+// agentLabel names session sid in a reply in ev's conversation. Where only
+// owners read (ownerOnly) it is the name people address it by: its name,
+// else its address. Anywhere else it is publicName (its name, or "an
+// agent"), so no address or machine reaches non-owners. It never falls back
+// to the session id.
+func (b *Bridge) agentLabel(ev messageEvent, sid string) string {
+	if !b.ownerOnly(ev) {
+		return b.publicName(sid)
+	}
 	o, err := b.bus.SessionOutbound(sid)
 	switch {
 	case err != nil:
-		return sid
+		return "an agent"
 	case o.Name != "":
 		return o.Name
 	}
@@ -300,7 +306,7 @@ func (b *Bridge) sendTagged(ev messageEvent, user allowedUser, text, own string)
 		return true
 	}
 	if _, delivered := b.deliver(ev, sid, body, user, sessionEnded, false); delivered && ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
-		b.replyInThread(ev, "→ sent to `"+escape(b.agentLabel(sid))+"`")
+		b.replyInThread(ev, "→ sent to `"+escape(b.agentLabel(ev, sid))+"`")
 	}
 	return true
 }
@@ -392,7 +398,7 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 	}
 	if _, delivered := b.deliver(ev, sid, text, user, sessionEnded, true); delivered && viaLast {
 		// dm_last may be stale: say which agent got it.
-		b.replyInThread(ev, "→ sent to `"+escape(b.agentLabel(sid))+"`")
+		b.replyInThread(ev, "→ sent to `"+escape(b.agentLabel(ev, sid))+"`")
 	}
 }
 
@@ -468,14 +474,16 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 // dispatchCommand delivers cmd from user to target as a command message, or
 // replies why not. The rest is as for runCommand.
 func (b *Bridge) dispatchCommand(ev messageEvent, user allowedUser, target string, cmd agentbus.Command, notFound string, adopt bool) {
-	display := target
-	if adopt {
-		display = escape(target)
-	}
 	sid, capable, errCapable := b.bus.CommandCapable(target)
-	// Name the agent as the user did, unless target is a session id.
-	if errCapable == nil && (!adopt || target == sid) {
-		display = escape(b.bus.Address(sid))
+	// The agent as people may see it here: as the owner typed it where
+	// only owners read (or by its label when target is a session id), else
+	// its public name.
+	display := ""
+	if errCapable == nil {
+		display = escape(b.agentLabel(ev, sid))
+		if adopt && target != sid && b.ownerOnly(ev) {
+			display = escape(target)
+		}
 	}
 	if errCapable == nil && !capable {
 		errCapable = agentbus.ErrCommandUnsupported

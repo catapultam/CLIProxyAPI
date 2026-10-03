@@ -14,8 +14,10 @@ import (
 )
 
 const (
-	// maxReplies caps the remembered deliveries; the oldest go first.
-	maxReplies = 1000
+	// maxReplies caps the remembered deliveries; the oldest go first. It is
+	// large enough that a guest flood (rate limited) can't push a private
+	// record out before its answer comes, which would otherwise be dropped.
+	maxReplies = 10000
 	// replyTTL matches the agentbus message TTL: a message older than this
 	// has left the bus, so an answer to it goes to the session's own thread.
 	replyTTL = 7 * 24 * time.Hour
