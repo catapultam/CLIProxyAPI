@@ -42,9 +42,8 @@ func (b *Bridge) runMaintenance(ctx context.Context) {
 
 // maintain is the bridge's periodic housekeeping: it refreshes link
 // liveness from the bus and drops the links of absent sessions and expired
-// approval requests, then drops
-// the threads, thread links and homes of sessions the bus hasn't seen for
-// sessionAbsentTTL. The bus is asked without any state lock held.
+// approval requests, then drops the threads, thread links and homes of
+// sessions the bus hasn't seen for sessionAbsentTTL. The bus is asked without any state lock held.
 func (b *Bridge) maintain() {
 	b.refreshLinks()
 	b.state.pruneApprovals()
