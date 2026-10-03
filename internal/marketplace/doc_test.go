@@ -15,6 +15,16 @@ func TestBaseURLPrefersForwardedHost(t *testing.T) {
 	}
 }
 
+func TestBaseURLPrefersPublicURLEnv(t *testing.T) {
+	t.Setenv(publicURLEnv, " https://cakebox.example.ts.net:8444/ ")
+	req := httptest.NewRequest(http.MethodGet, "/v1/messages", nil)
+	req.Host = "cakebox.example.ts.net:8317"
+	req.Header.Set("X-Forwarded-Host", "proxy.tailnet:8317")
+	if got, want := BaseURL(req), "https://cakebox.example.ts.net:8444"; got != want {
+		t.Fatalf("BaseURL = %q, want %q", got, want)
+	}
+}
+
 func TestBaseURLFallsBackToHost(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/plugins/marketplace.json", nil)
 	req.Host = "cakebox:8317"
