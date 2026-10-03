@@ -75,6 +75,8 @@ func (s *Store) handleName(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"address": s.Address(req.Session), "name": strings.TrimSpace(req.Name)})
 	case errors.Is(err, ErrNameTaken):
 		c.JSON(http.StatusConflict, gin.H{"error": "name already taken"})
+	case errors.Is(err, ErrInvalidName):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid name: use 1-64 letters, digits, '.', '_' or '-' (no spaces)"})
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	}

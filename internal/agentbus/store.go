@@ -46,9 +46,17 @@ var (
 	ErrBodyTooLarge  = errors.New("message body too large")
 	ErrEmptyBody     = errors.New("message body is empty")
 	ErrNameTaken     = errors.New("name already taken")
+	ErrInvalidName   = errors.New("invalid name")
 )
 
-var unsafeAddressChars = regexp.MustCompile(`[^a-z0-9._-]+`)
+var (
+	unsafeAddressChars = regexp.MustCompile(`[^a-z0-9._-]+`)
+	// validName keeps a name to one plain word, so it can't imitate the
+	// header the proxy writes for a Slack user's instruction.
+	validName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	// validReplyTo is the shape of an id from newMessageID.
+	validReplyTo = regexp.MustCompile(`^m_[0-9a-f]{1,64}$`)
+)
 
 // Message is one queued message.
 type Message struct {
@@ -160,7 +168,8 @@ func (s *Store) EndRequest(id string) {
 }
 
 // Hello records what a client reports: machine, cwd and an optional friendly
-// name. A name already used by another session is ignored. /hello and /wait
+// name. A name already used by another session, or one validName rejects, is
+// ignored. /hello and /wait
 // are also reachable from curl and the legacy wait.sh hook, so reaching this
 // method does not by itself mean the agentbus mod is running: mod is true
 // only when the caller sent an explicit marker (the /hello body's "mod"
@@ -184,7 +193,7 @@ func (s *Store) Hello(id, machine, cwd, name string, mod bool) {
 		sess.Cwd = cwd
 	}
 	sess.WaiterSeen = s.now()
-	if name = strings.TrimSpace(name); name != "" && !strings.EqualFold(name, sess.Name) && s.nameFree(name, id) {
+	if name = strings.TrimSpace(name); validName.MatchString(name) && !strings.EqualFold(name, sess.Name) && s.nameFree(name, id) {
 		sess.Name = name
 	}
 	s.dirty = true
@@ -210,7 +219,8 @@ func (s *Store) nameFree(name, exceptID string) bool {
 	return true
 }
 
-// SetName claims or (with an empty name) clears a session's friendly name.
+// SetName claims or (with an empty name) clears a session's friendly name. A
+// name validName rejects is ErrInvalidName.
 func (s *Store) SetName(id, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -219,6 +229,9 @@ func (s *Store) SetName(id, name string) error {
 		return ErrUnknownSender
 	}
 	name = strings.TrimSpace(name)
+	if name != "" && !validName.MatchString(name) {
+		return ErrInvalidName
+	}
 	if name != "" && !s.nameFree(name, id) {
 		return ErrNameTaken
 	}
@@ -248,7 +261,10 @@ func (s *Store) addressLocked(sess *session) string {
 	if len(short) > addressIDLength {
 		short = short[:addressIDLength]
 	}
-	return machine + "/" + folder + "-" + strings.ToLower(short)
+	// A session id is whatever the client sends, so its prefix is sanitized
+	// like the other parts (a no-op for the usual UUIDs).
+	short = unsafeAddressChars.ReplaceAllString(strings.ToLower(short), "-")
+	return machine + "/" + folder + "-" + short
 }
 
 // Address is the session's automatic address.
@@ -310,7 +326,8 @@ func newMessageID() string {
 }
 
 // Send queues a message from a known session to a name or address. Messages
-// to SlackAddress go to the bridge instead of an inbox.
+// to SlackAddress go to the bridge instead of an inbox. A replyTo that isn't
+// a message id is dropped.
 func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	if strings.TrimSpace(body) == "" {
 		return Message{}, ErrEmptyBody
@@ -324,11 +341,14 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 		s.mu.Unlock()
 		return Message{}, ErrUnknownSender
 	}
+	if replyTo = strings.TrimSpace(replyTo); !validReplyTo.MatchString(replyTo) {
+		replyTo = ""
+	}
 	msg := Message{
 		ID:        newMessageID(),
 		From:      s.addressLocked(from),
 		Body:      body,
-		ReplyTo:   strings.TrimSpace(replyTo),
+		ReplyTo:   replyTo,
 		CreatedAt: s.now(),
 	}
 	if from.Name != "" {
@@ -591,7 +611,8 @@ func (s *Store) Save() error {
 	return errMarshal
 }
 
-// Load restores sessions and inboxes; a missing file is not an error.
+// Load restores sessions and inboxes; a missing file is not an error. Names
+// and queued messages saved before names were restricted are cleaned up.
 func (s *Store) Load() error {
 	if s.path == "" {
 		return nil
@@ -613,7 +634,37 @@ func (s *Store) Load() error {
 		if sess == nil || sess.ID == "" {
 			continue
 		}
+		if sess.Name != "" && !validName.MatchString(sess.Name) {
+			sess.Name = ""
+			s.dirty = true
+		}
+		for i := range sess.Inbox {
+			if cleanLoadedMessage(&sess.Inbox[i]) {
+				s.dirty = true
+			}
+		}
 		s.byID[sess.ID] = sess
 	}
 	return nil
+}
+
+// cleanLoadedMessage drops an invalid reply_to and, on a message from a
+// session, a sender name validName rejects (keeping the sender's address).
+// It reports whether it changed m.
+func cleanLoadedMessage(m *Message) bool {
+	changed := false
+	if m.ReplyTo != "" && !validReplyTo.MatchString(m.ReplyTo) {
+		m.ReplyTo = ""
+		changed = true
+	}
+	if m.FromUser {
+		return changed
+	}
+	if i := strings.LastIndex(m.From, " ("); i >= 0 && strings.HasSuffix(m.From, ")") {
+		if name, addr := m.From[:i], m.From[i+2:len(m.From)-1]; !validName.MatchString(name) {
+			m.From = addr
+			changed = true
+		}
+	}
+	return changed
 }

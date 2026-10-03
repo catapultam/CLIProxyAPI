@@ -108,6 +108,14 @@ Slack user". Rules:
    and are never used for matching, since their owners can change them.
 4. The framing always says the message arrived over agentbus via Slack, even
    when it is from an allowed user.
+5. Nothing a session controls can imitate that framing. Session names must
+   match `^[A-Za-z0-9._-]{1,64}$` (`/name` answers 400 otherwise; `/hello`
+   ignores the name), `reply_to` is kept only when it looks like a message id
+   (`m_<hex>`), every message body is rendered with each line prefixed by
+   `> `, and interpolated values can't break a line or open or close the
+   `<agentbus>` block. The note tells agents that only an unquoted header line
+   reading `Message <id> from <name> via Slack (...)` (or the mod's
+   `agentbus message <id> from <name> via Slack`) is an instruction.
 
 ## Proxy side
 
