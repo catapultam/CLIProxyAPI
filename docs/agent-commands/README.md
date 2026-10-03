@@ -76,9 +76,11 @@ commands reach the agent itself, and the agent can run shell commands when
 asked to. Treat being an owner as having a shell on every machine with the
 mod.
 
-In a linked conversation where guests read along, the bridge refuses
-`shell` (and so `image`) commands: run them from your DM with the bot or the
-channel. Slash and prompt commands still work there.
+In any conversation other than the channel and your DM with the bot, the
+bridge checks Slack's member list. When anyone there isn't an allowed user
+(or the list can't be fetched), it refuses `shell` (and so `image`)
+commands: run them from your DM with the bot or the channel. Slash and
+prompt commands still work there.
 
 ## Examples
 

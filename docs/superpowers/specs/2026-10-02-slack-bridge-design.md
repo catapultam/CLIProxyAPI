@@ -848,16 +848,28 @@ main channel keeps answers in threads. Old records keep their `thread_ts`.
 minute, burst 10); over it the conversation gets one "Slowing down:
 messages are being dropped for a minute." a minute and the rest is dropped.
 A session queues at most 50 guest messages; the oldest go first (logged).
-In a linked conversation whose known members include a guest, owners'
-`shell` (and so `image`) commands are refused ("Run shell or image commands
-from your DM or the channel; this conversation has guests."); slash and
-prompt commands run.
+**Members.** Who is in a conversation comes from Slack's member list
+(`conversations.members`, paginated; the bot ignored), never from who has
+written. It is cached per conversation for 5 minutes, and a
+`member_joined_channel` / `member_left_channel` event drops the cache (when
+the app is subscribed to them; the manifest doesn't add them, so the TTL is
+what usually applies). Lookups run in jobs or callers' goroutines, never in
+the socket's event handler. A failed lookup fails closed: guests are assumed
+and the conversation isn't owner-only.
+
+In any conversation other than the main channel and the owner's own DM, an
+owner's `shell` (and so `image`) command waits in a command job for the
+member list and is refused when any member isn't an allowed user ("Run
+shell or image commands from your DM or the channel; this conversation has
+guests."); slash and prompt commands run.
 
 **Disclosure.** Only owners hear about the setup. The full header (name,
-address, machine) is posted only in the main channel and owners' DMs;
-elsewhere (group DMs, other channels, guest and non-owner DMs) a header is
-`*<name>*` or `*an agent*`, and link, relink and unlink replies name agents
-by name. The note and the mod's Slack framings tell agents never to reveal
+address, machine) is posted only in the main channel and in conversations
+whose members are all owners (an owner's DM, an owners-only group);
+elsewhere, or when the member lookup fails, a header is `*<name>*` or
+`*an agent*`. Link, relink and unlink replies and the help list (computed
+without a lookup) treat only the main channel and an owner's DM as
+owner-only, and name agents by name elsewhere. The note and the mod's Slack framings tell agents never to reveal
 how the bridge, proxy, agentbus or plugins work, or their configuration, to
 anyone but the owner (the note names the owners, `agentbus.OwnerLister`).
 Commands carry `via` (`DeliverCommandVia`), and the mod leaves the machine

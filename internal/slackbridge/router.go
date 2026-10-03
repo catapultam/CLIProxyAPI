@@ -77,6 +77,12 @@ func isDM(ev messageEvent) bool {
 // Only allowed users get through, except in a conversation linked to an
 // agent, where anyone else is a guest (see routeGuest).
 func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
+	if ev.Type == "member_joined_channel" || ev.Type == "member_left_channel" {
+		// Someone joined or left: the next guest check looks the members up
+		// again (when the app is subscribed to these; else the cache TTL).
+		b.forgetMembers(ev.Channel)
+		return
+	}
 	dm := isDM(ev)
 	if ev.Type != "message" || !relayedSubtypes[ev.Subtype] || ev.BotID != "" ||
 		ev.Channel == "" || ev.User == "" || ev.User == b.botUserID {
@@ -440,12 +446,28 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		}
 		cmd = entry.spec.command(rest)
 	}
-	if cmd.Kind == agentbus.CommandShell && b.guestsRead(ev) {
-		// Shell output (text or an image) would be posted where guests read.
-		log.Infof("slack: refused !%s from %s in %s: the conversation has guests", name, user.ID, ev.Channel)
-		b.replyCommand(ev, shellWhereGuests)
+	if cmd.Kind == agentbus.CommandShell && !isDM(ev) && ev.Channel != b.channelID {
+		// Shell output (text or an image) is posted where the command was
+		// given. Whether guests read there comes from Slack's member list,
+		// which is a network call: it runs as a command job, never in the
+		// socket's event handler. An owner's command only ever comes from
+		// their own DM, so DMs need no lookup.
+		b.enqueueCommand(func(ctx context.Context) error {
+			if b.hasGuests(ctx, ev.Channel) {
+				log.Infof("slack: refused !%s from %s in %s: the conversation has guests (or its members are unknown)", name, user.ID, ev.Channel)
+				return b.replyNow(ctx, ev, shellWhereGuests)
+			}
+			b.dispatchCommand(ev, user, target, cmd, notFound, adopt)
+			return nil
+		})
 		return
 	}
+	b.dispatchCommand(ev, user, target, cmd, notFound, adopt)
+}
+
+// dispatchCommand delivers cmd from user to target as a command message, or
+// replies why not. The rest is as for runCommand.
+func (b *Bridge) dispatchCommand(ev messageEvent, user allowedUser, target string, cmd agentbus.Command, notFound string, adopt bool) {
 	display := target
 	if adopt {
 		display = escape(target)

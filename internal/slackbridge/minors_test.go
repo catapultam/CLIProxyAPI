@@ -14,15 +14,17 @@ import (
 func TestShellCommandsRefusedWhereGuestsRead(t *testing.T) {
 	b, f, bus, dir := newCommandBridge(t)
 	writeCommand(t, dir, "screenshot.yaml", shellYAML, mtime0)
+	// Slack says only the owner (and the bot) are there.
+	f.setMembers("GMPIM1", "UALEX", "UBOT")
 	linkGroup(t, b, bus, sidA, "flyer", "Gs1")
-	// No guest has written yet: only the owner is known to be there.
 	b.handleEvent("EvGs2", foreignMsg("UALEX", "!screenshot", "1700009700.000002", ""))
+	drainJobs(t, b)
 	if m := claimOne(t, bus, sidA); m.Command == nil || m.Command.Kind != "shell" {
 		t.Fatalf("owner-only shell = %+v", m)
 	}
-	b.handleEvent("EvGs3", foreignMsg("UBOB", "hi all", "1700009700.000003", ""))
-	drainJobs(t, b)
-	_ = claimOne(t, bus, sidA)
+	// Bob joins (the event drops the cached list).
+	f.setMembers("GMPIM1", "UALEX", "UBOB", "UBOT")
+	b.handleEvent("EvGs3", messageEvent{Type: "member_joined_channel", Channel: "GMPIM1", User: "UBOB"})
 	b.handleEvent("EvGs4", foreignMsg("UALEX", "!screenshot", "1700009700.000004", ""))
 	drainJobs(t, b)
 	if bus.Pending(sidA) {

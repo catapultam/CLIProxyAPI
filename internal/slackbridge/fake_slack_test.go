@@ -55,9 +55,24 @@ type fakeSlack struct {
 	// would: adding one twice is already_reacted, removing an absent one
 	// no_reaction.
 	reactions map[reactionKey]bool
+	// members answers conversations.members per channel; a DM ("D" + user)
+	// without an entry has that user and the bot, anything else without one
+	// is channel_not_found. memberPage > 0 pages the answer.
+	members    map[string][]string
+	memberPage int
 }
 
 type reactionKey struct{ channel, ts, name string }
+
+// setMembers sets the member list conversations.members gives for channel.
+func (f *fakeSlack) setMembers(channel string, ids ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.members == nil {
+		f.members = map[string][]string{}
+	}
+	f.members[channel] = ids
+}
 
 // reactionsOn lists the bot's reactions now on message ts in channel, sorted.
 func (f *fakeSlack) reactionsOn(channel, ts string) []string {
@@ -316,6 +331,25 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeJSON(w, map[string]any{"ok": true, "channel": map[string]any{"id": "D" + users}})
 		}
+	case "conversations.members":
+		channel := r.PostForm.Get("channel")
+		f.mu.Lock()
+		ids, known := f.members[channel]
+		page := f.memberPage
+		f.mu.Unlock()
+		if !known && strings.HasPrefix(channel, "D") {
+			ids, known = []string{strings.TrimPrefix(channel, "D"), "UBOT"}, true
+		}
+		if !known {
+			writeJSON(w, map[string]any{"ok": false, "error": "channel_not_found"})
+			return
+		}
+		start, _ := strconv.Atoi(r.PostForm.Get("cursor"))
+		end, next := len(ids), ""
+		if page > 0 && start+page < len(ids) {
+			end, next = start+page, strconv.Itoa(start+page)
+		}
+		writeJSON(w, map[string]any{"ok": true, "members": ids[min(start, len(ids)):end], "response_metadata": map[string]any{"next_cursor": next}})
 	case "chat.getPermalink":
 		ch, ts := r.PostForm.Get("channel"), r.PostForm.Get("message_ts")
 		writeJSON(w, map[string]any{"ok": true, "channel": ch, "permalink": "https://example.slack.com/archives/" + ch + "/p" + strings.ReplaceAll(ts, ".", "")})
