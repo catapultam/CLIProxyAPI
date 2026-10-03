@@ -195,3 +195,42 @@ func (b *Bridge) resolve(ctx context.Context) error {
 	b.state.seed(users)
 	return nil
 }
+
+// Start resolves the bot, channel and users in the background (retrying with
+// backoff), then attaches to the bus and keeps the socket open until Stop.
+func (b *Bridge) Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	b.cancel = cancel
+	b.done = make(chan struct{})
+	go func() {
+		defer close(b.done)
+		for attempt := 1; ; attempt++ {
+			err := b.resolve(ctx)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			log.Warnf("slack: bridge not ready: %v", err)
+			if !b.sleep(ctx, b.backoff(attempt)) {
+				return
+			}
+		}
+		b.bus.SetBridge(b)
+		log.Infof("slack: bridge on, channel %s, allowed users %s", b.cfg.Channel, strings.Join(b.Users(), ", "))
+		go b.runJobs(ctx)
+		b.runSocket(ctx)
+	}()
+}
+
+// Stop detaches from the bus and closes the connection.
+func (b *Bridge) Stop() {
+	if b.cancel == nil {
+		return
+	}
+	b.bus.SetBridge(nil)
+	b.cancel()
+	<-b.done
+	b.cancel = nil
+}
