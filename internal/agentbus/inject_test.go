@@ -285,6 +285,28 @@ func TestInjectSlackLineWhenBridgeAttached(t *testing.T) {
 	}
 }
 
+func TestInjectSlackLineHasImageCommand(t *testing.T) {
+	for _, mod := range []bool{true, false} {
+		clock := &fakeClock{now: t0}
+		s, r, got := newInjectServer(t, clock)
+		s.Hello(sidA, "pc", "/a", "", mod)
+		s.SetBridge(&fakeBridge{users: []string{"alex"}})
+		post(r, sidA, "", stringContentBody)
+		var line string
+		for _, l := range strings.Split(strings.Join(lastUserTexts(got.body), "\n"), "\n") {
+			if strings.Contains(l, "/v1/agentbus/slack/upload") {
+				line = l
+			}
+		}
+		if line == "" || !strings.Contains(line, "-F session="+sidA+" ") || !strings.Contains(line, "-F file=@<path>") || !strings.Contains(line, "$ANTHROPIC_AUTH_TOKEN") {
+			t.Fatalf("mod=%v image line = %q\n%s", mod, line, got.body)
+		}
+		if strings.Contains(strings.ToLower(line), "set up") {
+			t.Fatalf("image line says set up: %q", line)
+		}
+	}
+}
+
 func TestInjectNoSlackLineWithoutBridge(t *testing.T) {
 	clock := &fakeClock{now: t0}
 	s, r, got := newInjectServer(t, clock)

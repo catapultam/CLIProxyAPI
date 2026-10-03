@@ -37,6 +37,11 @@ func (c Config) complete() bool {
 
 type job func(ctx context.Context) error
 
+var (
+	_ agentbus.Bridge      = (*Bridge)(nil)
+	_ agentbus.ImagePoster = (*Bridge)(nil)
+)
+
 // Bridge links the agentbus to one Slack channel. It implements
 // agentbus.Bridge.
 type Bridge struct {
@@ -112,16 +117,75 @@ func (b *Bridge) Post(o agentbus.Outbound) {
 
 func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
 	text := withMentions(o.Body, b.state.mentionIDs())
-	if ts, ok := b.state.thread(o.SessionID); ok {
-		_, err := b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, text, ts)
+	ts, opened, err := b.threadFor(ctx, o, text)
+	if err != nil || opened {
 		return err
 	}
-	ts, err := b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, sessionHeader(o)+"\n"+text, "")
+	_, err = b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, text, ts)
+	return err
+}
+
+// threadFor picks the thread a session's post goes to: its own thread when it
+// has one. Otherwise it opens one by posting the session header, followed by
+// text when text isn't empty, at the top level; opened reports that, so the
+// caller doesn't post text again. Text and image posts both choose their
+// thread here.
+func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string) (ts string, opened bool, err error) {
+	if ts, ok := b.state.thread(o.SessionID); ok {
+		return ts, false, nil
+	}
+	first := sessionHeader(o)
+	if text != "" {
+		first += "\n" + text
+	}
+	ts, err = b.api.postMessage(ctx, b.cfg.BotToken, b.channelID, first, "")
+	if err != nil {
+		return "", false, err
+	}
+	b.state.setThread(o.SessionID, ts)
+	return ts, true, nil
+}
+
+// PostImage uploads an image into the session's own thread, opening the
+// thread first (header plus caption) when the session has none. It
+// implements agentbus.ImagePoster and runs in the caller's goroutine, not on
+// the job queue, so the caller gets Slack's answer. The returned error is
+// only a short code (Slack's error code, or request_failed); the details are
+// logged without the upload URL or any token.
+func (b *Bridge) PostImage(ctx context.Context, o agentbus.Outbound, filename string, data []byte) error {
+	errPost := b.postImage(ctx, o, sanitizeFilename(filename), data)
+	if errPost == nil {
+		return nil
+	}
+	log.Warnf("slack: image from %s: %v", o.Address, errPost)
+	var apiErr *apiError
+	if errors.As(errPost, &apiErr) && apiErr.code != "" {
+		return errors.New(apiErr.code)
+	}
+	return errors.New("request_failed")
+}
+
+func (b *Bridge) postImage(ctx context.Context, o agentbus.Outbound, filename string, data []byte) error {
+	caption := ""
+	if strings.TrimSpace(o.Body) != "" {
+		caption = withMentions(o.Body, b.state.mentionIDs())
+	}
+	ts, opened, err := b.threadFor(ctx, o, caption)
 	if err != nil {
 		return err
 	}
-	b.state.setThread(o.SessionID, ts)
-	return nil
+	if opened {
+		// The caption went out with the header that opened the thread.
+		caption = ""
+	}
+	uploadURL, fileID, err := b.api.getUploadURL(ctx, b.cfg.BotToken, filename, len(data))
+	if err != nil {
+		return err
+	}
+	if err = b.api.uploadFile(ctx, uploadURL, data); err != nil {
+		return err
+	}
+	return b.api.completeUpload(ctx, b.cfg.BotToken, fileID, filename, b.channelID, ts, caption)
 }
 
 // enqueue adds a job, dropping the oldest queued job when the queue is full.

@@ -609,6 +609,15 @@ func TestPluginMarketplaceRequestsAreNotLogged(t *testing.T) {
 	}
 }
 
+func TestAgentbusImageUploadsAreNotLogged(t *testing.T) {
+	if shouldLogRequest("/v1/agentbus/slack/upload") {
+		t.Error("image upload request would be logged")
+	}
+	if !shouldLogRequest("/v1/agentbus/send") {
+		t.Error("agentbus send request would not be logged")
+	}
+}
+
 type spyRequestLogger struct {
 	lastLogRequestID       string
 	lastStreamingRequestID string

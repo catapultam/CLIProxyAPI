@@ -1,6 +1,9 @@
 package agentbus
 
-import "strings"
+import (
+	"context"
+	"strings"
+)
 
 // SlackAddress is the reserved bus address of the Slack bridge.
 const SlackAddress = "slack"
@@ -26,6 +29,15 @@ type Bridge interface {
 	Users() []string
 }
 
+// ImagePoster is implemented by bridges that can post images.
+type ImagePoster interface {
+	// PostImage posts data into the session's own thread, with o.Body as the
+	// caption, and returns once Slack has answered. Store calls it without
+	// holding its lock. An error's text must be safe to show the agent: no
+	// tokens or upload URLs.
+	PostImage(ctx context.Context, o Outbound, filename string, data []byte) error
+}
+
 // SetBridge attaches the Slack bridge, or detaches it when b is nil.
 func (s *Store) SetBridge(b Bridge) {
 	s.mu.Lock()
@@ -38,6 +50,32 @@ func (s *Store) currentBridge() Bridge {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.bridge
+}
+
+// outboundLocked is what the bridge needs to post body for the session id.
+// The caller holds s.mu.
+func (s *Store) outboundLocked(id string, sess *session, body string) Outbound {
+	return Outbound{
+		SessionID: id,
+		Address:   s.addressLocked(sess),
+		Name:      sess.Name,
+		Machine:   sess.Machine,
+		Cwd:       sess.Cwd,
+		Body:      body,
+	}
+}
+
+// outboundFor builds the Outbound for a known session, or returns
+// ErrUnknownSender. The caller hands it to the bridge after this returns, so
+// never under the lock.
+func (s *Store) outboundFor(sessionID, body string) (Outbound, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[sessionID]
+	if !ok {
+		return Outbound{}, ErrUnknownSender
+	}
+	return s.outboundLocked(sessionID, sess, body), nil
 }
 
 func isSlackAddress(target string) bool {

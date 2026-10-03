@@ -358,14 +358,7 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 		msg.From = from.Name + " (" + msg.From + ")"
 	}
 	if b := s.bridge; b != nil && isSlackAddress(to) {
-		out := Outbound{
-			SessionID: fromID,
-			Address:   s.addressLocked(from),
-			Name:      from.Name,
-			Machine:   from.Machine,
-			Cwd:       from.Cwd,
-			Body:      body,
-		}
+		out := s.outboundLocked(fromID, from, body)
 		s.mu.Unlock()
 		b.Post(out)
 		msg.To = SlackAddress

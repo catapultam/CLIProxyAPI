@@ -24,6 +24,7 @@ func (s *Store) Register(group *gin.RouterGroup) {
 	group.POST("/hello", s.handleHello)
 	group.GET("/wait", s.handleWait)
 	group.POST("/bye", s.handleBye)
+	group.POST("/slack/upload", s.handleSlackUpload)
 }
 
 func (s *Store) handlePeers(c *gin.Context) {

@@ -2,6 +2,7 @@ package slackbridge
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -40,7 +41,23 @@ type fakeSlack struct {
 	fail     map[string]string // method -> Slack error code
 	toClient chan string
 	acks     chan string
+	nextFile int
+	uploads  []fakeUpload
+	// uploadMode makes /upload/<id> answer with an HTTP status ("" is 200)
+	// or, with "hangup", close the connection without answering.
+	uploadMode string
 }
+
+// fakeUpload is one raw POST to a pre-signed upload URL.
+type fakeUpload struct {
+	FileID string
+	Body   []byte
+	Auth   string
+}
+
+// uploadSecret stands in for the signature on a pre-signed upload URL; it
+// must never show up in an error or log.
+const uploadSecret = "presigned-sig-0123"
 
 func newFakeSlack(t *testing.T) *fakeSlack {
 	t.Helper()
@@ -55,6 +72,7 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/", f.handleAPI)
 	mux.HandleFunc("/socket", f.handleSocket)
+	mux.HandleFunc("/upload/", f.handleUpload)
 	f.srv = httptest.NewServer(mux)
 	f.URL = f.srv.URL
 	t.Cleanup(f.srv.Close)
@@ -73,6 +91,61 @@ func (f *fakeSlack) callsTo(method string) []fakeCall {
 		}
 	}
 	return out
+}
+
+// methods lists every Web API method called, in order.
+func (f *fakeSlack) methods() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.calls))
+	for _, c := range f.calls {
+		out = append(out, c.Method)
+	}
+	return out
+}
+
+func (f *fakeSlack) recordedUploads() []fakeUpload {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeUpload(nil), f.uploads...)
+}
+
+func (f *fakeSlack) setUploadMode(mode string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.uploadMode = mode
+}
+
+// handleUpload records the bytes posted to a pre-signed upload URL.
+func (f *fakeSlack) handleUpload(w http.ResponseWriter, r *http.Request) {
+	data, errRead := io.ReadAll(r.Body)
+	if errRead != nil {
+		http.Error(w, "read", http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	mode := f.uploadMode
+	if r.URL.Query().Get("sig") == uploadSecret {
+		f.uploads = append(f.uploads, fakeUpload{FileID: strings.TrimPrefix(r.URL.Path, "/upload/"), Body: data, Auth: r.Header.Get("Authorization")})
+	}
+	f.mu.Unlock()
+	switch mode {
+	case "":
+		_, _ = w.Write([]byte("OK - " + strconv.Itoa(len(data))))
+	case "hangup":
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "no hijack", http.StatusInternalServerError)
+			return
+		}
+		conn, _, errHijack := hj.Hijack()
+		if errHijack == nil {
+			_ = conn.Close()
+		}
+	default:
+		status, _ := strconv.Atoi(mode)
+		http.Error(w, "upload refused", status)
+	}
 }
 
 func (f *fakeSlack) opens() int {
@@ -137,6 +210,14 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "ts": ts, "channel": r.PostForm.Get("channel")})
 	case "reactions.add":
 		writeJSON(w, map[string]any{"ok": true})
+	case "files.getUploadURLExternal":
+		f.mu.Lock()
+		f.nextFile++
+		id := "F" + strconv.Itoa(1000+f.nextFile)
+		f.mu.Unlock()
+		writeJSON(w, map[string]any{"ok": true, "upload_url": f.URL + "/upload/" + id + "?sig=" + uploadSecret, "file_id": id})
+	case "files.completeUploadExternal":
+		writeJSON(w, map[string]any{"ok": true, "files": []map[string]any{{"id": "F", "title": "t"}}})
 	case "apps.connections.open":
 		f.mu.Lock()
 		f.opened++

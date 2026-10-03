@@ -8,11 +8,12 @@ import (
 )
 
 var (
-	slackMention = regexp.MustCompile(`<@([UW][A-Z0-9]+)(?:\|[^>]*)?>`)
-	slackLink    = regexp.MustCompile(`<((?:https?|mailto):[^|>]+)(?:\|[^>]*)?>`)
-	labelMention = regexp.MustCompile(`(?i)(^|[\s(\[{"'])@([a-z0-9][a-z0-9._-]*)`)
-	addressed    = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]*):[ \t]*(\S[\s\S]*)$`)
-	labelUnsafe  = regexp.MustCompile(`[^a-z0-9._-]+`)
+	slackMention   = regexp.MustCompile(`<@([UW][A-Z0-9]+)(?:\|[^>]*)?>`)
+	slackLink      = regexp.MustCompile(`<((?:https?|mailto):[^|>]+)(?:\|[^>]*)?>`)
+	labelMention   = regexp.MustCompile(`(?i)(^|[\s(\[{"'])@([a-z0-9][a-z0-9._-]*)`)
+	addressed      = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._/-]*):[ \t]*(\S[\s\S]*)$`)
+	labelUnsafe    = regexp.MustCompile(`[^a-z0-9._-]+`)
+	filenameUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
 	slackEscaper   = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 	slackUnescaper = strings.NewReplacer("&lt;", "<", "&gt;", ">", "&amp;", "&")
@@ -87,6 +88,23 @@ func sanitizeLabel(s string) string {
 		return "user"
 	}
 	return label
+}
+
+// maxFilenameLen caps a filename sent to Slack.
+const maxFilenameLen = 100
+
+// sanitizeFilename keeps a filename to [A-Za-z0-9._-]: other runs become "_",
+// leading and trailing "._-" go, a long name keeps its end (the extension),
+// and an empty result is "image".
+func sanitizeFilename(name string) string {
+	name = strings.Trim(filenameUnsafe.ReplaceAllString(name, "_"), "._-")
+	if len(name) > maxFilenameLen {
+		name = strings.TrimLeft(name[len(name)-maxFilenameLen:], "._-")
+	}
+	if name == "" {
+		return "image"
+	}
+	return name
 }
 
 func emailLabel(email string) string {

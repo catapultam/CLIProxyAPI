@@ -66,6 +66,7 @@ oauth_config:
   scopes:
     bot:
       - chat:write
+      - files:write
       - channels:history
       - groups:history
       - reactions:write
@@ -179,6 +180,22 @@ works unchanged without Slack:
 Wiring: `internal/api/server_agentbus.go` builds the bridge when the config is
 complete, attaches it to the store, starts it, and stops and saves it on
 shutdown.
+
+**Images.** A session posts an image with `POST /v1/agentbus/slack/upload`
+(multipart: `session`, optional `caption`, `file`; same client API key as the
+other agentbus routes). The proxy streams the body into memory, never to disk:
+the file is capped at 10 MiB (413), its bytes are sniffed and only PNG, JPEG,
+GIF and WebP are accepted (415), and an unknown session is a 400. The client
+never picks a channel or thread: the image goes into the sending session's own
+thread, and a session without one first gets its header (plus the caption)
+posted to open it. The bridge uses Slack's external upload flow
+(`files.getUploadURLExternal`, a raw POST of the bytes to the pre-signed URL
+without the bot token, then `files.completeUploadExternal` with the thread and
+the escaped caption), synchronously, so the agent gets 200 `{"ok":true}` or
+502 with Slack's error code. The upload URL, tokens and image bytes are never
+logged, and the request log skips this route. This needs the `files:write`
+scope; an app installed before it was added must be reinstalled to grant it.
+The injected note's Slack lines include the curl command for it.
 
 ## Client side (agentbus mod)
 

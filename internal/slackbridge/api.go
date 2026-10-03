@@ -3,7 +3,9 @@
 package slackbridge
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,13 +35,23 @@ func (e *apiError) Error() string { return "slack " + e.method + ": " + e.code }
 type api struct {
 	base string
 	hc   *http.Client
+	// upload sends raw bytes to pre-signed upload URLs. It doesn't follow
+	// redirects, so a redirect's Location can't leak into an error.
+	upload *http.Client
 }
 
 func newAPI(base string) *api {
 	if base == "" {
 		base = defaultAPIBase
 	}
-	return &api{base: base, hc: &http.Client{Timeout: apiCallTimeout}}
+	return &api{
+		base: base,
+		hc:   &http.Client{Timeout: apiCallTimeout},
+		upload: &http.Client{
+			Timeout:       apiCallTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
 }
 
 // call POSTs form params to a Web API method. A 429 is retried once after
@@ -162,6 +174,66 @@ func (a *api) addReaction(ctx context.Context, token, channel, ts, name string) 
 	if errors.As(err, &apiErr) && apiErr.code == "already_reacted" {
 		return nil
 	}
+	return err
+}
+
+// getUploadURL starts an external file upload (files.upload is deprecated)
+// and returns the pre-signed URL to POST the bytes to, and the file id.
+func (a *api) getUploadURL(ctx context.Context, token, filename string, length int) (string, string, error) {
+	const method = "files.getUploadURLExternal"
+	body, err := a.call(ctx, token, method, url.Values{"filename": {filename}, "length": {strconv.Itoa(length)}})
+	if err != nil {
+		return "", "", err
+	}
+	uploadURL, fileID := body.Get("upload_url").String(), body.Get("file_id").String()
+	if parsed, errParse := url.Parse(uploadURL); errParse != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || fileID == "" {
+		return "", "", &apiError{method: method, code: "invalid_response"}
+	}
+	return uploadURL, fileID, nil
+}
+
+// uploadFile POSTs the raw bytes to a pre-signed upload URL. The URL is the
+// credential here, so the request carries no bot token, and neither the URL
+// nor the bytes ever go into an error or a log. Like the Web API calls, it is
+// bounded by apiCallTimeout (control-plane traffic, see the AGENTS.md
+// exception), through a.upload.
+func (a *api) uploadFile(ctx context.Context, uploadURL string, data []byte) error {
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, bytes.NewReader(data))
+	if errReq != nil {
+		return errors.New("slack file upload: invalid upload URL")
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, errDo := a.upload.Do(req)
+	if errDo != nil {
+		// *url.Error quotes the URL; keep only what went wrong.
+		var urlErr *url.Error
+		if errors.As(errDo, &urlErr) {
+			errDo = urlErr.Err
+		}
+		return fmt.Errorf("slack file upload: %w", errDo)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxAPIBody))
+	if errClose := resp.Body.Close(); errClose != nil {
+		log.Debugf("slack file upload: close body: %v", errClose)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("slack file upload: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// completeUpload shares an uploaded file into a channel thread, with an
+// optional comment posted alongside it.
+func (a *api) completeUpload(ctx context.Context, token, fileID, title, channel, threadTS, comment string) error {
+	files, errJSON := json.Marshal([]map[string]string{{"id": fileID, "title": title}})
+	if errJSON != nil {
+		return fmt.Errorf("slack files.completeUploadExternal: %w", errJSON)
+	}
+	params := url.Values{"files": {string(files)}, "channel_id": {channel}, "thread_ts": {threadTS}}
+	if comment != "" {
+		params.Set("initial_comment", comment)
+	}
+	_, err := a.call(ctx, token, "files.completeUploadExternal", params)
 	return err
 }
 
