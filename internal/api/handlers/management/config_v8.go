@@ -136,10 +136,6 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
 	}
-	if err = config.SanitizeModelRewriteNode(root); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
-		return
-	}
 	if !yamlRequest && c.Request.Method != http.MethodDelete {
 		preserveV8TURNSecrets(root, before)
 	}

@@ -379,18 +379,6 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
-
-	// ModelRewrite rewrites requested model names before provider resolution.
-	// Rules are evaluated in order in a single pass; the first match wins and
-	// its target is never matched again (no chaining).
-	ModelRewrite []ModelRewriteRule `yaml:"model-rewrite,omitempty" json:"model-rewrite,omitempty"`
-}
-
-// ModelRewriteRule rewrites every requested base model name that matches Match to To.
-// Match is a case-insensitive glob where "*" matches any run of characters, including "/".
-type ModelRewriteRule struct {
-	Match string `yaml:"match" json:"match"`
-	To    string `yaml:"to" json:"to"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

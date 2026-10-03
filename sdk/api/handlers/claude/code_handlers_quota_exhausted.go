@@ -27,8 +27,6 @@ func (h *ClaudeCodeAPIHandler) rewriteQuotaExhaustedError(modelName string, errM
 	if errMsg == nil || h.AuthManager == nil || !isNoClaudeAuthAvailableError(errMsg) {
 		return errMsg
 	}
-	// Execution ran on the rewritten model, so its quota state is the one to report.
-	modelName = h.RewriteModelName(modelName)
 	now := time.Now()
 	summary := h.AuthManager.SummarizeModelQuotaUnavailability(h.HandlerType(), modelName, now)
 	if !summary.Applicable || !summary.AllQuotaCooldown || summary.EarliestReset.IsZero() {

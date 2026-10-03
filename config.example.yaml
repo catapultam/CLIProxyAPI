@@ -158,16 +158,6 @@ routing:
   # Ignored when routing.session-affinity is false.
   session-affinity-subagents: true
 
-  # Rewrite requested model names before provider resolution. "match" is a case-insensitive glob
-  # where "*" matches any characters (including "/"); the thinking suffix, e.g. "(8192)", is kept.
-  # Rules apply once per request, first match wins, and are not chained: a target is never
-  # matched again. oauth.excluded-models is checked against the rewritten model, not the requested one.
-  # model-rewrite:
-  #   - match: "*sonnet*"
-  #     to: "claude-sonnet-5-5"
-  #   - match: "*opus*"
-  #     to: "claude-opus-5-5"
-
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false
 

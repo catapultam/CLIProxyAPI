@@ -94,9 +94,7 @@ func (h *BaseAPIHandler) PrepareStreamModelRoute(ctx context.Context, handlerTyp
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Routers see the rewritten model, as on the regular execution path. The rewrite
-	// itself is applied (and marked) later, when the stream executes.
-	decision := h.applyModelRouter(ctx, handlerType, h.RewriteModelName(modelName), rawJSON, true, modelExecutionOptions{})
+	decision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, true, modelExecutionOptions{})
 	ctx = context.WithValue(ctx, preparedModelRouteContextKey{}, decision)
 	hasOverride := strings.TrimSpace(decision.ExecutorPluginID) != "" || strings.TrimSpace(decision.Provider) != ""
 	return ctx, hasOverride

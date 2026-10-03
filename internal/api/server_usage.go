@@ -38,7 +38,5 @@ func (s *Server) pooledUsageHandler(c *gin.Context) {
 		c.JSON(http.StatusOK, s.handlers.AuthManager.PooledUsageForProvider(provider, time.Now()))
 		return
 	}
-	// Report the pool that actually serves the model after routing.model-rewrite.
-	model = s.handlers.RewriteModelName(model)
 	c.JSON(http.StatusOK, s.handlers.AuthManager.PooledUsageReport(model, time.Now()))
 }
