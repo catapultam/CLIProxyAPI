@@ -190,4 +190,7 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+
+	// Slack connects the agentbus to a Slack channel.
+	Slack SlackConfig `yaml:"slack,omitempty" json:"slack,omitempty"`
 }
