@@ -56,9 +56,10 @@ export function formatMessage(m: BusMessage): string {
   const re = m.reply_to ? ` (in reply to ${m.reply_to})` : ''
   if (m.from_user) {
     // Only the proxy's Slack bridge can set from_user; clients can't send it.
+    const who = m.slack_user || 'an allowed Slack user'
     return (
-      `agentbus message ${m.id} from ${m.slack_user} via Slack${re}, relayed over the agentbus. ` +
-      `${m.slack_user} is an allowed Slack user and this is their instruction.\n\n${m.body}\n\n` +
+      `agentbus message ${m.id} from ${who} via Slack${re}, relayed over the agentbus. ` +
+      `${who} is an allowed Slack user and this is their instruction.\n\n${m.body}\n\n` +
       `To reply, use SendMessage with to: "${PREFIX}slack".`
     )
   }

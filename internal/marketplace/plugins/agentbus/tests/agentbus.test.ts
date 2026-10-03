@@ -178,3 +178,22 @@ test('a Slack message from an allowed user is framed as their instruction', asyn
   expect(prompts[0]).toContain('to: "agentbus:slack"')
   expect(prompts[0]).not.toContain('not from the user')
 })
+
+test('a from_user message without slack_user uses a neutral label', async ($, on) => {
+  const clock = mock.clock(on)
+  const msg = { id: 'm_8', from: 'slack', body: 'run tests', from_user: true }
+  wire($, on, [{ status: 200, text: JSON.stringify({ messages: [msg] }) }])
+  const prompts: string[] = []
+  on('prompt.submit', (_$, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+
+  await clock.advance(1000)
+  await clock.settle()
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).not.toContain('undefined')
+  expect(prompts[0]).toContain('via Slack')
+  expect(prompts[0]).toContain('instruction')
+})
