@@ -439,6 +439,9 @@ func (b *Bridge) clanker(p slashPayload) string {
 	if !tagged {
 		return clankerUsage + "\n" + b.help(ev)
 	}
+	if strings.EqualFold(target, agentbus.BroadcastName) {
+		return b.clankerBroadcast(ev, user, body)
+	}
 	sid, found := b.bus.Resolve(target)
 	if !found {
 		return b.notFoundReply(ev, target)

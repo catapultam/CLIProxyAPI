@@ -69,6 +69,10 @@ type replyRecord struct {
 	// Command is the name of the command the message carried, so the
 	// agent's report on it can be logged; empty for any other message.
 	Command string `json:"command,omitempty"`
+	// Group ties the records of one owner broadcast ("all: …") together:
+	// its Slack message (TS) shows one receipt for all of them (see
+	// groupReceipt), and Shown is kept the same on each.
+	Group string `json:"group,omitempty"`
 }
 
 // convLink ties a whole Slack conversation other than the main channel (a
@@ -270,7 +274,7 @@ func loadState(path string) (*state, error) {
 	// A record of a top-level DM has no thread, but always a channel.
 	for _, r := range file.Replies {
 		if r.ID != "" && r.Session != "" && (r.ThreadTS != "" || r.Channel != "") {
-			if r.Shown == "" && r.Receipt != receiptDismissed {
+			if r.Shown == "" && r.Receipt != receiptDismissed && r.Group == "" {
 				// Saved before Shown: the receipt was applied.
 				r.Shown = r.Receipt
 			}
@@ -754,7 +758,8 @@ func (st *state) userByLabel(label string) (allowedUser, bool) {
 // the main channel goes to by its reply records: the one its first message
 // was delivered to, else the one the newest unexpired message in the thread
 // was. Records that exist only because of a conversation link don't count,
-// so after an unlink only tags (and threads under them) reach agents there.
+// so after an unlink only tags (and threads under them) reach agents there;
+// nor do a broadcast's, which went to every agent.
 func (st *state) threadSession(channel, threadTS string) (string, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -762,7 +767,7 @@ func (st *state) threadSession(channel, threadTS string) (string, bool) {
 	newest := ""
 	for i := len(st.replies) - 1; i >= 0; i-- {
 		r := st.replies[i]
-		if r.Channel != channel || r.Link || !r.At.After(cutoff) {
+		if r.Channel != channel || r.Link || r.Group != "" || !r.At.After(cutoff) {
 			continue
 		}
 		if r.TS == threadTS {

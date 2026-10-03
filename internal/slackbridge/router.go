@@ -146,14 +146,20 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 	}
 	if mentioned {
 		ev.Text = rest
-		if _, _, tagOK := b.tagged(ev, plainText(rest, b.state.idLabels())); !tagOK {
+	}
+	text := plainText(ev.Text, b.state.idLabels())
+	if body, isBroadcast := broadcastBody(ev.Text, text); isBroadcast {
+		b.broadcast(ev, user, body)
+		return
+	}
+	if mentioned {
+		if _, _, tagOK := b.tagged(ev, text); !tagOK {
 			if active {
 				b.replyCommand(ev, b.commandHelp())
 			}
 			return
 		}
 	}
-	text := plainText(ev.Text, b.state.idLabels())
 	if !main && !dm {
 		b.routeForeign(ev, user, text, link, linked)
 		return
@@ -458,18 +464,10 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		b.replyCommand(ev, b.help(ev))
 		return
 	}
-	cmd := agentbus.Command{Name: name, Kind: agentbus.CommandSlash, Command: name, Args: rest}
-	if entry, found := b.cmdRegistry.lookup(name); found {
-		if entry.err != nil {
-			b.replyCommand(ev, fmt.Sprintf("`!%s` is misconfigured.", name))
-			return
-		}
-		if errArgs := entry.spec.checkArgs(rest); errArgs != nil {
-			log.Infof("slack: refused !%s from %s: arguments not accepted", name, user.ID)
-			b.replyCommand(ev, errArgs.Error())
-			return
-		}
-		cmd = entry.spec.command(rest)
+	cmd, refusal := b.commandFor(user, name, rest)
+	if refusal != "" {
+		b.replyCommand(ev, refusal)
+		return
 	}
 	if cmd.Kind == agentbus.CommandShell && !isDM(ev) && ev.Channel != b.channelID {
 		// Shell output (text or an image) is posted where the command was
@@ -488,6 +486,24 @@ func (b *Bridge) runCommand(ev messageEvent, user allowedUser, target, text, not
 		return
 	}
 	b.dispatchCommand(ev, user, target, cmd, notFound, adopt)
+}
+
+// commandFor resolves "!name rest" from user against the registry, falling
+// through to the Claude Code slash command of that name. refusal is the
+// reply when it can't run (a misconfigured entry, arguments not accepted).
+func (b *Bridge) commandFor(user allowedUser, name, rest string) (cmd agentbus.Command, refusal string) {
+	cmd = agentbus.Command{Name: name, Kind: agentbus.CommandSlash, Command: name, Args: rest}
+	if entry, found := b.cmdRegistry.lookup(name); found {
+		if entry.err != nil {
+			return cmd, fmt.Sprintf("`!%s` is misconfigured.", name)
+		}
+		if errArgs := entry.spec.checkArgs(rest); errArgs != nil {
+			log.Infof("slack: refused !%s from %s: arguments not accepted", name, user.ID)
+			return cmd, errArgs.Error()
+		}
+		cmd = entry.spec.command(rest)
+	}
+	return cmd, ""
 }
 
 // dispatchCommand delivers cmd from user to target as a command message, or
@@ -607,7 +623,7 @@ func (b *Bridge) topLevelOutside(ev messageEvent) bool {
 // returns the one to put on ev now, which is a later receipt when one beat
 // the record (see state.record).
 func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, queued, command string) string {
-	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid, TS: ev.TS, Receipt: queued, TopLevel: b.topLevelOutside(ev), Command: command}
+	r := b.deliveryRecord(ev, msgID, sid, queued, command)
 	if !isDM(ev) {
 		reaction := b.state.record(r)
 		if adopt {
@@ -617,13 +633,23 @@ func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, 
 		}
 		return reaction
 	}
-	r.DMUser = ev.User
 	reaction := b.state.record(r)
 	b.state.setDMLast(ev.User, sid)
 	if adopt {
 		b.state.linkDM(ev.Channel, ev.TS, sid, false)
 	}
 	return reaction
+}
+
+// deliveryRecord is the reply record of msgID, delivered to sid from ev:
+// the conversation, thread and level an answer goes to, and the receipt it
+// starts with (queued). command is as for recordDelivery.
+func (b *Bridge) deliveryRecord(ev messageEvent, msgID, sid, queued, command string) replyRecord {
+	r := replyRecord{ID: msgID, Channel: ev.Channel, ThreadTS: replyThread(ev), Session: sid, TS: ev.TS, Receipt: queued, TopLevel: b.topLevelOutside(ev), Command: command}
+	if isDM(ev) {
+		r.DMUser = ev.User
+	}
+	return r
 }
 
 // ownerOnly reports whether ev's conversation shows the bridge's setup to

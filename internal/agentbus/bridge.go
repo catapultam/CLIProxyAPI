@@ -12,6 +12,10 @@ import (
 // is reserved too and never resolves to a session.
 const SlackAddress = "slack"
 
+// BroadcastName is the reserved name an owner's Slack broadcast ("all:
+// message") addresses. No session can take it, and it never resolves to one.
+const BroadcastName = "all"
+
 // Via values: where in Slack a message reached the bridge, when not in its
 // main channel.
 const (
@@ -160,11 +164,11 @@ func slackDMLabel(target string) (label string, ok bool) {
 	return strings.TrimSpace(target[len(prefix):]), true
 }
 
-// isReservedTarget reports whether target is "slack" or "slack@...", which
-// never name a session.
+// isReservedTarget reports whether target is "slack", "slack@..." or "all"
+// (compared case-insensitively), which never name a session.
 func isReservedTarget(target string) bool {
 	_, dm := slackDMLabel(target)
-	return dm || isSlackAddress(target)
+	return dm || isSlackAddress(target) || strings.EqualFold(strings.TrimSpace(target), BroadcastName)
 }
 
 // slackDMTarget checks a DM label against bridge's allowed users, compared

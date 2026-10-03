@@ -80,11 +80,18 @@ func (b *Bridge) advanceReceipts(ids []string, reaction string) {
 // jobs that run late or out of order (a retry, a full queue) never leave a
 // stale reaction: the new reaction is added first, then the one shown
 // before is removed, so the message always shows one. A dismissed message
-// loses every receipt reaction.
+// loses every receipt reaction. A broadcast's message shows its group's
+// receipt (groupReceipt).
 func (b *Bridge) syncReceipt(id string) {
 	b.enqueue(func(ctx context.Context) error {
 		r, ok := b.state.receiptOf(id)
-		if !ok || r.TS == "" || r.Receipt == r.Shown {
+		if !ok || r.TS == "" {
+			return nil
+		}
+		if r.Group != "" {
+			r.Receipt, r.Shown = b.state.groupReceipt(r.Group)
+		}
+		if r.Receipt == r.Shown {
 			return nil
 		}
 		if r.Receipt == receiptDismissed {
@@ -176,16 +183,65 @@ func (st *state) receiptOf(id string) (replyRecord, bool) {
 	return replyRecord{}, false
 }
 
-// setShown records that message id now shows shown (empty for none). A
-// receipt that moved on meanwhile has its own sync queued.
+// setShown records that message id now shows shown (empty for none), on
+// every record of its broadcast group when it has one. A receipt that moved
+// on meanwhile has its own sync queued.
 func (st *state) setShown(id, shown string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	for i := len(st.replies) - 1; i >= 0; i-- {
-		if st.replies[i].ID == id {
+		if st.replies[i].ID != id {
+			continue
+		}
+		group := st.replies[i].Group
+		if group == "" {
 			st.replies[i].Shown = shown
-			st.dirty = true
-			return
+		} else {
+			for j := range st.replies {
+				if st.replies[j].Group == group {
+					st.replies[j].Shown = shown
+				}
+			}
+		}
+		st.dirty = true
+		return
+	}
+}
+
+// groupReceipt is the receipt a broadcast's message shows (want) and the one
+// it shows now (shown): 📨 once any recipient received it, 👀 once all read
+// it, where a dismissal counts as read; until then the queued reaction (⚙️
+// for a command).
+func (st *state) groupReceipt(group string) (want, shown string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	queued, allRead, anyReceived, first := reactionQueued, true, false, true
+	for _, r := range st.replies {
+		if r.Group != group {
+			continue
+		}
+		if first {
+			shown, first = r.Shown, false
+		}
+		switch r.Receipt {
+		case reactionRead, receiptDismissed:
+			anyReceived = true
+		case reactionReceived:
+			anyReceived, allRead = true, false
+		default:
+			allRead = false
+			if r.Receipt == reactionCommand {
+				queued = reactionCommand
+			}
 		}
 	}
+	switch {
+	case first:
+		return shown, shown
+	case allRead:
+		return reactionRead, shown
+	case anyReceived:
+		return reactionReceived, shown
+	}
+	return queued, shown
 }

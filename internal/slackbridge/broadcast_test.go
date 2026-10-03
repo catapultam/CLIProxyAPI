@@ -1,0 +1,238 @@
+package slackbridge
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
+)
+
+// claimByBody claims sid's one message and checks it is the broadcast body
+// from alex.
+func claimBroadcast(t *testing.T, bus *agentbus.Store, sid, body, via string) agentbus.Message {
+	t.Helper()
+	m := claimOne(t, bus, sid)
+	if !m.FromUser || m.Guest || m.SlackUser != "alex" || m.Body != body || m.Via != via || m.Command != nil {
+		t.Fatalf("%s got %+v", sid, m)
+	}
+	return m
+}
+
+func TestOwnerBroadcastReachesLiveSessions(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	bus.Hello(sidC, "pc", "/work/gone", "gone", true)
+	bus.Bye(sidC)
+
+	b.handleEvent("EvB1", msg("UALEX", "all: status please", "1700011000.000001", ""))
+	claimBroadcast(t, bus, sidA, "status please", "")
+	mB := claimBroadcast(t, bus, sidB, "status please", "")
+	if bus.Pending(sidC) {
+		t.Fatal("an offline session got the broadcast")
+	}
+	drainJobs(t, b)
+	reply := lastPost(t, f)
+	if reply["channel"] != "CAGENTS" || reply["thread_ts"] != "1700011000.000001" || !strings.HasPrefix(reply["text"], "→ sent to 2 agents: ") ||
+		!strings.Contains(reply["text"], "`flyer`") || !strings.Contains(reply["text"], "`pc/other-bbbbbb`") || strings.Contains(reply["text"], "gone") {
+		t.Fatalf("reply = %+v", reply)
+	}
+	// An agent answers in the broadcast's thread; the thread is no agent's.
+	sendReply(t, b, bus, sidB, "all good", mB.ID)
+	if got := lastPost(t, f); got["channel"] != "CAGENTS" || got["thread_ts"] != "1700011000.000001" {
+		t.Fatalf("answer = %+v", got)
+	}
+	if sid, ok := b.state.session("1700011000.000001"); ok {
+		t.Fatalf("the broadcast's thread was linked to %s", sid)
+	}
+
+	// "@all" from an owner's DM: answers at the DM's top level; dm_last
+	// stays as it was.
+	b.handleEvent("EvB2", dmMsg("UALEX", "@all ship it", "1700011000.000002", ""))
+	mA := claimBroadcast(t, bus, sidA, "ship it", agentbus.ViaDM)
+	claimBroadcast(t, bus, sidB, "ship it", agentbus.ViaDM)
+	drainJobs(t, b)
+	if got := lastPost(t, f); got["channel"] != "DUALEX" || got["thread_ts"] != "" || !strings.HasPrefix(got["text"], "→ sent to 2 agents: ") {
+		t.Fatalf("DM reply = %+v", got)
+	}
+	if sid, ok := b.state.dmLast("UALEX"); ok {
+		t.Fatalf("dm_last = %s", sid)
+	}
+	sendReply(t, b, bus, sidA, "shipped", mA.ID)
+	if got := lastPost(t, f); got["channel"] != "DUALEX" || got["thread_ts"] != "" {
+		t.Fatalf("DM answer = %+v", got)
+	}
+
+	// In a thread, too.
+	b.handleEvent("EvB3", msg("UALEX", "all: and here", "1700011000.000003", "1700011000.000001"))
+	claimBroadcast(t, bus, sidA, "and here", "")
+	claimBroadcast(t, bus, sidB, "and here", "")
+}
+
+func TestNonOwnerBroadcastIsRefused(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	if _, _, err := b.state.allow("UJANE", "jane"); err != nil {
+		t.Fatal(err)
+	}
+	b.handleEvent("EvBn1", msg("UJANE", "all: hi", "1700011100.000001", ""))
+	b.handleEvent("EvBn2", dmMsg("UJANE", "@all hi", "1700011100.000002", ""))
+	b.handleEvent("EvBn3", msg("UJANE", "all: !compact", "1700011100.000003", ""))
+	drainJobs(t, b)
+	if bus.Pending(sidA) || bus.Pending(sidB) {
+		t.Fatal("a non-owner's broadcast was delivered")
+	}
+	posts := f.callsTo("chat.postMessage")
+	if len(posts) != 3 {
+		t.Fatalf("posts = %d", len(posts))
+	}
+	for _, p := range posts {
+		if p.Form.Get("text") != ownersOnlyBroadcast {
+			t.Fatalf("reply = %q", p.Form.Get("text"))
+		}
+	}
+}
+
+func TestBroadcastReplyNamesPublicly(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	b.handleEvent("EvBp1", foreignMsg("UALEX", "all: hi", "1700011200.000001", ""))
+	claimBroadcast(t, bus, sidA, "hi", agentbus.ViaGroup)
+	claimBroadcast(t, bus, sidB, "hi", agentbus.ViaGroup)
+	drainJobs(t, b)
+	got := lastPost(t, f)
+	if got["channel"] != "GMPIM1" || strings.Contains(got["text"], "pc/") || strings.Contains(got["text"], "· pc") ||
+		!strings.Contains(got["text"], "`flyer`") || !strings.Contains(got["text"], "`an agent`") {
+		t.Fatalf("reply = %+v", got)
+	}
+}
+
+func TestBroadcastReplyListsAtMost15(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	for i := 0; i < 17; i++ {
+		sid := fmt.Sprintf("dddddd%02d-2222-3333-4444-555555555555", i)
+		bus.Hello(sid, "pc", "/work/n", fmt.Sprintf("n%02d", i), true)
+	}
+	b.handleEvent("EvBl1", msg("UALEX", "all: hi", "1700011300.000001", ""))
+	drainJobs(t, b)
+	got := lastPost(t, f)["text"]
+	if !strings.HasPrefix(got, "→ sent to 19 agents: ") || !strings.HasSuffix(got, " +4 more") || strings.Count(got, "`")/2 != helpLimit {
+		t.Fatalf("reply = %q", got)
+	}
+}
+
+func TestBroadcastWithNoAgentsOnline(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	bus.Bye(sidA)
+	bus.Bye(sidB)
+	b.handleEvent("EvBz1", msg("UALEX", "all: anyone?", "1700011400.000001", ""))
+	drainJobs(t, b)
+	if got := lastPostText(f); got != "No agents are online right now." {
+		t.Fatalf("reply = %q", got)
+	}
+	if got := f.reactionsOn("CAGENTS", "1700011400.000001"); len(got) != 0 {
+		t.Fatalf("reactions = %v", got)
+	}
+}
+
+func TestBroadcastAggregateReceipts(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	const ts = "1700011500.000001"
+	b.handleEvent("EvBr1", msg("UALEX", "all: report", ts, ""))
+	idA := claimBroadcast(t, bus, sidA, "report", "").ID
+	idB := claimBroadcast(t, bus, sidB, "report", "").ID
+	step := func(want string, change func()) {
+		t.Helper()
+		change()
+		drainJobs(t, b)
+		if got := f.reactionsOn("CAGENTS", ts); !reflect.DeepEqual(got, []string{want}) {
+			t.Fatalf("reactions = %v, want %s", got, want)
+		}
+	}
+	step(reactionQueued, func() {})
+	// Any recipient that received it: 📨.
+	step(reactionReceived, func() { b.Received([]string{idA}) })
+	// One read, one not yet: still 📨.
+	step(reactionReceived, func() { b.Read([]string{idA}) })
+	step(reactionReceived, func() { b.Received([]string{idB}) })
+	// The last one dismissed it: that counts as read, so all have: 👀.
+	step(reactionRead, func() {
+		if n := b.Dismissed(sidB, []string{idB}); n != 1 {
+			t.Fatalf("dismissed = %d", n)
+		}
+	})
+
+	// All read the plain way, too.
+	const ts2 = "1700011500.000002"
+	b.handleEvent("EvBr2", msg("UALEX", "all: again", ts2, ""))
+	ids := []string{claimOne(t, bus, sidA).ID, claimOne(t, bus, sidB).ID}
+	b.Read(ids[:1])
+	drainJobs(t, b)
+	if got := f.reactionsOn("CAGENTS", ts2); !reflect.DeepEqual(got, []string{reactionReceived}) {
+		t.Fatalf("one read: %v", got)
+	}
+	b.Read(ids[1:])
+	drainJobs(t, b)
+	if got := f.reactionsOn("CAGENTS", ts2); !reflect.DeepEqual(got, []string{reactionRead}) {
+		t.Fatalf("all read: %v", got)
+	}
+}
+
+func TestBroadcastCommand(t *testing.T) {
+	b, f, bus, dir := newCommandBridge(t)
+	writeCommand(t, dir, "screenshot.yaml", shellYAML, mtime0)
+	const ts = "1700011600.000001"
+	b.handleEvent("EvBc1", msg("UALEX", "all: !compact now", ts, ""))
+	m := claimOne(t, bus, sidA)
+	if m.Command == nil || m.Command.Command != "compact" || m.Command.Args != "now" || m.SlackUserID != "UALEX" {
+		t.Fatalf("command = %+v", m)
+	}
+	if bus.Pending(sidB) {
+		t.Fatalf("a session without the plugin got the command: %+v", bus.Claim(sidB))
+	}
+	drainJobs(t, b)
+	if got := lastPost(t, f); got["thread_ts"] != ts || got["text"] != "→ sent `!compact` to 1 agent: `flyer` (skipped: 1 without plugin 0.3.3+)" {
+		t.Fatalf("reply = %+v", got)
+	}
+	if got := f.reactionsOn("CAGENTS", ts); !reflect.DeepEqual(got, []string{reactionCommand}) {
+		t.Fatalf("reactions = %v", got)
+	}
+	// The command's report goes to the broadcast's thread.
+	sendReply(t, b, bus, sidA, "✅ !compact: done", m.ID)
+	if got := lastPost(t, f); got["thread_ts"] != ts {
+		t.Fatalf("report = %+v", got)
+	}
+
+	// Shell commands are refused for a broadcast.
+	b.handleEvent("EvBc2", msg("UALEX", "all: !screenshot", "1700011600.000002", ""))
+	drainJobs(t, b)
+	if bus.Pending(sidA) || bus.Pending(sidB) {
+		t.Fatal("a shell command was broadcast")
+	}
+	if got := lastPostText(f); got != shellNoBroadcast {
+		t.Fatalf("shell reply = %q", got)
+	}
+}
+
+func TestClankerBroadcast(t *testing.T) {
+	b, f, bus := newTestBridge(t)
+	if _, _, err := b.state.allow("UJANE", "jane"); err != nil {
+		t.Fatal(err)
+	}
+	if got := slash(t, b, "UJANE", "all: hi"); got != ownersOnlyBroadcast {
+		t.Fatalf("non-owner ack = %q", got)
+	}
+	got := slash(t, b, "UALEX", "all: hi there")
+	if !strings.HasPrefix(got, "→ sent to 2 agents: ") || !strings.HasSuffix(got, "Answers arrive in your DM with @clanker-bro.") {
+		t.Fatalf("ack = %q", got)
+	}
+	drainJobs(t, b)
+	claimBroadcast(t, bus, sidA, "hi there", agentbus.ViaSlash)
+	mB := claimBroadcast(t, bus, sidB, "hi there", agentbus.ViaSlash)
+	sendReply(t, b, bus, sidB, "hello", mB.ID)
+	if got := lastPost(t, f); got["channel"] != "DUALEX" || got["thread_ts"] != "" {
+		t.Fatalf("answer = %+v", got)
+	}
+	// The ack was the reply: nothing else was posted.
+	if n := len(f.callsTo("chat.postMessage")); n != 1 {
+		t.Fatalf("posts = %d", n)
+	}
+}
