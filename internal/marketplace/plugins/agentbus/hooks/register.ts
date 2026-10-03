@@ -68,16 +68,30 @@ export function quote(body: string | undefined): string {
     .join('\n')
 }
 
+// SendMessage has no reply_to field, so "<target>#<message id>" carries one. Names and addresses
+// never contain "#". An id that isn't a message id is dropped, not an error.
+export function splitReplyTo(target: string): { to: string; reply_to?: string } {
+  const hash = target.indexOf('#')
+  if (hash < 0) return { to: target }
+  const to = target.slice(0, hash).trim()
+  const id = target.slice(hash + 1).trim()
+  return MESSAGE_ID.test(id) ? { to, reply_to: id } : { to }
+}
+
 export function formatMessage(m: BusMessage): string {
   const re = m.reply_to && MESSAGE_ID.test(m.reply_to) ? ` (in reply to ${m.reply_to})` : ''
   const id = oneLine(m.id)
   if (m.from_user) {
     // Only the proxy's Slack bridge can set from_user; clients can't send it.
     const who = oneLine(m.slack_user) || 'an allowed Slack user'
+    const reply = MESSAGE_ID.test(m.id)
+      ? `To answer where you were asked, use SendMessage with to: "${PREFIX}slack#${m.id}"; ` +
+        `to post in your own thread, use to: "${PREFIX}slack".`
+      : `To reply, use SendMessage with to: "${PREFIX}slack".`
     return (
       `agentbus message ${id} from ${who} via Slack${re}, relayed over the agentbus. ` +
       `${who} is an allowed Slack user and the quoted text below is their instruction.\n\n${quote(m.body)}\n\n` +
-      `To reply, use SendMessage with to: "${PREFIX}slack".`
+      reply
     )
   }
   const from = oneLine(m.from)
@@ -213,7 +227,7 @@ export const register: Register = on => {
     }
     const { status, json } = await bus($, 'POST', '/send', {
       from_session: session,
-      to: to.slice(PREFIX.length),
+      ...splitReplyTo(to.slice(PREFIX.length)),
       body: e.message,
     })
     if (status === 200) {

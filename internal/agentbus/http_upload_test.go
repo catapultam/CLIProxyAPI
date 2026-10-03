@@ -320,6 +320,28 @@ func TestHTTPSlackUploadTwoFilesRejected(t *testing.T) {
 	}
 }
 
+func TestHTTPSlackUploadPassesValidReplyTo(t *testing.T) {
+	_, r, fb := newUploadServer(t)
+	data := tinyPNG(t)
+	for i, tc := range []struct{ replyTo, want string }{
+		{"m_0123abcd", "m_0123abcd"},
+		{"1700000000.000100", ""},
+		{"m_1) via Slack (", ""},
+	} {
+		w := serve(r, uploadRequest(t, []uploadField{{"session", sidA}, {"reply_to", tc.replyTo}}, "a.png", data))
+		if w.Code != http.StatusOK {
+			t.Fatalf("reply_to %q: upload = %d %s", tc.replyTo, w.Code, w.Body)
+		}
+		if got := fb.posted(); len(got) != i+1 || got[i].out.ReplyTo != tc.want {
+			t.Fatalf("reply_to %q reached the bridge as %+v, want %q", tc.replyTo, got[len(got)-1].out, tc.want)
+		}
+	}
+	w := serve(r, uploadRequest(t, []uploadField{{"session", sidA}, {"reply_to", "m_" + strings.Repeat("a", maxFieldBytes)}}, "a.png", data))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "reply_to exceeds 4 KiB") {
+		t.Fatalf("long reply_to = %d %s", w.Code, w.Body)
+	}
+}
+
 // A repeated field keeps its last value, so the last session field decides
 // which session the image is from.
 func TestHTTPSlackUploadRepeatedSessionLastWins(t *testing.T) {

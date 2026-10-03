@@ -17,6 +17,10 @@ type Outbound struct {
 	Machine   string
 	Cwd       string
 	Body      string
+	// ReplyTo is a validated message id or empty. The bridge posts into the
+	// Slack thread that message came from only when it was delivered to this
+	// session; otherwise it uses the session's own thread.
+	ReplyTo string
 }
 
 // Bridge carries messages between the bus and Slack. Store calls it without
@@ -31,8 +35,8 @@ type Bridge interface {
 
 // ImagePoster is implemented by bridges that can post images.
 type ImagePoster interface {
-	// PostImage posts data into the session's own thread, with o.Body as the
-	// caption, and returns once Slack has answered. Store calls it without
+	// PostImage posts data into the thread Post would pick for o, with o.Body
+	// as the caption, and returns once Slack has answered. Store calls it without
 	// holding its lock. An error's text must be safe to show the agent: no
 	// tokens or upload URLs.
 	PostImage(ctx context.Context, o Outbound, filename string, data []byte) error
@@ -83,21 +87,22 @@ func isSlackAddress(target string) bool {
 }
 
 // Deliver queues a message from an allowed Slack user for a session given by
-// id, name or address, and returns that session's id. Only the Slack bridge
-// calls it, and it is the only way a message gets FromUser.
-func (s *Store) Deliver(target, body, slackUser string) (string, error) {
+// id, name or address, and returns that session's id and the new message's
+// id. Only the Slack bridge calls it, and it is the only way a message gets
+// FromUser.
+func (s *Store) Deliver(target, body, slackUser string) (sessionID, msgID string, err error) {
 	if strings.TrimSpace(body) == "" {
-		return "", ErrEmptyBody
+		return "", "", ErrEmptyBody
 	}
 	if len(body) > MaxBodyBytes {
-		return "", ErrBodyTooLarge
+		return "", "", ErrBodyTooLarge
 	}
 	if isSlackAddress(target) {
 		// A session id is whatever the client sends in /hello, so a client
 		// could register "slack" as its own session id and otherwise reach
 		// this through the byID fast path below. Reject it the same way
 		// resolveLocked rejects the name/address forms.
-		return "", ErrUnknownTarget
+		return "", "", ErrUnknownTarget
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,12 +110,12 @@ func (s *Store) Deliver(target, body, slackUser string) (string, error) {
 	if _, ok := s.byID[id]; !ok {
 		resolved, found := s.resolveLocked(target)
 		if !found {
-			return "", ErrUnknownTarget
+			return "", "", ErrUnknownTarget
 		}
 		id = resolved
 	}
 	sess := s.byID[id]
-	s.enqueueLocked(sess, Message{
+	msg := Message{
 		ID:        newMessageID(),
 		From:      SlackAddress,
 		To:        s.addressLocked(sess),
@@ -118,6 +123,7 @@ func (s *Store) Deliver(target, body, slackUser string) (string, error) {
 		FromUser:  true,
 		SlackUser: slackUser,
 		CreatedAt: s.now(),
-	})
-	return id, nil
+	}
+	s.enqueueLocked(sess, msg)
+	return id, msg.ID, nil
 }

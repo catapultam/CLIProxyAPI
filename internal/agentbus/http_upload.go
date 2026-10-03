@@ -36,6 +36,7 @@ var imageTypes = map[string]bool{
 type uploadForm struct {
 	session  string
 	caption  string
+	replyTo  string
 	filename string
 	data     []byte
 	hasFile  bool
@@ -47,9 +48,10 @@ type uploadError struct {
 	msg    string
 }
 
-// handleSlackUpload posts an image into the sending session's own Slack
-// thread. The client never picks the thread or channel. The body is streamed
-// part by part into memory and never spooled to disk.
+// handleSlackUpload posts an image into the sending session's Slack thread:
+// its own, or, with a reply_to the bridge delivered to that session, the
+// thread that message came from. The client never names a thread or channel.
+// The body is streamed part by part into memory and never spooled to disk.
 func (s *Store) handleSlackUpload(c *gin.Context) {
 	poster, ok := s.currentBridge().(ImagePoster)
 	if !ok {
@@ -78,6 +80,7 @@ func (s *Store) handleSlackUpload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "session is not a known session"})
 		return
 	}
+	out.ReplyTo = cleanReplyTo(form.replyTo)
 	if !form.hasFile {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
 		return
@@ -95,9 +98,9 @@ func (s *Store) handleSlackUpload(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// readUploadForm streams the multipart body: session and caption up to
-// maxFieldBytes each, the file up to maxImageBytes. Other parts are skipped.
-// A repeated field keeps its last value; a second file is refused.
+// readUploadForm streams the multipart body: session, caption and reply_to up
+// to maxFieldBytes each, the file up to maxImageBytes. Other parts are
+// skipped. A repeated field keeps its last value; a second file is refused.
 func readUploadForm(r *http.Request) (uploadForm, *uploadError) {
 	var form uploadForm
 	mr, errReader := r.MultipartReader()
@@ -113,7 +116,7 @@ func readUploadForm(r *http.Request) (uploadForm, *uploadError) {
 			return form, readFailure(errPart)
 		}
 		switch name := part.FormName(); name {
-		case "session", "caption":
+		case "session", "caption", "reply_to":
 			value, errRead := io.ReadAll(io.LimitReader(part, maxFieldBytes+1))
 			if errRead != nil {
 				return form, readFailure(errRead)
@@ -121,10 +124,14 @@ func readUploadForm(r *http.Request) (uploadForm, *uploadError) {
 			if len(value) > maxFieldBytes {
 				return form, &uploadError{http.StatusBadRequest, name + " exceeds 4 KiB"}
 			}
-			if name == "session" {
-				form.session = strings.TrimSpace(string(value))
-			} else {
-				form.caption = strings.TrimSpace(string(value))
+			v := strings.TrimSpace(string(value))
+			switch name {
+			case "session":
+				form.session = v
+			case "caption":
+				form.caption = v
+			default:
+				form.replyTo = v
 			}
 		case "file":
 			if form.hasFile {

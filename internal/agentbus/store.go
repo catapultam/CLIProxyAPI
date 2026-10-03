@@ -346,9 +346,7 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 		s.mu.Unlock()
 		return Message{}, ErrUnknownSender
 	}
-	if replyTo = strings.TrimSpace(replyTo); !validReplyTo.MatchString(replyTo) {
-		replyTo = ""
-	}
+	replyTo = cleanReplyTo(replyTo)
 	msg := Message{
 		ID:        newMessageID(),
 		From:      s.addressLocked(from),
@@ -361,6 +359,7 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	}
 	if b := s.bridge; b != nil && isSlackAddress(to) {
 		out := s.outboundLocked(fromID, from, body)
+		out.ReplyTo = replyTo
 		s.mu.Unlock()
 		b.Post(out)
 		msg.To = SlackAddress
@@ -375,6 +374,14 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	msg.To = s.addressLocked(target)
 	s.enqueueLocked(target, msg)
 	return msg, nil
+}
+
+// cleanReplyTo returns replyTo trimmed, or empty when it isn't a message id.
+func cleanReplyTo(replyTo string) string {
+	if replyTo = strings.TrimSpace(replyTo); validReplyTo.MatchString(replyTo) {
+		return replyTo
+	}
+	return ""
 }
 
 func (s *Store) enqueueLocked(target *session, msg Message) {

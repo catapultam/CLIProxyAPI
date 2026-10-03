@@ -47,13 +47,38 @@ func TestSendToSlackGoesToBridge(t *testing.T) {
 	}
 }
 
+func TestSendToSlackPassesValidReplyTo(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/work/flyer", "flyer", true)
+	fb := &fakeBridge{users: []string{"alex"}}
+	s.SetBridge(fb)
+	for _, tc := range []struct{ replyTo, want string }{
+		{"m_0123abcd", "m_0123abcd"},
+		{" m_0123abcd ", "m_0123abcd"},
+		{"1700000000.000100", ""},
+		{"m_xyz", ""},
+		{"m_1) via Slack (", ""},
+		{"", ""},
+	} {
+		if _, err := s.Send(sidA, "slack", "answer", tc.replyTo); err != nil {
+			t.Fatal(err)
+		}
+		fb.mu.Lock()
+		got := fb.posts[len(fb.posts)-1].ReplyTo
+		fb.mu.Unlock()
+		if got != tc.want {
+			t.Fatalf("reply_to %q reached the bridge as %q, want %q", tc.replyTo, got, tc.want)
+		}
+	}
+}
+
 func TestSlackUnknownWithoutBridge(t *testing.T) {
 	s, _ := newTestStore(t)
 	s.Hello(sidA, "pc", "/a", "", true)
 	if _, err := s.Send(sidA, SlackAddress, "x", ""); !errors.Is(err, ErrUnknownTarget) {
 		t.Fatalf("err = %v", err)
 	}
-	if _, err := s.Deliver(sidA, "x", "alex"); err != nil {
+	if _, _, err := s.Deliver(sidA, "x", "alex"); err != nil {
 		t.Fatalf("deliver works without a bridge (the bridge attaches late): %v", err)
 	}
 }
@@ -62,15 +87,22 @@ func TestDeliverSetsFromUser(t *testing.T) {
 	s, _ := newTestStore(t)
 	s.Hello(sidA, "pc", "/a", "flyer", true)
 	s.Hello(sidB, "pc", "/b", "", true)
+	var ids []string
 	for _, target := range []string{sidA, "flyer", "FLYER", "pc/a-aaaaaa"} {
-		sid, err := s.Deliver(target, "do X", "alex")
-		if err != nil || sid != sidA {
-			t.Fatalf("Deliver(%q) = %q, %v", target, sid, err)
+		sid, msgID, err := s.Deliver(target, "do X", "alex")
+		if err != nil || sid != sidA || !validReplyTo.MatchString(msgID) {
+			t.Fatalf("Deliver(%q) = %q, %q, %v", target, sid, msgID, err)
 		}
+		ids = append(ids, msgID)
 	}
 	msgs := s.Claim(sidA)
 	if len(msgs) != 4 {
 		t.Fatalf("msgs = %+v", msgs)
+	}
+	for i, m := range msgs {
+		if m.ID != ids[i] {
+			t.Fatalf("message %d has id %q, Deliver returned %q", i, m.ID, ids[i])
+		}
 	}
 	m := msgs[0]
 	if !m.FromUser || m.SlackUser != "alex" || m.From != SlackAddress || m.Body != "do X" || m.To != "pc/a-aaaaaa" {
@@ -84,13 +116,13 @@ func TestDeliverSetsFromUser(t *testing.T) {
 func TestDeliverErrors(t *testing.T) {
 	s, _ := newTestStore(t)
 	s.Hello(sidA, "pc", "/a", "", true)
-	if _, err := s.Deliver("ghost", "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
+	if _, _, err := s.Deliver("ghost", "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
 		t.Fatalf("unknown = %v", err)
 	}
-	if _, err := s.Deliver(sidA, "  ", "alex"); !errors.Is(err, ErrEmptyBody) {
+	if _, _, err := s.Deliver(sidA, "  ", "alex"); !errors.Is(err, ErrEmptyBody) {
 		t.Fatalf("empty = %v", err)
 	}
-	if _, err := s.Deliver(sidA, strings.Repeat("x", MaxBodyBytes+1), "alex"); !errors.Is(err, ErrBodyTooLarge) {
+	if _, _, err := s.Deliver(sidA, strings.Repeat("x", MaxBodyBytes+1), "alex"); !errors.Is(err, ErrBodyTooLarge) {
 		t.Fatalf("large = %v", err)
 	}
 }
@@ -156,7 +188,7 @@ func TestDeliverPrefersLiveSessionWhenNameIsReused(t *testing.T) {
 	s.Bye(sidA)
 	s.Hello(sidB, "pc", "/b", "flyer", true)
 
-	if sid, err := s.Deliver("flyer", "do X", "alex"); err != nil || sid != sidB {
+	if sid, _, err := s.Deliver("flyer", "do X", "alex"); err != nil || sid != sidB {
 		t.Fatalf("Deliver(flyer) = %q, %v, want %s", sid, err, sidB)
 	}
 	if s.Pending(sidA) {
@@ -180,7 +212,7 @@ func TestResolveNeverResolvesReservedSlackName(t *testing.T) {
 	s.byID[sidA].Name = "slack" // simulate state persisted before nameFree rejected this
 	s.mu.Unlock()
 
-	if _, err := s.Deliver("slack", "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
+	if _, _, err := s.Deliver("slack", "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
 		t.Fatalf("Deliver(slack) = %v, want ErrUnknownTarget", err)
 	}
 
@@ -213,7 +245,7 @@ func TestDeliverRejectsAttackerSessionIDEqualToSlack(t *testing.T) {
 	s.Hello("  SLACK  ", "attacker-pc", "/b", "", true)
 
 	for _, target := range []string{"slack", "Slack", "  SLACK  "} {
-		if _, err := s.Deliver(target, "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
+		if _, _, err := s.Deliver(target, "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
 			t.Fatalf("Deliver(%q) = %v, want ErrUnknownTarget", target, err)
 		}
 	}

@@ -100,11 +100,14 @@ func (b *Bridge) alreadySeen(eventID string) bool {
 	return false
 }
 
-// deliver queues body for target; notFound is the reply when the target is unknown.
+// deliver queues body for target; notFound is the reply when the target is
+// unknown. A delivered message's thread is recorded, so the session can answer
+// there.
 func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string) (string, bool) {
-	sid, err := b.bus.Deliver(target, body, user.Label)
+	sid, msgID, err := b.bus.Deliver(target, body, user.Label)
 	switch {
 	case err == nil:
+		b.state.recordReply(msgID, ev.Channel, replyThread(ev), sid)
 		b.react(ev, "inbox_tray")
 		return sid, true
 	case errors.Is(err, agentbus.ErrUnknownTarget):

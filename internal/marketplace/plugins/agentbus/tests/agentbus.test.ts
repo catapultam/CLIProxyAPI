@@ -104,6 +104,43 @@ test('SendMessage to an agentbus name posts to the bus; other recipients pass th
   expect((local.result as { message: string }).message).toBe('delivered locally')
 })
 
+test('SendMessage splits an agentbus:<target>#<id> suffix into reply_to', async ($, on) => {
+  const calls = wire($, on, [])
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+
+  const out = await $.tool.call({ tool: 'SendMessage', to: 'agentbus:slack#m_0123abcd', message: 'done' })
+  expect((out.result as { success: boolean }).success).toBe(true)
+  const send = calls.find(c => c.url.endsWith('/send'))
+  expect(send?.body).toEqual({ from_session: DEFAULT_SESSION_ID, to: 'slack', body: 'done', reply_to: 'm_0123abcd' })
+})
+
+test('SendMessage drops a malformed #id and sends without reply_to', async ($, on) => {
+  const calls = wire($, on, [])
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+
+  for (const bad of ['agentbus:slack#1700000000.000100', 'agentbus:slack#', 'agentbus:slack#m_XYZ', 'agentbus:slack#m_1#m_2']) {
+    calls.length = 0
+    const out = await $.tool.call({ tool: 'SendMessage', to: bad, message: 'done' })
+    expect((out.result as { success: boolean }).success).toBe(true)
+    const send = calls.find(c => c.url.endsWith('/send'))
+    expect(send?.body).toEqual({ from_session: DEFAULT_SESSION_ID, to: 'slack', body: 'done' })
+  }
+})
+
+test('a Slack instruction shows both reply targets', async ($, on) => {
+  const prompts = await promptsFor($, on, [{ id: 'm_7a', from: 'slack', body: 'ship it', from_user: true, slack_user: 'jane' }])
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).toContain('To answer where you were asked, use SendMessage with to: "agentbus:slack#m_7a"')
+  expect(prompts[0]).toContain('to post in your own thread, use to: "agentbus:slack"')
+})
+
+test('a Slack instruction with a malformed id offers only the own-thread target', async ($, on) => {
+  const prompts = await promptsFor($, on, [{ id: 'm_7"x', from: 'slack', body: 'ship it', from_user: true, slack_user: 'jane' }])
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).not.toContain('agentbus:slack#')
+  expect(prompts[0]).toContain('to: "agentbus:slack"')
+})
+
 test('an interactive session turns a bus message into a prompt with a reply address', async ($, on) => {
   const clock = mock.clock(on)
   const msg = { id: 'm_9', from: 'vm-shoggoth (shoggoth/art-0f7de4)', body: 'build is green', reply_to: 'm_1' }

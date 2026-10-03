@@ -278,10 +278,14 @@ func TestInjectSlackLineWhenBridgeAttached(t *testing.T) {
 	s.SetBridge(&fakeBridge{users: []string{"alex", "jane"}})
 	post(r, sidA, "", stringContentBody)
 	note := strings.Join(lastUserTexts(got.body), "\n")
-	for _, want := range []string{`alex, jane`, `"agentbus:slack"`, `@<name>`, `finish a task, get blocked, or need a decision`} {
+	for _, want := range []string{`alex, jane`, `"agentbus:slack"`, `@<name>`, `finish a task, get blocked, or need a decision`,
+		`to answer where you were asked, reply with reply_to set to that message's id (SendMessage: to "agentbus:slack#<id>")`} {
 		if !strings.Contains(note, want) {
 			t.Fatalf("note missing %q:\n%s", want, note)
 		}
+	}
+	if strings.Contains(strings.ToLower(note), "set up") {
+		t.Fatalf("note says set up:\n%s", note)
 	}
 }
 
@@ -298,7 +302,7 @@ func TestInjectSlackLineHasImageCommand(t *testing.T) {
 				line = l
 			}
 		}
-		if line == "" || !strings.Contains(line, "-F session="+sidA+" ") || !strings.Contains(line, "-F file=@<path>") || !strings.Contains(line, "$ANTHROPIC_AUTH_TOKEN") {
+		if line == "" || !strings.Contains(line, "-F session="+sidA+" ") || !strings.Contains(line, "-F file=@<path>") || !strings.Contains(line, "$ANTHROPIC_AUTH_TOKEN") || !strings.Contains(line, "-F reply_to=<id>") {
 			t.Fatalf("mod=%v image line = %q\n%s", mod, line, got.body)
 		}
 		if strings.Contains(strings.ToLower(line), "set up") {
@@ -338,7 +342,7 @@ func TestInjectFromUserHeader(t *testing.T) {
 	clock := &fakeClock{now: t0}
 	s, r, got := newInjectServer(t, clock)
 	s.Touch(sidA)
-	if _, err := s.Deliver(sidA, "please rebase", "jane"); err != nil {
+	if _, _, err := s.Deliver(sidA, "please rebase", "jane"); err != nil {
 		t.Fatal(err)
 	}
 	post(r, sidA, "", stringContentBody)

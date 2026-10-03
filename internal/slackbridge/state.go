@@ -7,12 +7,31 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
+)
+
+const (
+	// maxReplies caps the remembered deliveries; the oldest go first.
+	maxReplies = 1000
+	// replyTTL matches the agentbus message TTL: a message older than this
+	// has left the bus, so an answer to it goes to the session's own thread.
+	replyTTL = 7 * 24 * time.Hour
 )
 
 var (
 	errConfigUser = errors.New("user is set in config.yaml")
 	errNotAllowed = errors.New("user is not allowed")
 )
+
+// replyRecord remembers where a message the bridge delivered came from, so
+// the session it went to can answer in that Slack thread.
+type replyRecord struct {
+	ID       string    `json:"id"`
+	Channel  string    `json:"channel"`
+	ThreadTS string    `json:"thread_ts"`
+	Session  string    `json:"session"`
+	At       time.Time `json:"at"`
+}
 
 type allowedUser struct {
 	ID    string `json:"id"`
@@ -28,22 +47,26 @@ type stateFile struct {
 	// one in Threads) to its session id.
 	Links   map[string]string `json:"links,omitempty"`
 	Allowed []allowedUser     `json:"allowed"`
+	// Replies lists delivered messages, oldest first.
+	Replies []replyRecord `json:"replies,omitempty"`
 }
 
-// state holds session threads and the allowlist. Every change is written
-// through to disk; changes are rare.
+// state holds session threads, delivered messages and the allowlist. Every
+// change is written through to disk; changes are rare (human-paced).
 type state struct {
 	path     string
+	now      func() time.Time
 	mu       sync.Mutex
 	threads  map[string]string // session id -> its first thread ts (agents post there)
 	sessions map[string]string // thread ts -> session id, for every linked thread
+	replies  []replyRecord     // delivered messages, oldest first, at most maxReplies
 	users    []allowedUser     // config users first
 }
 
 // loadState reads path; a missing file is an empty state. On a corrupt file it
 // returns an empty state and the error.
 func loadState(path string) (*state, error) {
-	st := &state{path: path, threads: map[string]string{}, sessions: map[string]string{}}
+	st := &state{path: path, now: time.Now, threads: map[string]string{}, sessions: map[string]string{}}
 	if path == "" {
 		return st, nil
 	}
@@ -64,6 +87,16 @@ func loadState(path string) (*state, error) {
 	}
 	for ts, sid := range file.Links {
 		st.sessions[ts] = sid
+	}
+	// Expired entries stay until the next recordReply drops them; lookups
+	// never return them.
+	for _, r := range file.Replies {
+		if r.ID != "" && r.ThreadTS != "" && r.Session != "" {
+			st.replies = append(st.replies, r)
+		}
+	}
+	if extra := len(st.replies) - maxReplies; extra > 0 {
+		st.replies = st.replies[extra:]
 	}
 	st.users = file.Allowed
 	return st, nil
@@ -224,11 +257,69 @@ func (st *state) setThread(sid, ts string) bool {
 	return first
 }
 
+// recordReply remembers that message msgID, from thread threadTS in channel,
+// was delivered to session sid. Expired entries are dropped, and the oldest
+// when there are more than maxReplies.
+func (st *state) recordReply(msgID, channel, threadTS, sid string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	now := st.now()
+	cutoff := now.Add(-replyTTL)
+	kept := st.replies[:0]
+	for _, r := range st.replies {
+		if r.At.After(cutoff) {
+			kept = append(kept, r)
+		}
+	}
+	kept = append(kept, replyRecord{ID: msgID, Channel: channel, ThreadTS: threadTS, Session: sid, At: now})
+	if extra := len(kept) - maxReplies; extra > 0 {
+		kept = kept[:copy(kept, kept[extra:])]
+	}
+	st.replies = kept
+	if errSave := st.saveLocked(); errSave != nil {
+		logSaveError(errSave)
+	}
+}
+
+// replyLocked finds the unexpired entry for msgID. The caller holds st.mu.
+func (st *state) replyLocked(msgID string) (replyRecord, bool) {
+	if msgID == "" {
+		return replyRecord{}, false
+	}
+	cutoff := st.now().Add(-replyTTL)
+	for i := len(st.replies) - 1; i >= 0; i-- {
+		if r := st.replies[i]; r.ID == msgID {
+			return r, r.At.After(cutoff)
+		}
+	}
+	return replyRecord{}, false
+}
+
+// replyThread returns the thread msgID came from when it was delivered to sid
+// and hasn't expired.
+func (st *state) replyThread(msgID, sid string) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	r, ok := st.replyLocked(msgID)
+	if !ok || r.Session != sid {
+		return "", false
+	}
+	return r.ThreadTS, true
+}
+
+// replyOwner returns the session an unexpired msgID was delivered to.
+func (st *state) replyOwner(msgID string) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	r, ok := st.replyLocked(msgID)
+	return r.Session, ok
+}
+
 func (st *state) saveLocked() error {
 	if st.path == "" {
 		return nil
 	}
-	file := stateFile{Threads: st.threads, Links: st.sessions}
+	file := stateFile{Threads: st.threads, Links: st.sessions, Replies: st.replies}
 	for _, u := range st.users {
 		if !u.config {
 			file.Allowed = append(file.Allowed, u)

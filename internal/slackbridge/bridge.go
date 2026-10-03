@@ -132,13 +132,17 @@ func (b *Bridge) postOutbound(ctx context.Context, o agentbus.Outbound) error {
 	return err
 }
 
-// threadFor picks the thread a session's post goes to: its own thread when it
-// has one. Otherwise it opens one by posting the session header, followed by
-// text when text isn't empty, at the top level; opened reports that, so the
-// caller doesn't post text again. Text and image posts both choose their
-// thread here. Only one caller per session checks and opens at a time, so a
-// session never gets two header posts.
+// threadFor picks the thread a session's post goes to: the thread o.ReplyTo
+// came from when that message was delivered to this session, else its own
+// thread when it has one. Otherwise it opens one by posting the session
+// header, followed by text when text isn't empty, at the top level; opened
+// reports that, so the caller doesn't post text again. Text and image posts
+// both choose their thread here. Only one caller per session checks and opens
+// at a time, so a session never gets two header posts.
 func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string) (ts string, opened bool, err error) {
+	if ts, ok := b.repliedThread(o); ok {
+		return ts, false, nil
+	}
 	unlock, errLock := b.lockOpening(ctx, o.SessionID)
 	if errLock != nil {
 		return "", false, errLock
@@ -157,6 +161,27 @@ func (b *Bridge) threadFor(ctx context.Context, o agentbus.Outbound, text string
 	}
 	b.state.setThread(o.SessionID, ts)
 	return ts, true, nil
+}
+
+// repliedThread returns the recorded thread of o.ReplyTo when that message
+// was delivered to o's session. An id delivered to another session is logged
+// (both addresses, never the body) and ignored. It runs without bridge locks
+// held, since it may ask the Store for the other session's address.
+func (b *Bridge) repliedThread(o agentbus.Outbound) (string, bool) {
+	if o.ReplyTo == "" {
+		return "", false
+	}
+	if ts, ok := b.state.replyThread(o.ReplyTo, o.SessionID); ok {
+		return ts, true
+	}
+	if owner, ok := b.state.replyOwner(o.ReplyTo); ok && owner != o.SessionID {
+		other := b.bus.Address(owner)
+		if other == "" {
+			other = "a session that has left the bus"
+		}
+		log.Warnf("slack: %s answered message %s, which went to %s; posting in its own thread instead", o.Address, o.ReplyTo, other)
+	}
+	return "", false
 }
 
 // openGate is a per-session lock that a waiter can give up on. refs counts
@@ -196,8 +221,9 @@ func (b *Bridge) lockOpening(ctx context.Context, sid string) (func(), error) {
 	}
 }
 
-// PostImage uploads an image into the session's own thread, opening the
-// thread first (header plus caption) when the session has none. It
+// PostImage uploads an image into the thread threadFor picks (the replied-to
+// thread or the session's own), opening the session's thread first (header
+// plus caption) when it has none. It
 // implements agentbus.ImagePoster and runs in the caller's goroutine, not on
 // the job queue, so the caller gets Slack's answer. The returned error is
 // only a short code (Slack's error code, or request_failed); the details are
