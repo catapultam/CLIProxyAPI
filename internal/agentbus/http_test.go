@@ -34,8 +34,8 @@ func do(r http.Handler, method, path, body string) *httptest.ResponseRecorder {
 
 func TestHTTPSendThenInbox(t *testing.T) {
 	s, r := newTestServer(t)
-	s.Hello(sidA, "pc", "/a", "")
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.Hello(sidB, "pc", "/b", "", true)
 	w := do(r, http.MethodPost, "/v1/agentbus/send", `{"from_session":"`+sidA+`","to":"`+s.Address(sidB)+`","body":"hi"}`)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"m_`) {
 		t.Fatalf("send = %d %s", w.Code, w.Body)
@@ -51,7 +51,7 @@ func TestHTTPSendThenInbox(t *testing.T) {
 
 func TestHTTPSendErrors(t *testing.T) {
 	s, r := newTestServer(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if w := do(r, http.MethodPost, "/v1/agentbus/send", `{"from_session":"`+sidA+`","to":"ghost","body":"x"}`); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown target = %d", w.Code)
 	}
@@ -65,7 +65,7 @@ func TestHTTPSendErrors(t *testing.T) {
 
 func TestHTTPWaitReturnsPendingImmediately(t *testing.T) {
 	s, r := newTestServer(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if _, err := s.Send(sidA, s.Address(sidA), "queued", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +78,8 @@ func TestHTTPWaitReturnsPendingImmediately(t *testing.T) {
 func TestHTTPWaitBlocksUntilSend(t *testing.T) {
 	s, r := newTestServer(t)
 	s.waitTimeout = 5 * time.Second
-	s.Hello(sidA, "pc", "/a", "")
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.Hello(sidB, "pc", "/b", "", true)
 	done := make(chan *httptest.ResponseRecorder)
 	go func() { done <- do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidB, "") }()
 	time.Sleep(100 * time.Millisecond)
@@ -98,7 +98,7 @@ func TestHTTPWaitBlocksUntilSend(t *testing.T) {
 
 func TestHTTPWaitTimesOut(t *testing.T) {
 	s, r := newTestServer(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA, ""); w.Code != http.StatusNoContent {
 		t.Fatalf("wait = %d", w.Code)
 	}
@@ -107,7 +107,7 @@ func TestHTTPWaitTimesOut(t *testing.T) {
 func TestHTTPNewerWaiterSupersedesOlder(t *testing.T) {
 	s, r := newTestServer(t)
 	s.waitTimeout = 5 * time.Second
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	var wg sync.WaitGroup
 	results := make([]*httptest.ResponseRecorder, 2)
 	wg.Add(1)
@@ -128,6 +128,55 @@ func TestHTTPNewerWaiterSupersedesOlder(t *testing.T) {
 	}
 }
 
+func TestHTTPHelloMarksModOnlyWithMarker(t *testing.T) {
+	s, r := newTestServer(t)
+	if w := do(r, http.MethodPost, "/v1/agentbus/hello", `{"session":"`+sidA+`","machine":"pc","cwd":"/a"}`); w.Code != http.StatusOK {
+		t.Fatalf("hello = %d %s", w.Code, w.Body)
+	}
+	if modOf(s, sidA) {
+		t.Fatal("hello without the mod marker set Mod")
+	}
+	if w := do(r, http.MethodPost, "/v1/agentbus/hello", `{"session":"`+sidA+`","machine":"pc","cwd":"/a","mod":true}`); w.Code != http.StatusOK {
+		t.Fatalf("hello = %d %s", w.Code, w.Body)
+	}
+	if !modOf(s, sidA) {
+		t.Fatal("hello with the mod marker did not set Mod")
+	}
+}
+
+func TestHTTPWaitMarksModOnlyWithMarker(t *testing.T) {
+	s, r := newTestServer(t)
+	if w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA, ""); w.Code != http.StatusNoContent {
+		t.Fatalf("wait = %d", w.Code)
+	}
+	if modOf(s, sidA) {
+		t.Fatal("wait without the mod marker set Mod")
+	}
+	if w := do(r, http.MethodGet, "/v1/agentbus/wait?session="+sidA+"&mod=1", ""); w.Code != http.StatusNoContent {
+		t.Fatalf("wait = %d", w.Code)
+	}
+	if !modOf(s, sidA) {
+		t.Fatal("wait with the mod marker did not set Mod")
+	}
+}
+
+func TestHTTPBye(t *testing.T) {
+	s, r := newTestServer(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.NewWaiter(sidA)
+	if w := do(r, http.MethodPost, "/v1/agentbus/bye", `{"session":"`+sidA+`"}`); w.Code != http.StatusNoContent {
+		t.Fatalf("bye = %d %s", w.Code, w.Body)
+	}
+	for _, p := range s.Peers() {
+		if p.Address == s.Address(sidA) {
+			t.Fatalf("session still listed after bye: %+v", p)
+		}
+	}
+	if w := do(r, http.MethodPost, "/v1/agentbus/bye", `{"session":""}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty session bye = %d", w.Code)
+	}
+}
+
 func TestHTTPSetupRoutesRemoved(t *testing.T) {
 	_, r := newTestServer(t)
 	if w := do(r, http.MethodGet, "/v1/agentbus/setup", ""); w.Code != http.StatusNotFound {
@@ -140,7 +189,7 @@ func TestHTTPSetupRoutesRemoved(t *testing.T) {
 
 func TestHTTPNameAndHello(t *testing.T) {
 	s, r := newTestServer(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if w := do(r, http.MethodPost, "/v1/agentbus/hello", `{"session":"`+sidB+`","machine":"fedora","cwd":"/srv/ci","name":"ci"}`); w.Code != http.StatusOK {
 		t.Fatalf("hello = %d %s", w.Code, w.Body)
 	}

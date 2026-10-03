@@ -23,6 +23,7 @@ func (s *Store) Register(group *gin.RouterGroup) {
 	group.GET("/inbox", s.handleInbox)
 	group.POST("/hello", s.handleHello)
 	group.GET("/wait", s.handleWait)
+	group.POST("/bye", s.handleBye)
 }
 
 func (s *Store) handlePeers(c *gin.Context) {
@@ -97,6 +98,7 @@ type helloRequest struct {
 	Machine string `json:"machine"`
 	Cwd     string `json:"cwd"`
 	Name    string `json:"name"`
+	Mod     bool   `json:"mod"`
 }
 
 func (s *Store) handleHello(c *gin.Context) {
@@ -105,8 +107,25 @@ func (s *Store) handleHello(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
 		return
 	}
-	s.Hello(strings.TrimSpace(req.Session), req.Machine, req.Cwd, req.Name)
+	s.Hello(strings.TrimSpace(req.Session), req.Machine, req.Cwd, req.Name, req.Mod)
 	c.JSON(http.StatusOK, gin.H{"address": s.Address(strings.TrimSpace(req.Session))})
+}
+
+type byeRequest struct {
+	Session string `json:"session"`
+}
+
+// handleBye marks a session closed so it drops out of Peers. An unknown
+// session id is accepted but ignored (no session is created); only an empty
+// session id is a 400.
+func (s *Store) handleBye(c *gin.Context) {
+	var req byeRequest
+	if errBind := c.ShouldBindJSON(&req); errBind != nil || strings.TrimSpace(req.Session) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
+		return
+	}
+	s.Bye(strings.TrimSpace(req.Session))
+	c.Status(http.StatusNoContent)
 }
 
 // handleWait long-polls for messages. It returns 200 with the claimed
@@ -118,7 +137,7 @@ func (s *Store) handleWait(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "session is required"})
 		return
 	}
-	s.Hello(id, c.Query("machine"), c.Query("cwd"), c.Query("name"))
+	s.Hello(id, c.Query("machine"), c.Query("cwd"), c.Query("name"), c.Query("mod") == "1")
 	gen := s.NewWaiter(id)
 	timeout := s.waitTimeout
 	if timeout <= 0 {

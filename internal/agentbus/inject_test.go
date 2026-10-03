@@ -71,7 +71,7 @@ func TestInjectNoteIntoStringContentOnFirstRequest(t *testing.T) {
 
 func TestInjectAppendsBlockAfterToolResult(t *testing.T) {
 	s, r, got := newInjectServer(t, &fakeClock{now: t0})
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidB, "pc", "/b", "", true)
 	if _, err := s.Send(sidB, "unknown/session-aaaaaa", "x", ""); err == nil {
 		t.Fatal("send to an unseen session should fail")
 	}
@@ -85,7 +85,7 @@ func TestInjectAppendsBlockAfterToolResult(t *testing.T) {
 func TestInjectDeliversMessagesOnce(t *testing.T) {
 	s, r, got := newInjectServer(t, &fakeClock{now: t0})
 	post(r, sidA, "", stringContentBody) // first request: note only
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidB, "pc", "/b", "", true)
 	if _, err := s.Send(sidB, s.Address(sidA), "please review PR 12", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestInjectDeliversMessagesOnce(t *testing.T) {
 
 func TestInjectSkipsSubagentRequests(t *testing.T) {
 	s, r, got := newInjectServer(t, &fakeClock{now: t0})
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidB, "pc", "/b", "", true)
 	post(r, sidA, "", stringContentBody)
 	if _, err := s.Send(sidB, s.Address(sidA), "for the main thread", ""); err != nil {
 		t.Fatal(err)
@@ -117,7 +117,7 @@ func TestInjectSkipsSubagentRequests(t *testing.T) {
 
 func TestInjectReturnsMessagesWhenRequestFails(t *testing.T) {
 	s, r, got := newInjectServer(t, &fakeClock{now: t0})
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidB, "pc", "/b", "", true)
 	post(r, sidA, "", stringContentBody)
 	if _, err := s.Send(sidB, s.Address(sidA), "do not lose me", ""); err != nil {
 		t.Fatal(err)
@@ -136,7 +136,7 @@ func TestInjectReturnsMessagesWhenRequestFails(t *testing.T) {
 
 func TestInjectLeavesBodyAloneWhenLastMessageNotUser(t *testing.T) {
 	s, r, got := newInjectServer(t, &fakeClock{now: t0})
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidB, "pc", "/b", "", true)
 	post(r, sidA, "", stringContentBody)
 	if _, err := s.Send(sidB, s.Address(sidA), "keep", ""); err != nil {
 		t.Fatal(err)
@@ -175,7 +175,7 @@ func TestInjectNeverMentionsTheRetiredHook(t *testing.T) {
 	}
 
 	clock.Advance(3 * time.Minute)
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidB, "pc", "/b", "", true)
 	if _, err := s.Send(sidB, s.Address(sidA), "nightly build", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func assertNoHookMention(t *testing.T, body string) {
 func TestInjectNoteAgainWhenPeersChange(t *testing.T) {
 	s, r, got := newInjectServer(t, &fakeClock{now: t0})
 	post(r, sidA, "", stringContentBody)
-	s.Hello(sidB, "fedora", "/srv/ci", "ci")
+	s.Hello(sidB, "fedora", "/srv/ci", "ci", true)
 	post(r, sidA, "", stringContentBody)
 	if !strings.Contains(got.body, "ci (fedora/ci-bbbbbb)") {
 		t.Fatalf("new peer not announced: %s", got.body)
@@ -227,7 +227,7 @@ func bodyText(t *testing.T, body string) string {
 
 func TestInjectModSessionGetsListAgentsInstructions(t *testing.T) {
 	s, r, got := newInjectServer(t, &fakeClock{now: t0})
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	post(r, sidA, "", stringContentBody)
 	text := bodyText(t, got.body)
 	if !strings.Contains(text, "ListAgents") || !strings.Contains(text, `SendMessage, to: "agentbus:<address>"`) {
@@ -259,7 +259,7 @@ func TestInjectResendsNoteWhenModStarts(t *testing.T) {
 		t.Fatalf("first note should use curl instructions: %s", got.body)
 	}
 
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	post(r, sidA, "", stringContentBody)
 	if strings.Contains(got.body, "curl") {
 		t.Fatalf("note not re-sent after mod started: %s", got.body)

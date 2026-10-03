@@ -33,7 +33,7 @@ func TestAddressBeforeAndAfterHello(t *testing.T) {
 	if got := s.Address(sidA); got != "unknown/session-aaaaaa" {
 		t.Fatalf("address = %q", got)
 	}
-	s.Hello(sidA, "My-PC", `C:\Users\alex\Some Project`, "")
+	s.Hello(sidA, "My-PC", `C:\Users\alex\Some Project`, "", true)
 	if got := s.Address(sidA); got != "my-pc/some-project-aaaaaa" {
 		t.Fatalf("address = %q", got)
 	}
@@ -41,8 +41,8 @@ func TestAddressBeforeAndAfterHello(t *testing.T) {
 
 func TestNamesAreUniqueAndResolve(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/home/a/proj", "")
-	s.Hello(sidB, "fedora", "/srv/ci", "")
+	s.Hello(sidA, "pc", "/home/a/proj", "", true)
+	s.Hello(sidB, "fedora", "/srv/ci", "", true)
 	if err := s.SetName(sidA, "Builder"); err != nil {
 		t.Fatal(err)
 	}
@@ -65,8 +65,8 @@ func TestNamesAreUniqueAndResolve(t *testing.T) {
 
 func TestHelloNameIgnoredWhenTaken(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "ci")
-	s.Hello(sidB, "pc", "/b", "ci")
+	s.Hello(sidA, "pc", "/a", "ci", true)
+	s.Hello(sidB, "pc", "/b", "ci", true)
 	if id, _ := s.Resolve("ci"); id != sidA {
 		t.Fatalf("name moved to %q", id)
 	}
@@ -74,8 +74,8 @@ func TestHelloNameIgnoredWhenTaken(t *testing.T) {
 
 func TestSendClaimReturn(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "")
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.Hello(sidB, "pc", "/b", "", true)
 	m1, err := s.Send(sidA, s.Address(sidB), "first", "")
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func TestSendClaimReturn(t *testing.T) {
 
 func TestSendErrors(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if _, err := s.Send(sidA, "nobody", "x", ""); !errors.Is(err, ErrUnknownTarget) {
 		t.Fatalf("err = %v", err)
 	}
@@ -121,7 +121,7 @@ func TestStatusTransitions(t *testing.T) {
 	if st := peerStatus(t, s, sidA); st != StatusAway {
 		t.Fatalf("status = %s", st)
 	}
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if st := peerStatus(t, s, sidA); st != StatusIdle {
 		t.Fatalf("status = %s", st)
 	}
@@ -135,8 +135,15 @@ func TestStatusTransitions(t *testing.T) {
 		t.Fatalf("status after waiter gone = %s", st)
 	}
 	clock.Advance(31 * time.Minute)
-	if st := peerStatus(t, s, sidA); st != StatusOffline {
+	// Peers() no longer lists offline sessions, so check the status directly
+	// instead of through peerStatus (which looks the address up in Peers()).
+	if st := statusOf(s, sidA); st != StatusOffline {
 		t.Fatalf("status = %s", st)
+	}
+	for _, p := range s.Peers() {
+		if strings.HasSuffix(p.Address, "-aaaaaa") {
+			t.Fatal("offline session still listed")
+		}
 	}
 	clock.Advance(25 * time.Hour)
 	for _, p := range s.Peers() {
@@ -157,9 +164,151 @@ func peerStatus(t *testing.T, s *Store, id string) string {
 	return ""
 }
 
+// statusOf reads a session's status directly, including offline sessions
+// that Peers() would no longer list.
+func statusOf(s *Store, id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[id]
+	if !ok {
+		return ""
+	}
+	return s.statusLocked(sess, s.now())
+}
+
+func sessionExists(s *Store, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.byID[id]
+	return ok
+}
+
+func modOf(s *Store, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[id]
+	return ok && sess.Mod
+}
+
+func listedAddresses(s *Store) map[string]bool {
+	out := make(map[string]bool)
+	for _, p := range s.Peers() {
+		out[p.Address] = true
+	}
+	return out
+}
+
+func TestInteractiveWaiterLeaseExpires(t *testing.T) {
+	s, clock := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.NewWaiter(sidA)
+	if st := statusOf(s, sidA); st != StatusIdle {
+		t.Fatalf("status = %s", st)
+	}
+	clock.Advance(89 * time.Second)
+	if st := statusOf(s, sidA); st != StatusIdle {
+		t.Fatalf("status before lease expiry = %s", st)
+	}
+	if !listedAddresses(s)[s.Address(sidA)] {
+		t.Fatal("fresh waiter not listed")
+	}
+	clock.Advance(2 * time.Second) // 91s since the waiter last refreshed
+	if st := statusOf(s, sidA); st != StatusOffline {
+		t.Fatalf("status after lease expiry = %s", st)
+	}
+	if listedAddresses(s)[s.Address(sidA)] {
+		t.Fatal("expired waiter still listed")
+	}
+	if !sessionExists(s, sidA) {
+		t.Fatal("expired waiter's session id is no longer resolvable")
+	}
+}
+
+func TestByeMakesSessionOfflineImmediately(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.NewWaiter(sidA)
+	s.Bye(sidA)
+	if st := statusOf(s, sidA); st != StatusOffline {
+		t.Fatalf("status after bye = %s", st)
+	}
+	if listedAddresses(s)[s.Address(sidA)] {
+		t.Fatal("session still listed after bye")
+	}
+	if !sessionExists(s, sidA) {
+		t.Fatal("closed session id is no longer resolvable")
+	}
+}
+
+func TestByeUnknownSessionDoesNotCreateOne(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Bye(sidA)
+	if sessionExists(s, sidA) {
+		t.Fatal("bye created a session for an unknown id")
+	}
+}
+
+func TestHelloAfterByeReopensSession(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.Bye(sidA)
+	if st := statusOf(s, sidA); st != StatusOffline {
+		t.Fatalf("status after bye = %s", st)
+	}
+	s.Hello(sidA, "pc", "/a", "", true)
+	if st := statusOf(s, sidA); st != StatusIdle {
+		t.Fatalf("status after hello reopened the session = %s", st)
+	}
+}
+
+// TestNonInteractiveModSessionKeepsAwayBehaviour covers a mod session that
+// never long-polls (Hello only, then plain Touch requests): it should still
+// age from idle to away to offline on the old schedule, not the lease.
+func TestNonInteractiveModSessionKeepsAwayBehaviour(t *testing.T) {
+	s, clock := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	if st := statusOf(s, sidA); st != StatusIdle {
+		t.Fatalf("status = %s", st)
+	}
+	clock.Advance(3 * time.Minute)
+	s.Touch(sidA)
+	if st := statusOf(s, sidA); st != StatusAway {
+		t.Fatalf("status after waiter window passed = %s", st)
+	}
+	clock.Advance(31 * time.Minute)
+	if st := statusOf(s, sidA); st != StatusOffline {
+		t.Fatalf("status = %s", st)
+	}
+}
+
+func TestClosedAndWaitsPersistThroughSaveLoad(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.NewWaiter(sidA)
+	s.Bye(sidA)
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"waits":true`) || !strings.Contains(string(data), `"closed":true`) {
+		t.Fatalf("saved state missing lease fields: %s", data)
+	}
+	clock := &fakeClock{now: t0}
+	r := NewStore(s.path, clock.Now)
+	if err := r.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if st := statusOf(r, sidA); st != StatusOffline {
+		t.Fatalf("status after reload = %s", st)
+	}
+}
+
 func TestMessagesExpireAfterSevenDays(t *testing.T) {
 	s, clock := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if _, err := s.Send(sidA, s.Address(sidA), "old", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -171,8 +320,8 @@ func TestMessagesExpireAfterSevenDays(t *testing.T) {
 
 func TestPersistenceRoundTrip(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "builder")
-	s.Hello(sidB, "pc", "/b", "")
+	s.Hello(sidA, "pc", "/a", "builder", true)
+	s.Hello(sidB, "pc", "/b", "", true)
 	if _, err := s.Send(sidB, "builder", "persist me", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +363,7 @@ func TestLoadIgnoresLegacySetupHinted(t *testing.T) {
 
 func TestModPersistsThroughSaveLoad(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	if err := s.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -225,11 +374,39 @@ func TestModPersistsThroughSaveLoad(t *testing.T) {
 	if !strings.Contains(string(data), `"mod":true`) {
 		t.Fatalf("saved state missing mod flag: %s", data)
 	}
+	clock := &fakeClock{now: t0}
+	r := NewStore(s.path, clock.Now)
+	if err := r.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if !modOf(r, sidA) {
+		t.Fatal("mod flag not restored after load")
+	}
+}
+
+// TestHelloMarksModOnlyWithExplicitMarker covers the fix for Hello setting
+// Mod for any caller: curl and the legacy wait.sh hook can reach /hello and
+// /wait too, so only an explicit marker may set Mod, and it is never cleared
+// back to false afterward.
+func TestHelloMarksModOnlyWithExplicitMarker(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello(sidA, "pc", "/a", "", false)
+	if modOf(s, sidA) {
+		t.Fatal("hello without the marker set Mod")
+	}
+	s.Hello(sidA, "pc", "/a", "", true)
+	if !modOf(s, sidA) {
+		t.Fatal("hello with the marker did not set Mod")
+	}
+	s.Hello(sidA, "pc", "/a", "", false)
+	if !modOf(s, sidA) {
+		t.Fatal("a later hello without the marker cleared Mod")
+	}
 }
 
 func TestNotifyFiresOnSend(t *testing.T) {
 	s, _ := newTestStore(t)
-	s.Hello(sidA, "pc", "/a", "")
+	s.Hello(sidA, "pc", "/a", "", true)
 	ch := s.Notify(sidA)
 	if _, err := s.Send(sidA, s.Address(sidA), "ping", ""); err != nil {
 		t.Fatal(err)

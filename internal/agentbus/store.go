@@ -26,6 +26,7 @@ const (
 	idleWithin      = 2 * time.Minute
 	awayWithin      = 30 * time.Minute
 	offlineListFor  = 24 * time.Hour
+	leaseTTL        = 90 * time.Second
 	unknownMachine  = "unknown"
 	fallbackFolder  = "session"
 	addressIDLength = 6
@@ -78,6 +79,8 @@ type session struct {
 	LastRequest time.Time `json:"last_request"`
 	WaiterSeen  time.Time `json:"waiter_seen"`
 	Mod         bool      `json:"mod,omitempty"`
+	Waits       bool      `json:"waits,omitempty"`
+	Closed      bool      `json:"closed,omitempty"`
 	NoteSent    bool      `json:"note_sent,omitempty"`
 	NotedPeers  string    `json:"noted_peers,omitempty"`
 	Inbox       []Message `json:"inbox,omitempty"`
@@ -129,7 +132,9 @@ func (s *Store) Touch(id string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.get(id).LastRequest = s.now()
+	sess := s.get(id)
+	sess.LastRequest = s.now()
+	sess.Closed = false
 	s.dirty = true
 }
 
@@ -149,17 +154,23 @@ func (s *Store) EndRequest(id string) {
 }
 
 // Hello records what a client reports: machine, cwd and an optional friendly
-// name. A name already used by another session is ignored. Hello is only
-// ever called by the agentbus mod (POST /hello at session start, GET /wait
-// on every long-poll), so reaching it marks the session as running the mod.
-func (s *Store) Hello(id, machine, cwd, name string) {
+// name. A name already used by another session is ignored. /hello and /wait
+// are also reachable from curl and the legacy wait.sh hook, so reaching this
+// method does not by itself mean the agentbus mod is running: mod is true
+// only when the caller sent an explicit marker (the /hello body's "mod"
+// field, or /wait's "mod=1" query parameter). Once set, Mod is never cleared
+// back to false.
+func (s *Store) Hello(id, machine, cwd, name string, mod bool) {
 	if id == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess := s.get(id)
-	sess.Mod = true
+	if mod {
+		sess.Mod = true
+	}
+	sess.Closed = false
 	if machine = strings.TrimSpace(machine); machine != "" {
 		sess.Machine = machine
 	}
@@ -174,11 +185,16 @@ func (s *Store) Hello(id, machine, cwd, name string) {
 }
 
 func (s *Store) nameFree(name, exceptID string) bool {
+	now := s.now()
+	lower := strings.ToLower(name)
 	for id, other := range s.byID {
-		if id != exceptID && strings.EqualFold(other.Name, name) {
+		if id == exceptID || s.statusLocked(other, now) == StatusOffline {
+			continue
+		}
+		if strings.EqualFold(other.Name, name) {
 			return false
 		}
-		if id != exceptID && s.addressLocked(other) == strings.ToLower(name) {
+		if s.addressLocked(other) == lower {
 			return false
 		}
 	}
@@ -388,6 +404,8 @@ func (s *Store) NewWaiter(id string) uint64 {
 	sess := s.get(id)
 	sess.waiterGen++
 	sess.WaiterSeen = s.now()
+	sess.Waits = true
+	sess.Closed = false
 	return sess.waiterGen
 }
 
@@ -404,10 +422,35 @@ func (s *Store) WaiterCurrent(id string, gen uint64) bool {
 	return true
 }
 
+// Bye marks a known session as closed, so it reports offline immediately and
+// drops out of Peers. Unknown ids are ignored; Bye never creates a session.
+// The session itself stays in byID (as an offline entry) so its id remains
+// resolvable afterward.
+func (s *Store) Bye(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.byID[id]
+	if !ok {
+		return
+	}
+	sess.Closed = true
+	s.dirty = true
+}
+
 func (s *Store) statusLocked(sess *session, now time.Time) string {
 	switch {
+	case sess.Closed:
+		return StatusOffline
 	case sess.inflight > 0:
 		return StatusBusy
+	case sess.Waits:
+		// The lease is the waiter: an interactive session whose waiter
+		// stopped refreshing for leaseTTL is gone, even if it made a plain
+		// request more recently.
+		if now.Sub(sess.WaiterSeen) <= leaseTTL {
+			return StatusIdle
+		}
+		return StatusOffline
 	case now.Sub(sess.WaiterSeen) <= idleWithin:
 		return StatusIdle
 	case now.Sub(sess.lastSeen()) <= awayWithin:
@@ -417,14 +460,15 @@ func (s *Store) statusLocked(sess *session, now time.Time) string {
 	}
 }
 
-// Peers lists sessions seen within the last day, most recent first.
+// Peers lists sessions that are not offline, most recent first.
 func (s *Store) Peers() []Peer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
 	out := make([]Peer, 0, len(s.byID))
 	for _, sess := range s.byID {
-		if now.Sub(sess.lastSeen()) > offlineListFor && sess.inflight == 0 {
+		status := s.statusLocked(sess, now)
+		if status == StatusOffline {
 			continue
 		}
 		machine := sess.Machine
@@ -436,7 +480,7 @@ func (s *Store) Peers() []Peer {
 			Name:     sess.Name,
 			Machine:  machine,
 			Cwd:      sess.Cwd,
-			Status:   s.statusLocked(sess, now),
+			Status:   status,
 			LastSeen: sess.lastSeen(),
 		})
 	}
