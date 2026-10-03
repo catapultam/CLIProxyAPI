@@ -16,11 +16,22 @@ const PEERS = [
 
 type Call = { url: string; method: string; body: unknown; auth: string | undefined }
 
-function wire($: unknown, on: Parameters<Parameters<typeof test>[1]>[1], waits: Array<{ status: number; text: string }>) {
+const DEFAULT_SESSION_ID = '3a9e9c5c-0000-0000-0000-000000000000'
+
+// session is a mutable box so a test can change what $.session.id() answers
+// mid-test (simulating /clear, /resume, or /branch), the way wire()'s other
+// stubs are fixed at setup time.
+function wire(
+  $: unknown,
+  on: Parameters<Parameters<typeof test>[1]>[1],
+  waits: Array<{ status: number; text: string }>,
+  session: { id: string } = { id: DEFAULT_SESSION_ID },
+) {
   const calls: Call[] = []
   mock.env(on, ENV)
-  on('session.id', () => ({ value: '3a9e9c5c-0000-0000-0000-000000000000' }))
+  on('session.id', () => ({ value: session.id }))
   on('session.start', () => ({ cwd: 'C:/work/comms' }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('ui.log', () => ({ value: undefined }))
   on('http.fetch', (_$, e) => {
     const method = e.init?.method ?? 'GET'
@@ -28,6 +39,7 @@ function wire($: unknown, on: Parameters<Parameters<typeof test>[1]>[1], waits: 
     if (e.url.endsWith('/hello')) return { value: { status: 200, ok: true, headers: {}, text: '{"address":"cplt-4a/comms-3a9e9c"}' } }
     if (e.url.endsWith('/peers')) return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ peers: PEERS }) } }
     if (e.url.endsWith('/send')) return { value: { status: 200, ok: true, headers: {}, text: '{"id":"m_1","to":"shoggoth/art-0f7de4"}' } }
+    if (e.url.endsWith('/bye')) return { value: { status: 204, ok: true, headers: {}, text: '' } }
     if (e.url.includes('/wait?')) {
       const next = waits.shift() ?? { status: 204, text: '' }
       return { value: { ...next, ok: next.status < 300, headers: {} } }
@@ -93,4 +105,38 @@ test('a non-interactive session never long-polls', async ($, on) => {
   await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
   await clock.advance(5000)
   expect(calls.some(c => c.url.includes('/wait?'))).toBe(false)
+})
+
+test('session.end with prompt_input_exit says bye and stops the wait loop', async ($, on) => {
+  const clock = mock.clock(on)
+  const calls = wire($, on, [])
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: DEFAULT_SESSION_ID, resume: { id: DEFAULT_SESSION_ID } })
+  const bye = calls.find(c => c.url.endsWith('/bye'))
+  expect(bye?.body).toEqual({ session: DEFAULT_SESSION_ID })
+
+  calls.length = 0
+  await clock.advance(5000)
+  expect(calls.some(c => c.url.includes('/wait?'))).toBe(false)
+})
+
+test('session.end with clear says bye, then the next tick follows the session to its new id', async ($, on) => {
+  const clock = mock.clock(on)
+  const session = { id: DEFAULT_SESSION_ID }
+  const calls = wire($, on, [], session)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+
+  await $.session.end({ reason: 'clear', sessionId: session.id, resume: { id: session.id } })
+  const bye = calls.find(c => c.url.endsWith('/bye'))
+  expect(bye?.body).toEqual({ session: DEFAULT_SESSION_ID })
+
+  // /clear doesn't fire session.start again; the next tick has to notice the new id itself.
+  session.id = 'cleared1-0000-0000-0000-000000000000'
+  calls.length = 0
+  await clock.advance(1000)
+  const hello = calls.find(c => c.url.endsWith('/hello'))
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true })
+  const wait = calls.find(c => c.url.includes('/wait?'))
+  expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })

@@ -15,6 +15,9 @@ let machine = ''
 let address = ''
 let isWaiting = false
 let retryAt = 0
+// Set once session.end fires for a reason other than 'clear' or 'resume'
+// (the session is really going away), so the polling tick stops for good.
+let ended = false
 
 async function bus($: EngineInterface, method: string, path: string, body?: object) {
   const res = await $.http.fetch(`${base}/v1/agentbus${path}`, {
@@ -59,7 +62,7 @@ export function formatMessage(m: BusMessage): string {
 }
 
 async function waitOnce($: EngineInterface) {
-  const query = `?session=${encodeURIComponent(session)}&machine=${encodeURIComponent(machine)}`
+  const query = `?session=${encodeURIComponent(session)}&machine=${encodeURIComponent(machine)}&mod=1`
   const { status, json } = await bus($, 'GET', `/wait${query}`)
   if (status === 200) {
     for (const m of ((json?.messages as BusMessage[]) ?? [])) {
@@ -77,9 +80,10 @@ export const register: Register = on => {
     token = (await $.env.get('ANTHROPIC_AUTH_TOKEN')) ?? ''
     machine = ((await $.env.get('COMPUTERNAME')) ?? (await $.env.get('HOSTNAME')) ?? 'unknown').toLowerCase()
     session = await $.session.id()
+    ended = false
     if (base && token && session) {
       try {
-        const { json } = await bus($, 'POST', '/hello', { session, machine, cwd: e.cwd })
+        const { json } = await bus($, 'POST', '/hello', { session, machine, cwd: e.cwd, mod: true })
         address = (json?.address as string) ?? ''
       } catch {
         address = ''
@@ -89,6 +93,19 @@ export const register: Register = on => {
       // what it claimed.
       if (e.isInteractive) {
         $.clock.every(1000, async () => {
+          if (ended) return
+          // /clear, /resume, and /branch don't fire session.start again, so catch the id change
+          // here and re-register with the bus under the new session.
+          const current = await $.session.id()
+          if (current && current !== session) {
+            session = current
+            try {
+              const { json } = await bus($, 'POST', '/hello', { session, machine, mod: true })
+              address = (json?.address as string) ?? ''
+            } catch {
+              address = ''
+            }
+          }
           if (isWaiting || (await $.clock.now()) < retryAt) return
           isWaiting = true
           try {
@@ -100,6 +117,20 @@ export const register: Register = on => {
           }
         })
       }
+    }
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    try {
+      await Promise.race([bus($, 'POST', '/bye', { session }), $.clock.sleep(1000)])
+    } catch {
+      // Exiting; nothing to do about a failed bye.
+    }
+    // /clear, /resume, and /branch keep the session going under a new id, so only a real end
+    // (closing the terminal, /logout, etc.) stops the polling tick for good.
+    if (e.reason !== 'clear' && e.reason !== 'resume') {
+      ended = true
     }
     return next(e)
   })

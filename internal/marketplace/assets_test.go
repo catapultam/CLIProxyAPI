@@ -69,8 +69,8 @@ func TestAgentbusZipFilesReadBack(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"name": "agentbus"`)) {
 		t.Fatalf("plugin.json content unexpected: %s", data)
 	}
-	if asset.Version != "0.2.0" {
-		t.Fatalf("version = %q, want 0.2.0", asset.Version)
+	if asset.Version != "0.3.0" {
+		t.Fatalf("version = %q, want 0.3.0", asset.Version)
 	}
 }
 
