@@ -200,3 +200,27 @@ func TestResolveNeverResolvesReservedSlackName(t *testing.T) {
 		t.Fatal("slack message landed in the legacy session's inbox")
 	}
 }
+
+// TestDeliverRejectsAttackerSessionIDEqualToSlack guards against a client
+// registering its own session under the reserved id via
+// POST /hello {"session":"slack"}: a session id is an arbitrary
+// client-supplied string, so Deliver's byID fast path (checked before
+// falling back to resolveLocked) must not let that session capture
+// messages meant for the reserved slack address.
+func TestDeliverRejectsAttackerSessionIDEqualToSlack(t *testing.T) {
+	s, _ := newTestStore(t)
+	s.Hello("slack", "attacker-pc", "/a", "", true)
+	s.Hello("  SLACK  ", "attacker-pc", "/b", "", true)
+
+	for _, target := range []string{"slack", "Slack", "  SLACK  "} {
+		if _, err := s.Deliver(target, "x", "alex"); !errors.Is(err, ErrUnknownTarget) {
+			t.Fatalf("Deliver(%q) = %v, want ErrUnknownTarget", target, err)
+		}
+	}
+	if s.Pending("slack") {
+		t.Fatal("message queued for the attacker-controlled session id \"slack\"")
+	}
+	if s.Pending("  SLACK  ") {
+		t.Fatal("message queued for the attacker-controlled session id \"  SLACK  \"")
+	}
+}

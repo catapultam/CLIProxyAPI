@@ -47,6 +47,13 @@ func (s *Store) Deliver(target, body, slackUser string) (string, error) {
 	if len(body) > MaxBodyBytes {
 		return "", ErrBodyTooLarge
 	}
+	if isSlackAddress(target) {
+		// A session id is whatever the client sends in /hello, so a client
+		// could register "slack" as its own session id and otherwise reach
+		// this through the byID fast path below. Reject it the same way
+		// resolveLocked rejects the name/address forms.
+		return "", ErrUnknownTarget
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := strings.TrimSpace(target)
