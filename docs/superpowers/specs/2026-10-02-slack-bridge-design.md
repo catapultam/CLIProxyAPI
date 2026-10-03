@@ -37,12 +37,13 @@ have to go through agentbus to wake an idle session.
   address (`flyer: do X`). Anything else gets a short bot reply in thread
   explaining how to address an agent.
 - **Managing allowed users, in Slack.** Nobody looks up Slack IDs. The config
-  seeds the allowlist by email. After that, any allowed user posts top-level
+  seeds the allowlist by email. After that, a config-seeded user (an owner) posts top-level
   `@agents allow @jane` or `@agents remove @jane` in the channel. A Slack
   mention carries the user ID in the raw text (`<@U…>`), so the bridge gets the
   ID from the mention itself. The bot confirms in thread. Users seeded from
   config can't be removed from Slack (edit config instead), so nobody can lock
-  Alex out.
+  Alex out. Users added from Slack can instruct agents but can't run `allow`
+  or `remove`, so access can't chain. Every allow/remove is logged.
 - **Labels.** Each allowed user has a short label: the email's local part for
   config users, and for Slack-added users their Slack display name *as of when
   they were allowed*, frozen and made unique (`jane`, `jane2`). Labels are only

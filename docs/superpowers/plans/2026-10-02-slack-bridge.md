@@ -22,6 +22,7 @@
 - Lock rule: `agentbus.Store` calls `Bridge` methods without holding `s.mu`. The bridge never calls into the store while holding its own lock.
 - `from_user` is set only by `Store.Deliver`, which only the bridge calls. `POST /v1/agentbus/send` must never set it.
 - The allowlist is matched on Slack user ID only. Labels are display-only.
+- Only config-seeded users (owners) can run `allow`/`remove`; Slack-added users can instruct agents but not grant access. Every allow/remove is logged and confirmed in thread.
 - Reserved bus address: `slack` (constant `agentbus.SlackAddress`).
 - Message body cap is the existing `agentbus.MaxBodyBytes` (16 KiB).
 - comms' session-lease change is on `next-reset` (99b1f8a4): `Store.Hello(id, machine, cwd, name string, mod bool)`, `Store.Bye`, lease-based `statusLocked`, `Peers()` lists only non-offline sessions, `nameFree` skips offline sessions, mod 0.3.0. The mod version goes to one past comms' (0.3.1 if theirs is 0.3.0). The `slack` peer is not a bus session, so it needs no `Pin` and leases can't expire it.
@@ -2283,6 +2284,16 @@ func TestAllowAndRemoveFromSlack(t *testing.T) {
 		t.Fatalf("msgs = %+v", msgs)
 	}
 
+	// A user allowed from Slack can talk to agents but can't allow anyone.
+	b.handleEvent("Ev9b", msg("UJANE", "<@UBOT> allow <@UEVE>", "4.21", ""))
+	drainJobs(t, b)
+	if _, ok = b.state.user("UEVE"); ok || !strings.Contains(lastPostText(f), "Only people set in config.yaml") {
+		t.Fatal("a runtime-added user allowed someone")
+	}
+	if len(f.callsTo("users.info")) != 1 {
+		t.Fatal("refused allow still looked the user up")
+	}
+
 	b.handleEvent("Ev10", msg("UALEX", "<@UBOT> allow <@UHOOK>", "4.3", ""))
 	drainJobs(t, b)
 	if _, ok = b.state.user("UHOOK"); ok || !strings.Contains(lastPostText(f), "Bots") {
@@ -2291,7 +2302,12 @@ func TestAllowAndRemoveFromSlack(t *testing.T) {
 
 	b.handleEvent("Ev11", msg("UJANE", "<@UBOT> remove <@UALEX>", "4.4", ""))
 	drainJobs(t, b)
-	if _, ok = b.state.user("UALEX"); !ok || !strings.Contains(lastPostText(f), "config.yaml") {
+	if _, ok = b.state.user("UALEX"); !ok || !strings.Contains(lastPostText(f), "Only people set in config.yaml") {
+		t.Fatal("a runtime-added user removed someone")
+	}
+	b.handleEvent("Ev11b", msg("UALEX", "<@UBOT> remove <@UALEX>", "4.41", ""))
+	drainJobs(t, b)
+	if _, ok = b.state.user("UALEX"); !ok || !strings.Contains(lastPostText(f), "can't be removed from Slack") {
 		t.Fatal("removed a config user")
 	}
 
@@ -2329,11 +2345,13 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
 	howToAddress = "To reach an agent, reply in its thread, or post `name: message` at the top level (the name or address from its thread header)."
-	commandHelp  = "Commands: `@agents allow @person` lets someone instruct agents; `@agents remove @person` takes that back."
+	commandHelp  = "Commands (for people set in config.yaml): `@agents allow @person` lets someone instruct agents; `@agents remove @person` takes that back."
+	ownersOnly   = "Only people set in config.yaml (allowed-emails) can allow or remove users."
 	onlineLimit  = 10
 )
 
@@ -2367,7 +2385,7 @@ func (b *Bridge) handleEvent(eventID string, ev messageEvent) {
 		return
 	}
 	if verb, target, isCommand := parseCommand(ev.Text, b.botUserID); isCommand {
-		b.command(ev, verb, target)
+		b.command(ev, user, verb, target)
 		return
 	}
 	text := plainText(ev.Text, b.state.idLabels())
@@ -2447,7 +2465,14 @@ func (b *Bridge) onlineHint() string {
 	return "Online: " + strings.Join(names, ", ")
 }
 
-func (b *Bridge) command(ev messageEvent, verb, target string) {
+// command runs allow/remove. Only users seeded from config (owners) may run
+// them, so access granted from Slack can't chain.
+func (b *Bridge) command(ev messageEvent, user allowedUser, verb, target string) {
+	if (verb == "allow" || verb == "remove") && !user.config {
+		log.Infof("slack: refused %s of %s by non-owner %s", verb, target, user.ID)
+		b.reply(ev, ownersOnly)
+		return
+	}
 	switch verb {
 	case "allow":
 		b.enqueue(func(ctx context.Context) error {
@@ -2465,6 +2490,7 @@ func (b *Bridge) command(ev messageEvent, verb, target string) {
 			if !added {
 				return b.replyNow(ctx, ev, fmt.Sprintf("<@%s> is already allowed, as @%s.", u.ID, u.Label))
 			}
+			log.Infof("slack: %s allowed %s as @%s", user.ID, u.ID, u.Label)
 			return b.replyNow(ctx, ev, fmt.Sprintf("<@%s> can now instruct agents. Agents know them as @%s.", u.ID, u.Label))
 		})
 	case "remove":
@@ -2478,6 +2504,7 @@ func (b *Bridge) command(ev messageEvent, verb, target string) {
 			if err != nil {
 				logSaveError(err)
 			}
+			log.Infof("slack: %s removed %s", user.ID, target)
 			b.reply(ev, fmt.Sprintf("<@%s> can no longer instruct agents.", target))
 		}
 	default:
