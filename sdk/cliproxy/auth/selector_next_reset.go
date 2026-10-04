@@ -66,6 +66,10 @@ type NextResetSelector struct {
 	rotation RoundRobinSelector
 	polled   *nextResetPolledStore
 	now      func() time.Time
+	// rebind tracks sessions and credentials so that session affinity can move
+	// a bound session toward the credential that resets first. Nil disables
+	// moves (see selector_next_reset_rebind.go).
+	rebind *nextResetRebindTracker
 }
 
 // nextResetColdPickKey marks a context as originating from a cold session
@@ -113,7 +117,8 @@ func nextResetAuthIdentity(auth *Auth) string {
 
 // NewNextResetSelector returns a selector that reads the shared poll store.
 func NewNextResetSelector() *NextResetSelector {
-	return &NextResetSelector{polled: nextResetPolled}
+	registerNextResetRebindUsagePlugin()
+	return &NextResetSelector{polled: nextResetPolled, rebind: nextResetRebindState}
 }
 
 func (s *NextResetSelector) clock() time.Time {
@@ -128,17 +133,10 @@ func (s *NextResetSelector) clock() time.Time {
 // sortNextReset).
 func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := s.clock()
-	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	ranked, err := s.rank(ctx, provider, model, auths, now)
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
-
-	ranked := make([]nextResetAssessment, 0, len(available))
-	for _, auth := range available {
-		ranked = append(ranked, s.assess(auth, model, now))
-	}
-	sortNextReset(ranked)
 
 	if ranked[0].tier == nextResetReady {
 		picked := ranked[0]
@@ -172,6 +170,23 @@ func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, op
 	}
 	sort.Slice(pool, func(i, j int) bool { return pool[i].ID < pool[j].ID })
 	return s.rotation.Pick(withPrevalidatedAuthCandidates(ctx), provider, model, opts, pool)
+}
+
+// rank assesses the available candidates and orders them the way a pick
+// does (see sortNextReset). The result is never empty when err is nil.
+func (s *NextResetSelector) rank(ctx context.Context, provider, model string, auths []*Auth, now time.Time) ([]nextResetAssessment, error) {
+	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+
+	ranked := make([]nextResetAssessment, 0, len(available))
+	for _, auth := range available {
+		ranked = append(ranked, s.assess(auth, model, now))
+	}
+	sortNextReset(ranked)
+	return ranked, nil
 }
 
 func (s *NextResetSelector) assess(auth *Auth, model string, now time.Time) nextResetAssessment {

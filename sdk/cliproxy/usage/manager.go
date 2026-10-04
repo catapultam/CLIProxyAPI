@@ -83,9 +83,14 @@ type Detail struct {
 	CachedTokens        int64
 	CacheReadTokens     int64
 	CacheCreationTokens int64
-	TotalTokens         int64
-	TokenBreakdown      TokenBreakdown
-	ResponseServiceTier string
+	// CacheCreation5mTokens and CacheCreation1hTokens split CacheCreationTokens
+	// by cache TTL when the upstream reports it (Claude usage.cache_creation).
+	// Both stay zero when the split is unknown.
+	CacheCreation5mTokens int64
+	CacheCreation1hTokens int64
+	TotalTokens           int64
+	TokenBreakdown        TokenBreakdown
+	ResponseServiceTier   string
 }
 
 type requestedModelAliasContextKey struct{}

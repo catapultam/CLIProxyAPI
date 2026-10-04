@@ -1062,6 +1062,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				// next-reset may move the bound session toward the credential
+				// that resets first; the move logs its own line.
+				if moved := s.nextResetMove(ctx, provider, model, primaryID, opts, fallbackAuths, auth); moved != nil {
+					bind(moved.ID)
+					return moved, nil
+				}
 				bind(auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
