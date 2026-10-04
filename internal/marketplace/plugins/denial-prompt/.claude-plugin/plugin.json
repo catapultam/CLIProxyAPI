@@ -1,0 +1,6 @@
+{
+  "name": "denial-prompt",
+  "version": "0.1.0",
+  "description": "When auto mode blocks an action, ask the user to allow it once (30s, then the denial stands)",
+  "types": "./types/index.d.ts"
+}

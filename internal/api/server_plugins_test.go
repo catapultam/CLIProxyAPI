@@ -33,12 +33,16 @@ func TestPluginsMarketplaceJSONNeedsNoAuth(t *testing.T) {
 	if doc.Name != "homelab" || doc.Owner.Name != "catapultam" {
 		t.Fatalf("doc = %+v", doc)
 	}
-	if len(doc.Plugins) != 1 || doc.Plugins[0].Name != "agentbus" {
+	if len(doc.Plugins) != 2 || doc.Plugins[0].Name != "agentbus" || doc.Plugins[1].Name != "denial-prompt" {
 		t.Fatalf("plugins = %+v", doc.Plugins)
 	}
 	wantURL := "https://cakebox:8317/plugins/agentbus-0.3.9.zip"
 	if doc.Plugins[0].Source.URL != wantURL {
 		t.Fatalf("url = %q, want %q", doc.Plugins[0].Source.URL, wantURL)
+	}
+	wantURL = "https://cakebox:8317/plugins/denial-prompt-0.1.0.zip"
+	if doc.Plugins[1].Source.URL != wantURL {
+		t.Fatalf("url = %q, want %q", doc.Plugins[1].Source.URL, wantURL)
 	}
 }
 
