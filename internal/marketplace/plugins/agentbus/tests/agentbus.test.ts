@@ -1435,17 +1435,44 @@ test('a message sent with Ask an agent or /clanker is framed as private, answere
   }
 })
 
-test('a broadcast is marked as one, naming the other recipients, in every Slack instruction framing', async ($, on) => {
+test('a broadcast is marked as one, naming the other recipients by address, in every Slack instruction framing', async ($, on) => {
   const prompts = await promptsFor($, on, [
-    { id: 'm_b1', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: ['beta', 'gamma'] },
-    { id: 'm_b2', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: ['beta'], via: 'dm' },
-    { id: 'm_b3', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: [], via: 'group' },
+    { id: 'm_b1', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: ['beta', 'gamma'], broadcast_count: 3 },
+    { id: 'm_b2', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: ['beta'], broadcast_count: 2, via: 'dm' },
+    { id: 'm_b3', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: [], broadcast_count: 1, via: 'group' },
     { id: 'm_b4', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex' },
     { id: 'm_b5', from: 'pc/x-111111', body: 'status?', broadcast: true },
   ])
-  expect(at(prompts, 0)).toContain('agentbus message m_b1 from alex via Slack (broadcast from alex to all 3 agents; also sent to: beta, gamma), relayed')
-  expect(at(prompts, 1)).toContain('agentbus message m_b2 from alex via Slack (DM) (broadcast from alex to all 2 agents; also sent to: beta), relayed')
+  expect(at(prompts, 0)).toContain(
+    'agentbus message m_b1 from alex via Slack (broadcast from alex to all 3 agents; also sent to: agentbus:beta, agentbus:gamma), relayed',
+  )
+  expect(at(prompts, 0)).toContain(
+    'This is a broadcast: the other recipients got the same message. If it needs a single answer or a split of work, ' +
+      'coordinate with them over the agentbus first (SendMessage to agentbus:beta, agentbus:gamma) and agree who replies on what. ' +
+      'Reply to Slack only for your part, and don\'t duplicate another agent\'s answer. If it doesn\'t concern you, send "ignore".',
+  )
+  expect(at(prompts, 1)).toContain('agentbus message m_b2 from alex via Slack (DM) (broadcast from alex to all 2 agents; also sent to: agentbus:beta), relayed')
   expect(at(prompts, 2)).toContain('agentbus message m_b3 from alex via Slack (in a group conversation) (broadcast from alex to all 1 agent), relayed')
+  // A sole recipient has nobody to coordinate with: no instruction.
+  expect(at(prompts, 2)).not.toContain('coordinate with them')
   expect(at(prompts, 3)).not.toContain('broadcast')
   expect(at(prompts, 4)).not.toContain('broadcast')
+})
+
+// Task fix round 1 (finding 3): broadcast_to capped below broadcast_count - 1
+// says how many of how many others it is showing; a legacy broadcast (no
+// count, no list) renders the old bare text with no number.
+test('a broadcast header shows a truncated count, and a legacy broadcast has none', async ($, on) => {
+  // broadcast_to already arrives capped at 30 (the proxy's own cap); broadcast_count (32) still
+  // reports the true total, so others (31) exceeds what's listed (30).
+  const others = Array.from({ length: 30 }, (_, i) => `n${String(i).padStart(2, '0')}`)
+  const prompts = await promptsFor($, on, [
+    { id: 'm_b6', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: others, broadcast_count: 32 },
+    { id: 'm_b7', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true },
+  ])
+  expect(at(prompts, 0)).toContain('to all 32 agents; also sent to: ')
+  expect(at(prompts, 0)).toContain('(showing 30 of 31 others)')
+  expect(at(prompts, 1)).toContain('agentbus message m_b7 from alex via Slack (broadcast to all agents), relayed')
+  expect(at(prompts, 1)).not.toContain('also sent to')
+  expect(at(prompts, 1)).not.toContain('coordinate with them')
 })

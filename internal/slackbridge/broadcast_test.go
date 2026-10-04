@@ -329,6 +329,7 @@ func TestBroadcastCommand(t *testing.T) {
 func TestBroadcastToNamesTheOtherRecipients(t *testing.T) {
 	b, _, bus := newTestBridge(t)
 	bus.Hello(sidC, "pc", "/work/third", "", true)
+	addrA := bus.Address(sidA)
 	addrB := bus.Address(sidB)
 	addrC := bus.Address(sidC)
 
@@ -340,15 +341,66 @@ func TestBroadcastToNamesTheOtherRecipients(t *testing.T) {
 		t.Fatalf("sidC = %+v", mC)
 	}
 
+	// BroadcastTo names the other recipients by bus address (never sidA's
+	// display name "flyer"), and BroadcastCount is 3 for every one of them.
 	want := map[string][]string{
 		sidA: {addrB, addrC},
-		sidB: {"flyer", addrC},
-		sidC: {"flyer", addrB},
+		sidB: {addrA, addrC},
+		sidC: {addrA, addrB},
 	}
 	got := map[string][]string{sidA: mA.BroadcastTo, sidB: mB.BroadcastTo, sidC: mC.BroadcastTo}
 	for sid, w := range want {
 		if !sameSet(got[sid], w) {
 			t.Fatalf("%s broadcast_to = %v, want set %v", sid, got[sid], w)
+		}
+	}
+	for sid, m := range map[string]agentbus.Message{sidA: mA, sidB: mB, sidC: mC} {
+		if m.BroadcastCount != 3 {
+			t.Fatalf("%s broadcast_count = %d, want 3", sid, m.BroadcastCount)
+		}
+	}
+}
+
+// Task fix round 1 (finding 2): an offline session's name can be reused by
+// a later, unrelated one (nameFree skips offline sessions). BroadcastTo
+// must list unique bus addresses, resolving to the intended other session,
+// never a name that could now mean someone else, and never the recipient
+// itself.
+func TestBroadcastToSurvivesOfflineNameReuse(t *testing.T) {
+	b, _, bus := newTestBridge(t)
+	// sidA ("flyer") goes offline, freeing its name.
+	bus.Bye(sidA)
+	// A different, later session reconnects and claims the freed name.
+	bus.Hello(sidC, "pc", "/work/newcomer", "flyer", true)
+	addrB := bus.Address(sidB)
+	addrC := bus.Address(sidC)
+
+	b.handleEvent("EvBr1", msg("UALEX", "all: status please", "1700011900.000001", ""))
+	if bus.Pending(sidA) {
+		t.Fatal("an offline session (whose name was reused) got the broadcast")
+	}
+	mB := claimOne(t, bus, sidB)
+	mC := claimOne(t, bus, sidC)
+	if !mB.Broadcast || !mC.Broadcast {
+		t.Fatalf("mB = %+v, mC = %+v", mB, mC)
+	}
+
+	if !reflect.DeepEqual(mB.BroadcastTo, []string{addrC}) {
+		t.Fatalf("B broadcast_to = %v, want [%s]", mB.BroadcastTo, addrC)
+	}
+	if !reflect.DeepEqual(mC.BroadcastTo, []string{addrB}) {
+		t.Fatalf("C broadcast_to = %v, want [%s]", mC.BroadcastTo, addrB)
+	}
+	for _, addr := range append(append([]string{}, mB.BroadcastTo...), mC.BroadcastTo...) {
+		if addr == "flyer" {
+			t.Fatal("broadcast_to used the reused name instead of an address")
+		}
+		sid, ok := bus.Resolve(addr)
+		if !ok {
+			t.Fatalf("broadcast_to target %q doesn't resolve", addr)
+		}
+		if sid != sidB && sid != sidC {
+			t.Fatalf("broadcast_to target %q resolved to an unexpected session %s", addr, sid)
 		}
 	}
 }

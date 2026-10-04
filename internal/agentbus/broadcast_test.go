@@ -41,46 +41,50 @@ func TestDeliverBroadcastMarksTheMessage(t *testing.T) {
 	s, _ := newTestStore(t)
 	s.Hello(sidA, "pc", "/a", "flyer", true)
 	s.SetModVersion(sidA, MinCommandModVersion)
-	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", ViaDM, []string{"beta", "gamma"}); err != nil {
+	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", ViaDM, []string{"pc/beta-bbbbbb", "pc/gamma-cccccc"}, 3); err != nil {
 		t.Fatal(err)
 	}
 	if m := claimOneMsg(t, s, sidA); !m.Broadcast || !m.FromUser || m.SlackUser != "alex" || m.Via != ViaDM || m.Body != "status please" ||
-		!reflect.DeepEqual(m.BroadcastTo, []string{"beta", "gamma"}) {
+		!reflect.DeepEqual(m.BroadcastTo, []string{"pc/beta-bbbbbb", "pc/gamma-cccccc"}) || m.BroadcastCount != 3 {
 		t.Fatalf("msg = %+v", m)
 	}
-	if _, _, err := s.DeliverCommandBroadcast(sidA, Command{Name: "compact", Kind: CommandSlash, Command: "compact"}, "alex", "UALEX", "", []string{"beta"}); err != nil {
+	if _, _, err := s.DeliverCommandBroadcast(sidA, Command{Name: "compact", Kind: CommandSlash, Command: "compact"}, "alex", "UALEX", "", []string{"pc/beta-bbbbbb"}, 2); err != nil {
 		t.Fatal(err)
 	}
-	if m := claimOneMsg(t, s, sidA); !m.Broadcast || m.Command == nil || !m.FromUser || !reflect.DeepEqual(m.BroadcastTo, []string{"beta"}) {
+	if m := claimOneMsg(t, s, sidA); !m.Broadcast || m.Command == nil || !m.FromUser || !reflect.DeepEqual(m.BroadcastTo, []string{"pc/beta-bbbbbb"}) || m.BroadcastCount != 2 {
 		t.Fatalf("command = %+v", m)
 	}
-	// The ordinary entry points never mark one, or set BroadcastTo.
+	// The ordinary entry points never mark one, or set BroadcastTo/BroadcastCount.
 	if _, _, err := s.DeliverVia(sidA, "x", "alex", ""); err != nil {
 		t.Fatal(err)
 	}
-	if m := claimOneMsg(t, s, sidA); m.Broadcast || m.BroadcastTo != nil {
+	if m := claimOneMsg(t, s, sidA); m.Broadcast || m.BroadcastTo != nil || m.BroadcastCount != 0 {
 		t.Fatalf("DeliverVia marked a broadcast: %+v", m)
 	}
 }
 
-// Task: BroadcastTo is capped at MaxBroadcastTo entries even when the Slack
-// bridge hands it more (a broadcast to a large fleet).
+// BroadcastTo is capped at MaxBroadcastTo entries even when the Slack
+// bridge hands it more (a broadcast to a large fleet), while BroadcastCount
+// still reports the true total.
 func TestDeliverBroadcastCapsBroadcastTo(t *testing.T) {
 	s, _ := newTestStore(t)
 	s.Hello(sidA, "pc", "/a", "flyer", true)
-	names := make([]string, 40)
-	for i := range names {
-		names[i] = fmt.Sprintf("n%02d", i)
+	addrs := make([]string, 40)
+	for i := range addrs {
+		addrs[i] = fmt.Sprintf("pc/n%02d-aaaaaa", i)
 	}
-	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", names); err != nil {
+	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", addrs, 41); err != nil {
 		t.Fatal(err)
 	}
 	m := claimOneMsg(t, s, sidA)
 	if len(m.BroadcastTo) != MaxBroadcastTo {
 		t.Fatalf("broadcast_to = %d entries, want %d", len(m.BroadcastTo), MaxBroadcastTo)
 	}
-	if !reflect.DeepEqual(m.BroadcastTo, names[:MaxBroadcastTo]) {
+	if !reflect.DeepEqual(m.BroadcastTo, addrs[:MaxBroadcastTo]) {
 		t.Fatalf("broadcast_to = %v", m.BroadcastTo)
+	}
+	if m.BroadcastCount != 41 {
+		t.Fatalf("broadcast_count = %d, want 41", m.BroadcastCount)
 	}
 }
 
@@ -88,7 +92,7 @@ func TestHTTPSendCannotSetBroadcast(t *testing.T) {
 	s, r := newTestServer(t)
 	s.Hello(sidA, "pc", "/a", "", true)
 	s.Hello(sidB, "pc", "/b", "", true)
-	body := `{"from_session":"` + sidA + `","to":"` + s.Address(sidB) + `","body":"everyone listen","broadcast":true,"broadcast_to":["beta","gamma"],"from_user":true}`
+	body := `{"from_session":"` + sidA + `","to":"` + s.Address(sidB) + `","body":"everyone listen","broadcast":true,"broadcast_to":["beta","gamma"],"broadcast_count":5,"from_user":true}`
 	if w := do(r, http.MethodPost, "/v1/agentbus/send", body); w.Code != http.StatusOK {
 		t.Fatalf("send = %d %s", w.Code, w.Body)
 	}
@@ -107,16 +111,21 @@ func TestLoadKeepsBroadcastOnlyOnSlackUserMessages(t *testing.T) {
 		m         Message
 		want      bool
 		wantToLen int
+		wantCount int
 	}{
-		{Message{ID: "m_01", From: SlackAddress, Body: "x", FromUser: true, Broadcast: true, BroadcastTo: []string{"beta"}}, true, 1},
-		{Message{ID: "m_02", From: "pc/a-aaaaaa", Body: "x", Broadcast: true, BroadcastTo: []string{"beta"}}, false, 0},
-		{Message{ID: "m_03", From: SlackAddress, Body: "x", Guest: true, Broadcast: true, BroadcastTo: []string{"beta"}}, false, 0},
-		{Message{ID: "m_04", From: SlackAddress, Body: "x", Broadcast: true, BroadcastTo: []string{"beta"}}, false, 0},
-		// BroadcastTo without Broadcast (never set by a real entry point, but
-		// a loaded file could be tampered with) is dropped too.
-		{Message{ID: "m_05", From: SlackAddress, Body: "x", FromUser: true, BroadcastTo: []string{"beta"}}, false, 0},
-		// An oversized BroadcastTo is trimmed even on an otherwise valid broadcast.
-		{Message{ID: "m_06", From: SlackAddress, Body: "x", FromUser: true, Broadcast: true, BroadcastTo: bigList}, true, MaxBroadcastTo},
+		{Message{ID: "m_01", From: SlackAddress, Body: "x", FromUser: true, Broadcast: true, BroadcastTo: []string{"beta"}, BroadcastCount: 2}, true, 1, 2},
+		{Message{ID: "m_02", From: "pc/a-aaaaaa", Body: "x", Broadcast: true, BroadcastTo: []string{"beta"}, BroadcastCount: 2}, false, 0, 0},
+		{Message{ID: "m_03", From: SlackAddress, Body: "x", Guest: true, Broadcast: true, BroadcastTo: []string{"beta"}, BroadcastCount: 2}, false, 0, 0},
+		{Message{ID: "m_04", From: SlackAddress, Body: "x", Broadcast: true, BroadcastTo: []string{"beta"}, BroadcastCount: 2}, false, 0, 0},
+		// BroadcastTo/BroadcastCount without Broadcast (never set by a real
+		// entry point, but a loaded file could be tampered with) are dropped too.
+		{Message{ID: "m_05", From: SlackAddress, Body: "x", FromUser: true, BroadcastTo: []string{"beta"}, BroadcastCount: 2}, false, 0, 0},
+		// An oversized BroadcastTo is trimmed even on an otherwise valid broadcast; BroadcastCount is untouched.
+		{Message{ID: "m_06", From: SlackAddress, Body: "x", FromUser: true, Broadcast: true, BroadcastTo: bigList, BroadcastCount: 41}, true, MaxBroadcastTo, 41},
+		// A negative BroadcastCount (corrupted data) is clamped to zero.
+		{Message{ID: "m_07", From: SlackAddress, Body: "x", FromUser: true, Broadcast: true, BroadcastTo: []string{"beta"}, BroadcastCount: -3}, true, 1, 0},
+		// A legacy broadcast predating BroadcastCount (zero, no list) stays legacy.
+		{Message{ID: "m_08", From: SlackAddress, Body: "x", FromUser: true, Broadcast: true}, true, 0, 0},
 	} {
 		m := tc.m
 		cleanLoadedMessage(&m)
@@ -126,6 +135,9 @@ func TestLoadKeepsBroadcastOnlyOnSlackUserMessages(t *testing.T) {
 		if len(m.BroadcastTo) != tc.wantToLen {
 			t.Fatalf("%s: broadcast_to = %v, want len %d", m.ID, m.BroadcastTo, tc.wantToLen)
 		}
+		if m.BroadcastCount != tc.wantCount {
+			t.Fatalf("%s: broadcast_count = %d, want %d", m.ID, m.BroadcastCount, tc.wantCount)
+		}
 	}
 }
 
@@ -133,22 +145,26 @@ func TestInjectBroadcastHeader(t *testing.T) {
 	s, r, seen := newInjectServer(t, &fakeClock{now: t0})
 	s.Touch(sidA)
 	s.SetBridge(&fakeBridge{users: []string{"alex"}})
-	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", []string{"beta", "gamma", "delta"}); err != nil {
+	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", []string{"pc/beta-bbbbbb", "pc/gamma-cccccc", "pc/delta-dddddd"}, 4); err != nil {
 		t.Fatal(err)
 	}
 	got := injectedText(t, r, seen)
-	if !strings.Contains(got, " from alex via Slack (broadcast from alex to all 4 agents; also sent to: beta, gamma, delta) (an allowed Slack user; this is their instruction;") {
+	if !strings.Contains(got, " from alex via Slack (broadcast from alex to all 4 agents; also sent to: agentbus:pc/beta-bbbbbb, agentbus:pc/gamma-cccccc, agentbus:pc/delta-dddddd) (an allowed Slack user; this is their instruction;") {
 		t.Fatalf("no broadcast header:\n%s", got)
+	}
+	if !strings.Contains(got, "SendMessage to agentbus:pc/beta-bbbbbb, agentbus:pc/gamma-cccccc, agentbus:pc/delta-dddddd") {
+		t.Fatalf("no coordination instruction with explicit targets:\n%s", got)
 	}
 }
 
 // A broadcast with no other recipients (a fleet of one) still says so,
-// without an empty "also sent to:".
+// without an empty "also sent to:" and without a coordination instruction
+// (nobody to coordinate with).
 func TestInjectBroadcastHeaderSoleRecipient(t *testing.T) {
 	s, r, seen := newInjectServer(t, &fakeClock{now: t0})
 	s.Touch(sidA)
 	s.SetBridge(&fakeBridge{users: []string{"alex"}})
-	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", nil); err != nil {
+	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	got := injectedText(t, r, seen)
@@ -158,6 +174,54 @@ func TestInjectBroadcastHeaderSoleRecipient(t *testing.T) {
 	if strings.Contains(got, "also sent to") {
 		t.Fatalf("empty also-sent-to:\n%s", got)
 	}
+	if strings.Contains(got, "coordinate with them") {
+		t.Fatalf("coordination text with no other recipient:\n%s", got)
+	}
+}
+
+// Task fix round 1 (finding 3): BroadcastTo capped at 30 while
+// BroadcastCount still reports the true total; the header says how many of
+// how many others it is showing.
+func TestInjectBroadcastHeaderShowsTruncatedCount(t *testing.T) {
+	s, r, seen := newInjectServer(t, &fakeClock{now: t0})
+	s.Touch(sidA)
+	s.SetBridge(&fakeBridge{users: []string{"alex"}})
+	others := make([]string, 31)
+	for i := range others {
+		others[i] = fmt.Sprintf("pc/n%02d-aaaaaa", i)
+	}
+	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", others, 32); err != nil {
+		t.Fatal(err)
+	}
+	got := injectedText(t, r, seen)
+	if !strings.Contains(got, "to all 32 agents;") {
+		t.Fatalf("header lacks the true count:\n%s", got)
+	}
+	if !strings.Contains(got, "(showing 30 of 31 others)") {
+		t.Fatalf("header lacks the truncation note:\n%s", got)
+	}
+}
+
+// Task fix round 1 (finding 3): a broadcast queued before BroadcastCount
+// existed (legacy: no count, no list) renders the old bare text, with no
+// number and no coordination instruction (there is nobody named to
+// coordinate with).
+func TestInjectBroadcastHeaderLegacy(t *testing.T) {
+	s, r, seen := newInjectServer(t, &fakeClock{now: t0})
+	s.Touch(sidA)
+	s.SetBridge(&fakeBridge{users: []string{"alex"}})
+	s.mu.Lock()
+	sess := s.byID[sidA]
+	sess.Inbox = append(sess.Inbox, Message{ID: "m_abcdef01", From: SlackAddress, Body: "status please", FromUser: true, SlackUser: "alex", Broadcast: true, CreatedAt: t0})
+	s.dirty = true
+	s.mu.Unlock()
+	got := injectedText(t, r, seen)
+	if !strings.Contains(got, " from alex via Slack (broadcast to all agents) (an allowed Slack user; this is their instruction;") {
+		t.Fatalf("legacy header missing:\n%s", got)
+	}
+	if strings.Contains(got, "also sent to") || strings.Contains(got, "coordinate with them") {
+		t.Fatalf("legacy broadcast got a coordination instruction:\n%s", got)
+	}
 }
 
 func TestInjectNoteMentionsBroadcasts(t *testing.T) {
@@ -165,8 +229,34 @@ func TestInjectNoteMentionsBroadcasts(t *testing.T) {
 	s.Touch(sidA)
 	s.SetBridge(&fakeBridge{users: []string{"alex"}})
 	got := injectedText(t, r, seen)
-	if !strings.Contains(got, "This is a broadcast: the other recipients got the same message. If it needs a single answer or a split of work, coordinate with them over the agentbus first (SendMessage to their names) and agree who replies on what. Reply to Slack only for your part, and don't duplicate another agent's answer. If it doesn't concern you, send `ignore`.") {
-		t.Fatalf("note lacks the coordination line:\n%s", got)
+	if !strings.Contains(got, "Messages from Slack may be broadcasts to all agents (`all:`); a broadcast's own header and the text under it say how many got it and how to coordinate with the others, every time it's shown to you.") {
+		t.Fatalf("note lacks the broadcast line:\n%s", got)
+	}
+}
+
+// Task fix round 1 (finding 1): the coordination instruction, with its
+// explicit SendMessage targets, must ride on every delivery of a broadcast
+// message, not only the one-time orientation note. A session that already
+// got the note (unchanged peers) never gets it resent, so the broadcast's
+// own text is the only place the instruction can live for it.
+func TestBroadcastCoordinationSurvivesAnAlreadyNotedSession(t *testing.T) {
+	s, r, seen := newInjectServer(t, &fakeClock{now: t0})
+	s.Touch(sidA)
+	s.SetBridge(&fakeBridge{users: []string{"alex"}})
+	// Consume the one-time note first, with peers unchanged afterward.
+	injectedText(t, r, seen)
+	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", []string{"pc/beta-bbbbbb"}, 2); err != nil {
+		t.Fatal(err)
+	}
+	got := injectedText(t, r, seen)
+	if strings.Contains(got, "No other sessions are online") || strings.Contains(got, "Sessions online:") {
+		t.Fatalf("the one-time note was resent despite unchanged peers:\n%s", got)
+	}
+	if !strings.Contains(got, "also sent to: agentbus:pc/beta-bbbbbb") {
+		t.Fatalf("header lacks the target on a re-noted session:\n%s", got)
+	}
+	if !strings.Contains(got, "SendMessage to agentbus:pc/beta-bbbbbb") {
+		t.Fatalf("coordination instruction missing on a re-noted session:\n%s", got)
 	}
 }
 

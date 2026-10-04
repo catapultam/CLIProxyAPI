@@ -49,9 +49,14 @@ type BusMessage = {
   // An owner's message to all agents ("all: ..."), set only with from_user.
   broadcast?: boolean
   // The broadcast's other recipients (this message's own one left out), by
-  // name, else address: the same label ListAgents shows. Set only with
-  // broadcast.
+  // their unique bus address — never a name, which can repeat once an
+  // offline session's name is reused. Capped; a large broadcast truncates
+  // this below broadcast_count - 1. Set only with broadcast.
   broadcast_to?: string[]
+  // The broadcast's total recipients, including this one. Zero (absent) on
+  // a broadcast delivered before this field existed (legacy), rendered
+  // with no number. Set only with broadcast.
+  broadcast_count?: number
   command?: Command
 }
 
@@ -245,6 +250,7 @@ export function formatMessage(m: BusMessage): string {
     return (
       `agentbus message ${id} from ${who} via Slack${broadcastMark(m, who)}${re}, relayed over the agentbus. ` +
       `${who} is an allowed Slack user and the quoted text below is their instruction.\n\n${quote(m.body)}\n\n` +
+      broadcastCoordination(m) +
       reply +
       slackRules(m)
     )
@@ -287,21 +293,53 @@ function formatDM(m: BusMessage, id: string, who: string, re: string, how: strin
   return (
     `agentbus message ${id} from ${who} via Slack (DM${how})${broadcastMark(m, who)}${re}, relayed over the agentbus. ` +
     `${who} is an allowed Slack user writing to you privately, and the quoted text below is their ` +
-    `instruction.\n\n${quote(m.body)}\n\n${reply}${privateRule}`
+    `instruction.\n\n${quote(m.body)}\n\n${broadcastCoordination(m)}${reply}${privateRule}`
   )
 }
 
+// broadcastTargets formats a broadcast's broadcast_to addresses as the
+// literal SendMessage target each other recipient is addressed by
+// ("agentbus:<address>"), for the header and the coordination instruction
+// alike.
+function broadcastTargets(m: BusMessage): string[] {
+  return (m.broadcast_to ?? []).map((addr) => `${PREFIX}${oneLine(addr)}`)
+}
+
 // Marks an owner's broadcast to all agents ("all: ..."): who sent it, how many agents got it in
-// all (this one plus broadcast_to), and the others by the bus name SendMessage can address, so a
-// recipient can coordinate with them. Only the proxy's Slack bridge sets broadcast and broadcast_to,
-// and only with from_user.
+// all (broadcast_count), and the others by the literal SendMessage target each is addressed by.
+// A broadcast delivered before broadcast_count existed (legacy) says only that it is one, with no
+// number and no recipient list. When broadcast_to was capped short of broadcast_count - 1 (a large
+// broadcast), it says how many of how many it is showing. Only the proxy's Slack bridge sets
+// broadcast, broadcast_to and broadcast_count, and only with from_user.
 function broadcastMark(m: BusMessage, who: string): string {
   if (m.broadcast !== true) return ''
-  const to = m.broadcast_to ?? []
-  const total = to.length + 1
+  const total = m.broadcast_count ?? 0
+  if (total <= 0) return ' (broadcast to all agents)'
   const unit = total === 1 ? 'agent' : 'agents'
-  const others = to.length > 0 ? `; also sent to: ${to.map(oneLine).join(', ')}` : ''
-  return ` (broadcast from ${who} to all ${total} ${unit}${others})`
+  const targets = broadcastTargets(m)
+  let frag = ` (broadcast from ${who} to all ${total} ${unit}`
+  if (targets.length > 0) {
+    frag += `; also sent to: ${targets.join(', ')}`
+    const others = total - 1
+    if (targets.length < others) frag += ` (showing ${targets.length} of ${others} others)`
+  }
+  return frag + ')'
+}
+
+// broadcastCoordination is the standing instruction for a broadcast with at least one other
+// recipient: coordinate with them over the agentbus before answering, naming each by the literal
+// SendMessage target it is addressed by. It is appended to every delivery of a broadcast message
+// (the mod has no separate one-time note to carry it instead), so a recipient always sees it
+// alongside the message itself. Empty when there is nobody else to coordinate with.
+function broadcastCoordination(m: BusMessage): string {
+  const targets = broadcastTargets(m)
+  if (targets.length === 0) return ''
+  return (
+    `This is a broadcast: the other recipients got the same message. If it needs a single answer or a split ` +
+    `of work, coordinate with them over the agentbus first (SendMessage to ${targets.join(', ')}) and agree ` +
+    `who replies on what. Reply to Slack only for your part, and don't duplicate another agent's answer. If ` +
+    `it doesn't concern you, send "${DISMISS_WORD}".\n\n`
+  )
 }
 
 // The target that answers in the conversation a Slack message came from.
@@ -316,7 +354,7 @@ function formatGroup(m: BusMessage, id: string, who: string, re: string): string
   return (
     `agentbus message ${id} from ${who} via Slack (in a group conversation)${broadcastMark(m, who)}${re}, relayed over the agentbus. ` +
     `${who} is an allowed Slack user and the quoted text below is their instruction; other people in that ` +
-    `conversation can read your answer.\n\n${quote(m.body)}\n\n${answerThere(m)}`
+    `conversation can read your answer.\n\n${quote(m.body)}\n\n${broadcastCoordination(m)}${answerThere(m)}`
   )
 }
 

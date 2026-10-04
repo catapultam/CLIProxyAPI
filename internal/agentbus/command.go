@@ -36,18 +36,19 @@ func (s *Store) DeliverCommand(target string, cmd Command, slackUser, slackUserI
 // /clanker), so a prompt command from a DM is framed as private and a report
 // in a group conversation leaves the machine out.
 func (s *Store) DeliverCommandVia(target string, cmd Command, slackUser, slackUserID, via string) (sessionID, msgID string, err error) {
-	return s.deliverCommand(target, cmd, slackUser, slackUserID, via, false, nil)
+	return s.deliverCommand(target, cmd, slackUser, slackUserID, via, false, nil, 0)
 }
 
 // DeliverCommandBroadcast is DeliverCommandVia for an owner's broadcast to
-// all agents ("all: !cmd"): the message is marked Broadcast, and to names
-// the broadcast's other recipients (BroadcastTo). Only the Slack bridge
-// calls it.
-func (s *Store) DeliverCommandBroadcast(target string, cmd Command, slackUser, slackUserID, via string, to []string) (sessionID, msgID string, err error) {
-	return s.deliverCommand(target, cmd, slackUser, slackUserID, via, true, to)
+// all agents ("all: !cmd"): the message is marked Broadcast, to lists the
+// broadcast's other recipients by bus address (BroadcastTo), and total is
+// every recipient including this one (BroadcastCount). Only the Slack
+// bridge calls it.
+func (s *Store) DeliverCommandBroadcast(target string, cmd Command, slackUser, slackUserID, via string, to []string, total int) (sessionID, msgID string, err error) {
+	return s.deliverCommand(target, cmd, slackUser, slackUserID, via, true, to, total)
 }
 
-func (s *Store) deliverCommand(target string, cmd Command, slackUser, slackUserID, via string, broadcast bool, to []string) (string, string, error) {
+func (s *Store) deliverCommand(target string, cmd Command, slackUser, slackUserID, via string, broadcast bool, to []string, total int) (string, string, error) {
 	if !validVia(via) {
 		return "", "", ErrInvalidVia
 	}
@@ -76,6 +77,7 @@ func (s *Store) deliverCommand(target string, cmd Command, slackUser, slackUserI
 	msg.Broadcast = broadcast
 	if broadcast {
 		msg.BroadcastTo = cappedBroadcastTo(to)
+		msg.BroadcastCount = clampBroadcastCount(total)
 	}
 	if cmd.Argv != nil {
 		argv := make(map[string][]string, len(cmd.Argv))

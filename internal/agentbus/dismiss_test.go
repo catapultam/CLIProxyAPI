@@ -59,10 +59,11 @@ func TestInjectNoteExplainsDoneAndWorking(t *testing.T) {
 	if !strings.Contains(got, "Long task? Send `working` to agentbus:slack#<id>; finish with `done`.") {
 		t.Fatalf("note lacks the working hint:\n%s", got)
 	}
-	// M8: the broadcast line and the dismiss line each already say "ignore"; the done hint
-	// doesn't add a third mention.
-	if n := strings.Count(got, "`ignore`"); n != 2 {
-		t.Fatalf("note mentions `ignore` %d times, want 2:\n%s", n, got)
+	// Fix round 1: the broadcast line no longer says "ignore" itself (that
+	// instruction now rides on each broadcast message); only the dismiss
+	// line does, and the done hint doesn't add a second mention.
+	if n := strings.Count(got, "`ignore`"); n != 1 {
+		t.Fatalf("note mentions `ignore` %d times, want 1:\n%s", n, got)
 	}
 }
 

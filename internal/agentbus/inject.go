@@ -270,7 +270,7 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 				owner = "the owner (" + inline(strings.Join(slack.owners, ", ")) + ")"
 			}
 			fmt.Fprintf(&b, disclosureRule, owner)
-			b.WriteString("Messages from Slack may be broadcasts to all agents (`all:`), marked in the header. This is a broadcast: the other recipients got the same message. If it needs a single answer or a split of work, coordinate with them over the agentbus first (SendMessage to their names) and agree who replies on what. Reply to Slack only for your part, and don't duplicate another agent's answer. If it doesn't concern you, send `ignore`.\n")
+			b.WriteString("Messages from Slack may be broadcasts to all agents (`all:`); a broadcast's own header and the text under it say how many got it and how to coordinate with the others, every time it's shown to you.\n")
 			fmt.Fprintf(&b, "If a Slack message clearly wasn't meant for you (people talking to each other in a linked chat, a tag for someone else), dismiss it instead of replying: SendMessage to \"agentbus:slack#<id>\" with message `ignore` (curl: POST /v1/agentbus/dismiss {\"session\":\"%s\",\"ids\":[\"<id>\"]}).\n", sid)
 			b.WriteString(doneHintNote)
 			if slack.bot != "" {
@@ -285,6 +285,14 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 			head += " (in reply to " + inline(m.ReplyTo) + ")"
 		}
 		b.WriteString(head + ":\n" + quoteBody(m.Body) + "\n")
+		// The coordination instruction rides on every delivery of a
+		// broadcast message (not just the one-time note above, which an
+		// already-noted session never gets resent).
+		if m.Broadcast && m.FromUser && !m.Guest {
+			if coord := broadcastCoordination(m); coord != "" {
+				b.WriteString(coord + "\n")
+			}
+		}
 	}
 	// Without the mod, nothing re-surfaces a Slack instruction later. A
 	// guest's message is no instruction, so it gets no hint to keep it.
@@ -295,29 +303,64 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 	return b.String()
 }
 
+// broadcastTargets formats a broadcast's BroadcastTo addresses as the
+// literal SendMessage target each other recipient is addressed by
+// ("agentbus:<address>"), for the header and the coordination instruction
+// alike.
+func broadcastTargets(m Message) []string {
+	if len(m.BroadcastTo) == 0 {
+		return nil
+	}
+	out := make([]string, len(m.BroadcastTo))
+	for i, addr := range m.BroadcastTo {
+		out[i] = "agentbus:" + inline(addr)
+	}
+	return out
+}
+
 // broadcastWhere is the "(broadcast ...)" fragment of a broadcast message's
-// header: who sent it, how many agents got it in all (this one plus
-// BroadcastTo), and the others by the bus name they can be addressed by
-// with SendMessage, so a recipient can coordinate with them.
+// header: who sent it, how many agents got it in all (BroadcastCount), and
+// the others by the literal SendMessage target each is addressed by. A
+// broadcast delivered before BroadcastCount existed (legacy) says only that
+// it is one, with no number and no recipient list. When BroadcastTo was
+// capped short of BroadcastCount-1 (a large broadcast), it says how many of
+// how many it is showing.
 func broadcastWhere(m Message) string {
+	if m.BroadcastCount <= 0 {
+		return " (broadcast to all agents)"
+	}
 	owner := m.SlackUser
 	if owner == "" {
 		owner = "an allowed Slack user"
 	}
-	total := len(m.BroadcastTo) + 1
 	unit := "agents"
-	if total == 1 {
+	if m.BroadcastCount == 1 {
 		unit = "agent"
 	}
-	frag := fmt.Sprintf(" (broadcast from %s to all %d %s", inline(owner), total, unit)
-	if len(m.BroadcastTo) > 0 {
-		names := make([]string, len(m.BroadcastTo))
-		for i, n := range m.BroadcastTo {
-			names[i] = inline(n)
+	frag := fmt.Sprintf(" (broadcast from %s to all %d %s", inline(owner), m.BroadcastCount, unit)
+	if targets := broadcastTargets(m); len(targets) > 0 {
+		frag += "; also sent to: " + strings.Join(targets, ", ")
+		if others := m.BroadcastCount - 1; len(targets) < others {
+			frag += fmt.Sprintf(" (showing %d of %d others)", len(targets), others)
 		}
-		frag += "; also sent to: " + strings.Join(names, ", ")
 	}
 	return frag + ")"
+}
+
+// broadcastCoordination is the standing instruction for a broadcast with at
+// least one other recipient: coordinate with them over the agentbus before
+// answering, naming each by the literal SendMessage target it is addressed
+// by. It is appended after every delivery of a broadcast message, not just
+// the one-time orientation note (which a session that was already noted
+// never gets resent), so a recipient always sees it alongside the message
+// itself. Empty when there is nobody else to coordinate with.
+func broadcastCoordination(m Message) string {
+	targets := broadcastTargets(m)
+	if len(targets) == 0 {
+		return ""
+	}
+	return "This is a broadcast: the other recipients got the same message. If it needs a single answer or a split of work, coordinate with them over the agentbus first (SendMessage to " +
+		strings.Join(targets, ", ") + ") and agree who replies on what. Reply to Slack only for your part, and don't duplicate another agent's answer. If it doesn't concern you, send `ignore`."
 }
 
 // messageHead is the unquoted header line of an injected message, without

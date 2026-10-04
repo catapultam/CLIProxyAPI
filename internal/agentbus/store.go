@@ -114,12 +114,19 @@ type Message struct {
 	// with FromUser; clients can never send it.
 	Broadcast bool `json:"broadcast,omitempty"`
 	// BroadcastTo lists a broadcast's other recipients (this message's own
-	// one left out), by display name or address when it has no name: the
-	// same label the Slack bridge's help list uses for an agent. It lets a
-	// recipient coordinate with the others over the agentbus. Capped at
+	// one left out), by their unique bus address — never a name, which can
+	// repeat once an offline session's name is reused by a later one. It
+	// lets a recipient SendMessage the others to coordinate. Capped at
 	// MaxBroadcastTo. Only DeliverBroadcast and DeliverCommandBroadcast set
 	// it, always with Broadcast; clients can never send it.
 	BroadcastTo []string `json:"broadcast_to,omitempty"`
+	// BroadcastCount is a broadcast's total recipients, including this
+	// message's own one (so it is always at least len(BroadcastTo)+1). A
+	// broadcast delivered before this field existed has it zero (legacy),
+	// rendered with no number. Only DeliverBroadcast and
+	// DeliverCommandBroadcast set it, always with Broadcast; clients can
+	// never send it.
+	BroadcastCount int `json:"broadcast_count,omitempty"`
 	// SlackUserID is the Slack user ID of the owner who sent Command. Only
 	// DeliverCommand sets it, and /wait re-checks it before handing the
 	// command out.
@@ -920,9 +927,11 @@ func (s *Store) Load() error {
 // a Slack user's or guest's message (and every via on anything else), an
 // approval on anything but a Slack user's message or with an invalid request
 // id, a broadcast mark on anything but a Slack user's message, BroadcastTo
-// on anything that isn't marked Broadcast (and trims it to MaxBroadcastTo
-// either way) and, on a message from a session, a sender name validName
-// rejects (keeping the sender's address). It reports whether it changed m.
+// and BroadcastCount on anything that isn't marked Broadcast (trimming
+// BroadcastTo to MaxBroadcastTo and clamping a negative BroadcastCount to
+// zero either way) and, on a message from a session, a sender name
+// validName rejects (keeping the sender's address). It reports whether it
+// changed m.
 func cleanLoadedMessage(m *Message) bool {
 	changed := false
 	if m.ReplyTo != "" && !validReplyTo.MatchString(m.ReplyTo) {
@@ -941,12 +950,22 @@ func cleanLoadedMessage(m *Message) bool {
 		m.Broadcast = false
 		changed = true
 	}
-	if len(m.BroadcastTo) > 0 && !m.Broadcast {
-		m.BroadcastTo = nil
-		changed = true
+	if !m.Broadcast {
+		if len(m.BroadcastTo) > 0 {
+			m.BroadcastTo = nil
+			changed = true
+		}
+		if m.BroadcastCount != 0 {
+			m.BroadcastCount = 0
+			changed = true
+		}
 	}
 	if len(m.BroadcastTo) > MaxBroadcastTo {
 		m.BroadcastTo = m.BroadcastTo[:MaxBroadcastTo]
+		changed = true
+	}
+	if m.BroadcastCount < 0 {
+		m.BroadcastCount = 0
 		changed = true
 	}
 	if m.FromUser || m.Guest {

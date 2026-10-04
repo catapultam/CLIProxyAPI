@@ -234,16 +234,18 @@ func (s *Store) DeliverVia(target, body, slackUser, via string) (sessionID, msgI
 }
 
 // DeliverBroadcast is DeliverVia for an owner's broadcast to all agents
-// ("all: message"): the message is marked Broadcast, and to names the
-// broadcast's other recipients (BroadcastTo). Only the Slack bridge calls
-// it, and together with DeliverCommandBroadcast it is the only way a
-// message gets Broadcast or BroadcastTo.
-func (s *Store) DeliverBroadcast(target, body, slackUser, via string, to []string) (sessionID, msgID string, err error) {
+// ("all: message"): the message is marked Broadcast, to lists the
+// broadcast's other recipients by bus address (BroadcastTo), and total is
+// every recipient including this one (BroadcastCount). Only the Slack
+// bridge calls it, and together with DeliverCommandBroadcast it is the
+// only way a message gets Broadcast, BroadcastTo or BroadcastCount.
+func (s *Store) DeliverBroadcast(target, body, slackUser, via string, to []string, total int) (sessionID, msgID string, err error) {
 	return s.deliverFromSlack(target, body, via, func(m *Message) {
 		m.FromUser = true
 		m.SlackUser = slackUser
 		m.Broadcast = true
 		m.BroadcastTo = cappedBroadcastTo(to)
+		m.BroadcastCount = clampBroadcastCount(total)
 	})
 }
 
@@ -257,6 +259,15 @@ func cappedBroadcastTo(to []string) []string {
 		to = to[:MaxBroadcastTo]
 	}
 	return append([]string(nil), to...)
+}
+
+// clampBroadcastCount floors a broadcast's total recipient count at zero,
+// so a caller's mistaken negative never persists as one.
+func clampBroadcastCount(total int) int {
+	if total < 0 {
+		return 0
+	}
+	return total
 }
 
 // DeliverGuest queues a message from a guest: a Slack user who isn't
