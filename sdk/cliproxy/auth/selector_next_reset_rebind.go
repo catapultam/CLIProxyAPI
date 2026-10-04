@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,6 +45,9 @@ const (
 	nextResetRebindMaxSessions = 10000
 	// nextResetRebindSweepEvery bounds how often idle entries are swept.
 	nextResetRebindSweepEvery = 5 * time.Minute
+	// nextResetLearnerIdle prunes tokens-per-% learners of credentials that
+	// have produced no usage for this long (removed or long-idle credentials).
+	nextResetLearnerIdle = 7 * 24 * time.Hour
 
 	nextResetWeeklyUtilizationHeader = "Anthropic-Ratelimit-Unified-7d-Utilization"
 	nextResetContextCompactedHeader  = "X-Claude-Code-Context-Compacted"
@@ -51,14 +55,19 @@ const (
 
 // nextResetSessionState is what the tracker knows about one session and model.
 type nextResetSessionState struct {
-	// hasUsage reports that a response for this session has been observed, so
-	// contextTokens and lastSeen are meaningful.
+	// hasUsage reports that a successful response for this session has been
+	// observed, so contextTokens is meaningful.
 	hasUsage bool
 	// contextTokens is the last observed request size: input + cache read +
 	// cache creation tokens.
 	contextTokens int64
-	// lastSeen is when the last request with observed usage was sent.
-	lastSeen time.Time
+	// usageAt is when the request that produced contextTokens was sent.
+	usageAt time.Time
+	// lastActivity is the latest start of any request of this session: noted
+	// at pick time (so in-flight and failed requests count) and from usage
+	// records, including failed ones that carry cache usage. Cold-cache idle
+	// time is measured from it.
+	lastActivity time.Time
 	// movedAt is when the session was last moved by next-reset.
 	movedAt time.Time
 	// compacted is the compaction header value of the previous request, so
@@ -75,12 +84,13 @@ type nextResetTokenLearner struct {
 	haveUtil    bool
 	estimate    float64
 	samples     int
+	seen        time.Time
 }
 
 // nextResetUsageObservation is one response, as seen by the tracker.
 type nextResetUsageObservation struct {
 	sessionID       string
-	models          []string
+	model           string
 	authID          string
 	input           int64
 	cacheRead       int64
@@ -91,6 +101,8 @@ type nextResetUsageObservation struct {
 	util7d          float64
 	haveUtil7d      bool
 	at              time.Time
+	// failed marks a failed request: it only counts as session activity.
+	failed bool
 }
 
 // weightedTokens prices a response in input-token equivalents. When the
@@ -112,6 +124,29 @@ type nextResetRebindTracker struct {
 	creds       map[string]*nextResetTokenLearner
 	maxSessions int
 	lastSweep   time.Time
+}
+
+// nextResetAffinityModelKey carries the model session affinity keyed the
+// request by, from the conductor to the usage plugin.
+type nextResetAffinityModelKey struct{}
+
+// withNextResetAffinityModel records the affinity model on an execution
+// context so usage records are tracked under the same key the move decision
+// reads.
+func withNextResetAffinityModel(ctx context.Context, model string) context.Context {
+	model = strings.TrimSpace(model)
+	if ctx == nil || model == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, nextResetAffinityModelKey{}, model)
+}
+
+func nextResetAffinityModelFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	model, _ := ctx.Value(nextResetAffinityModelKey{}).(string)
+	return model
 }
 
 func newNextResetRebindTracker(now func() time.Time) *nextResetRebindTracker {
@@ -150,8 +185,8 @@ func nextResetRebindKey(sessionID, model string) string {
 }
 
 // HandleUsage implements coreusage.Plugin.
-func (t *nextResetRebindTracker) HandleUsage(_ context.Context, record coreusage.Record) {
-	if t == nil || record.Failed || strings.TrimSpace(record.AuthID) == "" {
+func (t *nextResetRebindTracker) HandleUsage(ctx context.Context, record coreusage.Record) {
+	if t == nil || strings.TrimSpace(record.AuthID) == "" {
 		return
 	}
 	if record.Generate != nil && !*record.Generate {
@@ -167,11 +202,17 @@ func (t *nextResetRebindTracker) HandleUsage(_ context.Context, record coreusage
 		cacheCreation1h: record.Detail.CacheCreation1hTokens,
 		output:          record.Detail.OutputTokens,
 		at:              record.RequestedAt,
+		failed:          record.Failed,
 	}
-	for _, m := range []string{record.Alias, record.Model} {
-		if key := canonicalModelKey(m); key != "" && (len(obs.models) == 0 || obs.models[0] != key) {
-			obs.models = append(obs.models, key)
-		}
+	// Track only under the key session affinity used for this request. The
+	// alias (the model the client asked for) is the fallback for executions
+	// that did not pass through the conductor.
+	obs.model = nextResetAffinityModelFrom(ctx)
+	if obs.model == "" {
+		obs.model = record.Alias
+	}
+	if obs.model == "" {
+		obs.model = record.Model
 	}
 	if raw := strings.TrimSpace(record.ResponseHeaders.Get(nextResetWeeklyUtilizationHeader)); raw != "" {
 		if f, errParse := strconv.ParseFloat(raw, 64); errParse == nil && f >= 0 {
@@ -193,6 +234,18 @@ func (t *nextResetRebindTracker) observeUsage(o nextResetUsageObservation) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.sweepLocked(now, false)
+
+	if o.failed {
+		// A failed request that still read or wrote the cache refreshed it.
+		if o.sessionID != "" && o.cacheRead+o.cacheCreation > 0 {
+			st := t.sessionLocked(nextResetRebindKey(o.sessionID, o.model), now)
+			if at.After(st.lastActivity) {
+				st.lastActivity = at
+			}
+		}
+		return
+	}
 
 	if o.authID != "" {
 		l := t.creds[o.authID]
@@ -200,6 +253,7 @@ func (t *nextResetRebindTracker) observeUsage(o nextResetUsageObservation) {
 			l = &nextResetTokenLearner{}
 			t.creds[o.authID] = l
 		}
+		l.seen = now
 		l.observe(o.weightedTokens(), o.util7d, o.haveUtil7d)
 	}
 
@@ -207,14 +261,15 @@ func (t *nextResetRebindTracker) observeUsage(o nextResetUsageObservation) {
 	if o.sessionID == "" || contextTokens <= 0 {
 		return
 	}
-	for _, model := range o.models {
-		st := t.sessionLocked(nextResetRebindKey(o.sessionID, model), now)
-		if st.hasUsage && st.lastSeen.After(at) {
-			// An older request finished after a newer one; keep the newer.
-			continue
-		}
-		st.hasUsage, st.contextTokens, st.lastSeen = true, contextTokens, at
+	st := t.sessionLocked(nextResetRebindKey(o.sessionID, o.model), now)
+	if at.After(st.lastActivity) {
+		st.lastActivity = at
 	}
+	if st.hasUsage && st.usageAt.After(at) {
+		// An older request finished after a newer one; keep the newer size.
+		return
+	}
+	st.hasUsage, st.contextTokens, st.usageAt = true, contextTokens, at
 }
 
 // observe folds one response into the estimate. Tokens before the first
@@ -265,15 +320,20 @@ func (t *nextResetRebindTracker) session(key string) (nextResetSessionState, boo
 	return *st, true
 }
 
-// noteRequest records the compaction flag of a request and reports whether
-// it is the first flagged request since an unflagged one.
-func (t *nextResetRebindTracker) noteRequest(key string, compacted bool, now time.Time) bool {
+// noteRequest records the start of a request: its compaction flag and its
+// activity time. It reports whether the request is the first flagged one
+// since an unflagged one, and the session's activity before this request.
+func (t *nextResetRebindTracker) noteRequest(key string, compacted bool, now time.Time) (bool, time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	st := t.sessionLocked(key, now)
 	first := compacted && !st.compacted
 	st.compacted = compacted
-	return first
+	previous := st.lastActivity
+	if now.After(st.lastActivity) {
+		st.lastActivity = now
+	}
+	return first, previous
 }
 
 func (t *nextResetRebindTracker) markMoved(key string, now time.Time) {
@@ -287,7 +347,7 @@ func (t *nextResetRebindTracker) markMoved(key string, now time.Time) {
 func (t *nextResetRebindTracker) sessionLocked(key string, now time.Time) *nextResetSessionState {
 	st, ok := t.sessions[key]
 	if !ok {
-		t.evictLocked(now)
+		t.sweepLocked(now, t.maxSessions > 0 && len(t.sessions) >= t.maxSessions)
 		st = &nextResetSessionState{}
 		t.sessions[key] = st
 	}
@@ -297,17 +357,22 @@ func (t *nextResetRebindTracker) sessionLocked(key string, now time.Time) *nextR
 	return st
 }
 
-// evictLocked drops idle entries every few minutes or when the map is full,
-// then the least recently touched entries while it is still full.
-func (t *nextResetRebindTracker) evictLocked(now time.Time) {
-	full := t.maxSessions > 0 && len(t.sessions) >= t.maxSessions
-	if !full && now.Sub(t.lastSweep) < nextResetRebindSweepEvery {
+// sweepLocked drops idle sessions and learners every few minutes, or now when
+// force is set (the session map is full), then the least recently touched
+// sessions while the map is still full. t.mu must be held.
+func (t *nextResetRebindTracker) sweepLocked(now time.Time, force bool) {
+	if !force && now.Sub(t.lastSweep) < nextResetRebindSweepEvery {
 		return
 	}
 	t.lastSweep = now
 	for key, st := range t.sessions {
 		if now.Sub(st.touched) > nextResetRebindSessionIdle {
 			delete(t.sessions, key)
+		}
+	}
+	for authID, l := range t.creds {
+		if now.Sub(l.seen) > nextResetLearnerIdle {
+			delete(t.creds, authID)
 		}
 	}
 	for t.maxSessions > 0 && len(t.sessions) >= t.maxSessions {
@@ -447,18 +512,59 @@ func nextResetMoveAllowance(a nextResetAssessment, now time.Time) float64 {
 // nextResetMove decides whether the session bound to bound should move, and
 // returns the credential to move to, or nil to stay. candidates are the same
 // credentials a cold pick would rank (the highest available priority tier).
-func (s *SessionAffinitySelector) nextResetMove(ctx context.Context, provider, model, sessionID string, opts cliproxyexecutor.Options, candidates []*Auth, bound *Auth) *Auth {
+// nextResetMoveDecision is a move nextResetMove found worthwhile. It only
+// takes effect once the caller has re-bound the session (compare-and-set);
+// commit then records the move and logs it.
+type nextResetMoveDecision struct {
+	target  *Auth
+	tracker *nextResetRebindTracker
+	key     string
+	now     time.Time
+	message string
+}
+
+func (d *nextResetMoveDecision) commit(ctx context.Context) {
+	d.tracker.markMoved(d.key, d.now)
+	selectorLogEntry(ctx).Info(d.message)
+}
+
+// nextResetTracker returns the move tracker when next-reset is the fallback.
+func (s *SessionAffinitySelector) nextResetTracker() (*NextResetSelector, *nextResetRebindTracker) {
 	nr, ok := s.fallback.(*NextResetSelector)
-	if !ok || nr == nil || nr.rebind == nil || bound == nil || sessionID == "" {
+	if !ok || nr == nil || nr.rebind == nil {
+		return nil, nil
+	}
+	return nr, nr.rebind
+}
+
+// noteNextResetRequest records the start of a session request that did not
+// go through nextResetMove (cold binding, failover, fallback-key hit), so its
+// activity still counts against cold-cache idle time.
+func (s *SessionAffinitySelector) noteNextResetRequest(sessionID, model string, opts cliproxyexecutor.Options) {
+	nr, tracker := s.nextResetTracker()
+	if tracker == nil || sessionID == "" {
+		return
+	}
+	tracker.noteRequest(nextResetRebindKey(sessionID, model), nextResetHeaderCompacted(opts.Headers), nr.clock())
+}
+
+// nextResetMove decides whether the session bound to bound should move, and
+// returns the move, or nil to stay. candidates are the same credentials a
+// cold pick would rank (the highest available priority tier). compacted is
+// the request's IsCompactionMetadataKey flag, captured before Pick clears it
+// on the explicit-session path.
+func (s *SessionAffinitySelector) nextResetMove(ctx context.Context, provider, model, sessionID string, opts cliproxyexecutor.Options, candidates []*Auth, bound *Auth, compacted bool) *nextResetMoveDecision {
+	nr, tracker := s.nextResetTracker()
+	if tracker == nil || bound == nil || sessionID == "" {
 		return nil
 	}
-	tracker := nr.rebind
 	now := nr.clock()
 	key := nextResetRebindKey(sessionID, model)
-	// Note the header on every bound request, before any early return, so a
-	// sticky header only counts on the first request after a compaction.
-	firstAfterCompaction := tracker.noteRequest(key, nextResetHeaderCompacted(opts.Headers), now) ||
-		nextResetMetadataCompacted(opts.Metadata)
+	// Note every bound request at its start, before any early return: the
+	// activity time makes in-flight and failed requests count as cache use,
+	// and a sticky compaction header only counts on the first request.
+	firstFlagged, lastActivity := tracker.noteRequest(key, nextResetHeaderCompacted(opts.Headers), now)
+	firstAfterCompaction := firstFlagged || compacted || nextResetMetadataCompacted(opts.Metadata)
 
 	st, ok := tracker.session(key)
 	if !ok || !st.hasUsage {
@@ -492,7 +598,7 @@ func (s *SessionAffinitySelector) nextResetMove(ctx context.Context, provider, m
 	if facts.oneHourTTL {
 		ttl = nextResetCacheTTL1h
 	}
-	cold := firstAfterCompaction || now.Sub(st.lastSeen) > ttl
+	cold := firstAfterCompaction || now.Sub(lastActivity) > ttl
 	cost := 0.0
 	if !cold {
 		tokensPerPct, okEstimate := tracker.tokensPerPct(a.auth.ID)
@@ -506,11 +612,15 @@ func (s *SessionAffinitySelector) nextResetMove(ctx context.Context, provider, m
 		return nil
 	}
 
-	tracker.markMoved(key, now)
-	selectorLogEntry(ctx).Infof(
-		"next-reset: moved session | session=%s from=%s to=%s cost=%.3f%% allowance=%.3f%% a_reset=%s b_reset=%s cold=%t",
-		truncateSessionID(sessionID), nextResetAuthIdentity(bound), nextResetAuthIdentity(a.auth), cost, allowance,
-		a.weeklyResetsAt.Format(time.RFC3339), b.weeklyResetsAt.Format(time.RFC3339), cold,
-	)
-	return a.auth
+	return &nextResetMoveDecision{
+		target:  a.auth,
+		tracker: tracker,
+		key:     key,
+		now:     now,
+		message: fmt.Sprintf(
+			"next-reset: moved session | session=%s from=%s to=%s cost=%.3f%% allowance=%.3f%% a_reset=%s b_reset=%s cold=%t",
+			truncateSessionID(sessionID), nextResetAuthIdentity(bound), nextResetAuthIdentity(a.auth), cost, allowance,
+			a.weeklyResetsAt.Format(time.RFC3339), b.weeklyResetsAt.Format(time.RFC3339), cold,
+		),
+	}
 }

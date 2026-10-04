@@ -147,8 +147,34 @@ func (c *SessionCache) SetAliases(authID string, sessionIDs ...string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ensureInitializedLocked()
-	now := time.Now()
+	c.setAliasesLocked(authID, time.Now(), sessionIDs...)
+}
 
+// CompareAndSetAliases binds sessionIDs to authID, like SetAliases, but only
+// while sessionIDs[0] is still bound to expectedAuthID. It returns the binding
+// of sessionIDs[0] after the call ("" when there is none) and whether the
+// binding was written. A request that read a binding uses this so it cannot
+// overwrite a newer binding written concurrently by another request.
+func (c *SessionCache) CompareAndSetAliases(expectedAuthID, authID string, sessionIDs ...string) (string, bool) {
+	if c == nil || expectedAuthID == "" || authID == "" || len(sessionIDs) == 0 || sessionIDs[0] == "" {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureInitializedLocked()
+	now := time.Now()
+	entry, ok := c.entries[sessionIDs[0]]
+	if !ok || !now.Before(entry.expiresAt) {
+		return "", false
+	}
+	if entry.authID != expectedAuthID {
+		return entry.authID, false
+	}
+	c.setAliasesLocked(authID, now, sessionIDs...)
+	return authID, true
+}
+
+func (c *SessionCache) setAliasesLocked(authID string, now time.Time, sessionIDs ...string) {
 	aliases := mergeSessionAliases(nil, sessionIDs...)
 	previousGroups := make([]sessionEntry, 0, len(sessionIDs))
 	for _, sessionID := range sessionIDs {

@@ -62,9 +62,14 @@ func (f *rebindFixture) pick(opts cliproxyexecutor.Options, auths ...*Auth) *Aut
 	return got
 }
 
-// bind binds the session to b by making b the only candidate.
+// bind binds the session to b by making b the only candidate. The binding
+// request happens 90 minutes ago, before any request the tests observe, so
+// its pick-time activity never decides whether the cache is warm.
 func (f *rebindFixture) bind(b *Auth) {
 	f.t.Helper()
+	now := f.now
+	f.now = now.Add(-90 * time.Minute)
+	defer func() { f.now = now }()
 	if got := f.pick(f.opts(""), b); got.ID != b.ID {
 		f.t.Fatalf("bind got %s, want %s", got.ID, b.ID)
 	}
@@ -75,7 +80,7 @@ func (f *rebindFixture) observe(authID string, contextTokens int64, ago time.Dur
 	f.t.Helper()
 	f.tracker.observeUsage(nextResetUsageObservation{
 		sessionID: f.canon,
-		models:    []string{rebindModel},
+		model:     rebindModel,
 		authID:    authID,
 		input:     contextTokens,
 		output:    10,
@@ -86,7 +91,7 @@ func (f *rebindFixture) observe(authID string, contextTokens int64, ago time.Dur
 func (f *rebindFixture) setTokensPerPct(authID string, v float64) {
 	f.tracker.mu.Lock()
 	defer f.tracker.mu.Unlock()
-	f.tracker.creds[authID] = &nextResetTokenLearner{estimate: v, samples: nextResetLearnerMinSamples}
+	f.tracker.creds[authID] = &nextResetTokenLearner{estimate: v, samples: nextResetLearnerMinSamples, seen: f.now}
 }
 
 func approxEqual(a, b float64) bool { return math.Abs(a-b) <= 1e-6*math.Max(1, math.Abs(b)) }
@@ -124,6 +129,8 @@ func TestNextResetRebindNoMoveWhenTargetShortWindowNearFull(t *testing.T) {
 		t.Fatalf("moved to %s whose open 5h window is near full", got.ID)
 	}
 	// The same 90% on a 5h window that has already closed does not block.
+	// The request above counts as activity, so let the cache go cold again.
+	f.now = f.now.Add(6 * time.Minute)
 	a2 := claudeAuthWithShortWindow("a", 20, 10*time.Hour, 90, nrNow.Add(-time.Minute))
 	if got := f.pick(f.opts(""), a2, b); got.ID != "a" {
 		t.Fatalf("closed 5h window blocked the move: got %s", got.ID)
@@ -144,6 +151,9 @@ func TestNextResetRebindNoMoveWithinHourOfLastMove(t *testing.T) {
 	if got := f.pick(f.opts(""), a, b, c); got.ID != "a" {
 		t.Fatalf("moved again within the hour: got %s", got.ID)
 	}
+	// The 59-minute request keeps the cache warm, so make the warm move to c
+	// affordable: 1150 tokens cost 1.15% of c's quota, under its allowance.
+	f.setTokensPerPct("c", 1000)
 	f.now = f.now.Add(2 * time.Minute)
 	if got := f.pick(f.opts(""), a, b, c); got.ID != "c" {
 		t.Fatalf("after the hour got %s, want c", got.ID)
@@ -228,17 +238,18 @@ func TestNextResetRebindCompactionIsColdRegardlessOfCost(t *testing.T) {
 func TestNextResetRebindCompactionHeaderOnlyCountsOnFirstRequest(t *testing.T) {
 	tr := newNextResetRebindTracker(func() time.Time { return nrNow })
 	key := nextResetRebindKey("s", rebindModel)
-	if tr.noteRequest(key, false, nrNow) {
+	note := func(flag bool) bool { first, _ := tr.noteRequest(key, flag, nrNow); return first }
+	if note(false) {
 		t.Fatal("unflagged request reported as first after compaction")
 	}
-	if !tr.noteRequest(key, true, nrNow) {
+	if !note(true) {
 		t.Fatal("first flagged request not reported")
 	}
-	if tr.noteRequest(key, true, nrNow) {
+	if note(true) {
 		t.Fatal("sticky flag reported twice")
 	}
-	tr.noteRequest(key, false, nrNow)
-	if !tr.noteRequest(key, true, nrNow) {
+	note(false)
+	if !note(true) {
 		t.Fatal("a later compaction was not reported")
 	}
 }
@@ -494,13 +505,14 @@ func TestNextResetRebindHandleUsageRecord(t *testing.T) {
 			"Anthropic-Ratelimit-Unified-7d-Utilization": []string{"0.25"},
 		},
 	}
+	// Without an affinity model on the context, the alias is the key.
 	tr.HandleUsage(context.Background(), rec)
 	st, ok := tr.session(nextResetRebindKey("claude:sess", rebindModel))
-	if !ok || !st.hasUsage || st.contextTokens != 1210 || !st.lastSeen.Equal(nrNow.Add(-time.Minute)) {
+	if !ok || !st.hasUsage || st.contextTokens != 1210 || !st.usageAt.Equal(nrNow.Add(-time.Minute)) || !st.lastActivity.Equal(nrNow.Add(-time.Minute)) {
 		t.Fatalf("alias-keyed session = %+v, %v", st, ok)
 	}
-	if _, ok := tr.session(nextResetRebindKey("claude:sess", "claude-sonnet-5-5-20260101")); !ok {
-		t.Fatal("upstream-model key not recorded")
+	if _, ok := tr.session(nextResetRebindKey("claude:sess", "claude-sonnet-5-5-20260101")); ok {
+		t.Fatal("usage also written under the upstream model key")
 	}
 	tr.mu.Lock()
 	l := tr.creds["a"]
@@ -508,10 +520,226 @@ func TestNextResetRebindHandleUsageRecord(t *testing.T) {
 	if l == nil || !l.haveUtil || l.lastUtil != 0.25 {
 		t.Fatalf("learner = %+v", l)
 	}
-	// Failed records are ignored.
+	// A failed record without cache usage is ignored; with cache usage it is
+	// session activity only, never a context size.
 	tr.HandleUsage(context.Background(), coreusage.Record{SessionID: "claude:other", Model: rebindModel, AuthID: "a", Failed: true, Detail: coreusage.Detail{InputTokens: 5}})
 	if _, ok := tr.session(nextResetRebindKey("claude:other", rebindModel)); ok {
-		t.Fatal("failed record tracked")
+		t.Fatal("failed record without cache usage tracked")
+	}
+	tr.HandleUsage(context.Background(), coreusage.Record{SessionID: "claude:other", Model: rebindModel, AuthID: "a", Failed: true,
+		RequestedAt: nrNow, Detail: coreusage.Detail{CacheReadTokens: 5}})
+	st, ok = tr.session(nextResetRebindKey("claude:other", rebindModel))
+	if !ok || st.hasUsage || !st.lastActivity.Equal(nrNow) {
+		t.Fatalf("failed record with cache usage = %+v, %v", st, ok)
+	}
+}
+
+func TestNextResetRebindUsageOnlyUnderAffinityModelKey(t *testing.T) {
+	tr := newNextResetRebindTracker(func() time.Time { return nrNow })
+	main := withNextResetAffinityModel(context.Background(), rebindModel)
+	tr.HandleUsage(main, coreusage.Record{
+		SessionID: "claude:sess", AuthID: "a", RequestedAt: nrNow,
+		Model: "claude-sonnet-5-5-20260101", Alias: "my-sonnet-alias",
+		Detail: coreusage.Detail{InputTokens: 50_000},
+	})
+	// A helper-model request under the same session ID stays isolated.
+	helper := withNextResetAffinityModel(context.Background(), "claude-haiku-5-5")
+	tr.HandleUsage(helper, coreusage.Record{
+		SessionID: "claude:sess", AuthID: "a", RequestedAt: nrNow.Add(time.Second),
+		Model: "claude-haiku-5-5", Alias: rebindModel,
+		Detail: coreusage.Detail{InputTokens: 300},
+	})
+	st, ok := tr.session(nextResetRebindKey("claude:sess", rebindModel))
+	if !ok || st.contextTokens != 50_000 {
+		t.Fatalf("affinity-model session = %+v, %v (helper request leaked in)", st, ok)
+	}
+	if st, ok := tr.session(nextResetRebindKey("claude:sess", "claude-haiku-5-5")); !ok || st.contextTokens != 300 {
+		t.Fatalf("helper session = %+v, %v", st, ok)
+	}
+	for _, other := range []string{"claude-sonnet-5-5-20260101", "my-sonnet-alias"} {
+		if _, ok := tr.session(nextResetRebindKey("claude:sess", other)); ok {
+			t.Fatalf("usage written under non-affinity key %q", other)
+		}
+	}
+}
+
+func TestContextWithRequestedModelAliasCarriesAffinityModel(t *testing.T) {
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.SessionAffinityModelMetadataKey: rebindModel}}
+	if got := nextResetAffinityModelFrom(contextWithRequestedModelAlias(context.Background(), opts, "route-model")); got != rebindModel {
+		t.Fatalf("affinity model = %q, want %q", got, rebindModel)
+	}
+	if got := nextResetAffinityModelFrom(contextWithRequestedModelAlias(context.Background(), cliproxyexecutor.Options{}, "route-model")); got != "route-model" {
+		t.Fatalf("fallback affinity model = %q", got)
+	}
+}
+
+func TestNextResetLearnersPrunedAfterSevenDaysIdle(t *testing.T) {
+	now := nrNow
+	tr := newNextResetRebindTracker(func() time.Time { return now })
+	obs := func(authID string) {
+		tr.observeUsage(nextResetUsageObservation{authID: authID, input: 1, at: now})
+	}
+	obs("old")
+	now = now.Add(6 * 24 * time.Hour)
+	obs("recent")
+	now = now.Add(24*time.Hour + time.Minute)
+	obs("new")
+	tr.mu.Lock()
+	_, oldKept := tr.creds["old"]
+	_, recentKept := tr.creds["recent"]
+	_, newKept := tr.creds["new"]
+	tr.mu.Unlock()
+	if oldKept {
+		t.Fatal("learner idle over 7 days not pruned")
+	}
+	if !recentKept || !newKept {
+		t.Fatalf("recent=%v new=%v, want both kept", recentKept, newKept)
+	}
+}
+
+func TestNextResetRebindIdleCountsCancelledAndInFlightRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cancelled bool
+	}{
+		{"cancelled at minute 4", true},
+		{"in flight since minute 4", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRebindFixture(t)
+			b := claudeAuth("b", 20, 100*time.Hour)
+			a := claudeAuth("a", 20, 10*time.Hour)
+			f.bind(b)
+			f.observe("b", 900_000, 0) // last completed request at minute 0
+			start := f.now
+			f.now = start.Add(4 * time.Minute)
+			if got := f.pick(f.opts(""), a, b); got.ID != "b" {
+				t.Fatalf("minute 4 got %s, want b (warm)", got.ID)
+			}
+			if tc.cancelled {
+				// The cancelled request reports a failure without usage.
+				f.tracker.HandleUsage(context.Background(), coreusage.Record{
+					SessionID: f.canon, Alias: rebindModel, AuthID: "b", Failed: true, RequestedAt: f.now,
+				})
+			}
+			f.now = start.Add(6 * time.Minute)
+			if got := f.pick(f.opts(""), a, b); got.ID != "b" {
+				t.Fatalf("minute 6 got %s: the minute-4 request kept the cache warm", got.ID)
+			}
+		})
+	}
+}
+
+func TestNextResetRebindFailedRecordWithCacheUsageIsActivity(t *testing.T) {
+	f := newRebindFixture(t)
+	b := claudeAuth("b", 20, 100*time.Hour)
+	a := claudeAuth("a", 20, 10*time.Hour)
+	f.bind(b)
+	f.observe("b", 900_000, 0)
+	start := f.now
+	// A request at minute 4 that failed after reading the cache, picked
+	// outside this selector instance (no pick-time note here).
+	f.tracker.HandleUsage(withNextResetAffinityModel(context.Background(), rebindModel), coreusage.Record{
+		SessionID: f.canon, AuthID: "b", Failed: true, RequestedAt: start.Add(4 * time.Minute),
+		Detail: coreusage.Detail{CacheReadTokens: 900_000},
+	})
+	f.now = start.Add(6 * time.Minute)
+	if got := f.pick(f.opts(""), a, b); got.ID != "b" {
+		t.Fatalf("got %s: failed request with cache usage should keep the cache warm", got.ID)
+	}
+}
+
+func TestNextResetRebindCompactionMetadataThroughPick(t *testing.T) {
+	f := newRebindFixture(t)
+	b := claudeAuth("b", 20, 100*time.Hour)
+	a := claudeAuth("a", 20, 10*time.Hour)
+	f.bind(b)
+	f.observe("b", 900_000, time.Minute) // warm, no estimate for a
+	if got := f.pick(f.opts(""), a, b); got.ID != "b" {
+		t.Fatalf("warm request without compaction moved to %s", got.ID)
+	}
+	opts := f.opts("")
+	opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+	if got := f.pick(opts, a, b); got.ID != "a" {
+		t.Fatalf("compaction-flagged request got %s, want a", got.ID)
+	}
+	if _, still := opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey]; still {
+		t.Fatal("explicit-session path no longer clears the compaction flag")
+	}
+}
+
+type rebindRoleKey struct{}
+
+// TestNextResetRebindConcurrentCacheHitCannotUndoMove interleaves two requests
+// of one session deterministically: both read binding b, then the first moves
+// the session to a, and only then does the second (which would not move)
+// re-bind. The second must follow the move instead of restoring b.
+func TestNextResetRebindConcurrentCacheHitCannotUndoMove(t *testing.T) {
+	f := newRebindFixture(t)
+	b := claudeAuth("b", 20, 100*time.Hour)
+	a := claudeAuth("a", 20, 10*time.Hour)
+	f.bind(b)
+	f.observe("b", 1000, time.Hour) // cold: a move is free
+
+	stayerRead := make(chan struct{})
+	moverDone := make(chan struct{})
+	f.affinity.afterCacheReadHook = func(ctx context.Context) {
+		if ctx.Value(rebindRoleKey{}) == "stayer" {
+			close(stayerRead)
+			<-moverDone
+		}
+	}
+
+	advisor := `{"messages":[{"role":"assistant","content":[{"type":"advisor_redacted_result","data":"x"}]}]}`
+	stayerOpts := f.opts(advisor) // advisor results: this request never moves
+	type result struct {
+		auth *Auth
+		err  error
+	}
+	stayer := make(chan result, 1)
+	go func() {
+		ctx := context.WithValue(context.Background(), rebindRoleKey{}, "stayer")
+		got, err := f.affinity.Pick(ctx, "claude", rebindModel, stayerOpts, []*Auth{a, b})
+		stayer <- result{got, err}
+	}()
+
+	<-stayerRead // the stayer holds a read of b
+	moved, err := f.affinity.Pick(context.Background(), "claude", rebindModel, f.opts(""), []*Auth{a, b})
+	if err != nil || moved.ID != "a" {
+		t.Fatalf("mover got %v, %v; want a", moved, err)
+	}
+	close(moverDone)
+
+	res := <-stayer
+	if res.err != nil || res.auth.ID != "a" {
+		t.Fatalf("stayer got %v, %v; want a (the concurrent move)", res.auth, res.err)
+	}
+	f.affinity.afterCacheReadHook = nil
+	if got := f.pick(f.opts(""), a, b); got.ID != "a" {
+		t.Fatalf("binding after both requests is %s, want a", got.ID)
+	}
+	if st, _ := f.tracker.session(nextResetRebindKey(f.canon, rebindModel)); !st.movedAt.Equal(f.now) {
+		t.Fatalf("movedAt = %v, want %v", st.movedAt, f.now)
+	}
+}
+
+func TestSessionCacheCompareAndSetAliases(t *testing.T) {
+	c := NewSessionCache(time.Hour)
+	defer c.Stop()
+	if _, ok := c.CompareAndSetAliases("b", "a", "k"); ok {
+		t.Fatal("swapped a missing binding")
+	}
+	c.SetAliases("b", "k", "alias")
+	if cur, ok := c.CompareAndSetAliases("x", "a", "k"); ok || cur != "b" {
+		t.Fatalf("stale expectation: cur=%q ok=%v", cur, ok)
+	}
+	if cur, ok := c.CompareAndSetAliases("b", "a", "k", "alias"); !ok || cur != "a" {
+		t.Fatalf("swap: cur=%q ok=%v", cur, ok)
+	}
+	for _, key := range []string{"k", "alias"} {
+		if got, _ := c.Get(key); got != "a" {
+			t.Fatalf("%s bound to %q, want a", key, got)
+		}
 	}
 }
 
@@ -520,7 +748,7 @@ func TestNextResetRebindSessionsAreBounded(t *testing.T) {
 	tr := newNextResetRebindTracker(func() time.Time { return now })
 	tr.maxSessions = 3
 	add := func(id string) {
-		tr.observeUsage(nextResetUsageObservation{sessionID: id, models: []string{rebindModel}, authID: "a", input: 1, at: now})
+		tr.observeUsage(nextResetUsageObservation{sessionID: id, model: rebindModel, authID: "a", input: 1, at: now})
 	}
 	add("old")
 	now = now.Add(nextResetRebindSessionIdle + time.Minute)

@@ -1595,6 +1595,13 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
 	alias := requestedModelAliasFromOptions(opts, fallback)
 	ctx = coreusage.WithRequestedModelAlias(ctx, alias)
+	// The next-reset usage tracker keys sessions by the model session affinity
+	// used for the pick (recorded in metadata by Pick), else the route model.
+	affinityModel := sessionMetadataString(opts.Metadata, cliproxyexecutor.SessionAffinityModelMetadataKey)
+	if affinityModel == "" {
+		affinityModel = fallback
+	}
+	ctx = withNextResetAffinityModel(ctx, affinityModel)
 	effort := reasoningEffortFromOptions(opts)
 	if effort != "" {
 		ctx = coreusage.WithReasoningEffort(ctx, effort)

@@ -917,6 +917,9 @@ type SessionAffinitySelector struct {
 	cache            *SessionCache
 	matcher          *cliproxysession.MerklePrefixMatcher
 	subagentAffinity bool
+	// afterCacheReadHook, when set, runs between reading a session binding and
+	// re-binding it. Tests use it to interleave concurrent requests.
+	afterCacheReadHook func(ctx context.Context)
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -984,6 +987,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	// Explicit harness identities are absolute authority. The LCP matcher is only
 	// consulted when no header, body, or execution-session identity is present.
 	explicitID, explicitFallbackID := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	// The compaction flag is cleared below on the explicit-session path, but
+	// the next-reset move decision treats it as a cold prompt cache.
+	compactionFlag := nextResetMetadataCompacted(opts.Metadata)
 	if explicitID == "" {
 		if auth, handled, errLCP := s.pickLCP(ctx, provider, model, opts, auths, entry); handled || errLCP != nil {
 			return auth, errLCP
@@ -1051,25 +1057,56 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
 	}
+	bindAliases := fallbackKey != "" && !isSubagent && !isFork
 	bind := func(authID string) {
-		if fallbackKey != "" && !isSubagent && !isFork {
+		if bindAliases {
 			s.cache.SetAliases(authID, cacheKey, fallbackKey)
 		} else {
 			s.cache.Set(cacheKey, authID)
 		}
 	}
+	// rebind writes authID only while the session is still bound to expected,
+	// so a request holding a stale read cannot undo a concurrent re-binding.
+	rebind := func(expected, authID string) (string, bool) {
+		if bindAliases {
+			return s.cache.CompareAndSetAliases(expected, authID, cacheKey, fallbackKey)
+		}
+		return s.cache.CompareAndSetAliases(expected, authID, cacheKey)
+	}
+	findAvailable := func(authID string) *Auth {
+		for _, auth := range available {
+			if auth.ID == authID {
+				return auth
+			}
+		}
+		return nil
+	}
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				// next-reset may move the bound session toward the credential
-				// that resets first; the move logs its own line.
-				if moved := s.nextResetMove(ctx, provider, model, primaryID, opts, fallbackAuths, auth); moved != nil {
-					bind(moved.ID)
-					return moved, nil
+		if s.afterCacheReadHook != nil {
+			s.afterCacheReadHook(ctx)
+		}
+		if bound := findAvailable(cachedAuthID); bound != nil {
+			// next-reset may move the bound session toward the credential
+			// that resets first; the move logs its own line.
+			target := bound
+			move := s.nextResetMove(ctx, provider, model, primaryID, opts, fallbackAuths, bound, compactionFlag)
+			if move != nil {
+				target = move.target
+			}
+			current, swapped := rebind(bound.ID, target.ID)
+			if swapped {
+				if move != nil {
+					move.commit(ctx)
+					return target, nil
 				}
-				bind(auth.ID)
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
+				return bound, nil
+			}
+			// Another request re-bound the session after this one read it;
+			// follow the current binding instead of overwriting it.
+			if auth := findAvailable(current); auth != nil {
+				entry.Infof("session-affinity: cache hit after concurrent re-bind | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
@@ -1083,6 +1120,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, nil
 		}
 		bind(auth.ID)
+		s.noteNextResetRequest(primaryID, model, opts)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
@@ -1093,6 +1131,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				if auth.ID == cachedAuthID {
 					if !isSubagent || s.subagentAffinity {
 						bind(auth.ID)
+						s.noteNextResetRequest(primaryID, model, opts)
 						if isFork {
 							entry.Infof("session-affinity: fork cache hit | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 						} else {
@@ -1115,6 +1154,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, nil
 	}
 	bind(auth.ID)
+	s.noteNextResetRequest(primaryID, model, opts)
 	if isFork && fallbackID != "" {
 		entry.Infof("session-affinity: fork bound to new auth | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 	} else {
