@@ -2,6 +2,7 @@ package agentbus
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"reflect"
 	"sync"
@@ -110,6 +111,80 @@ func TestHandOffCarriesNameInboxAndUnacked(t *testing.T) {
 	// Deliveries by the old name now reach the new session.
 	if id, _, errDeliver := s.Deliver("flyer", "third", "alex"); errDeliver != nil || id != sidC {
 		t.Fatalf("Deliver(flyer) = %q, %v", id, errDeliver)
+	}
+}
+
+// Fix round 2, finding 1: Send follows a handoff chain to the live
+// successor, the same way Ack does, so a peer that was handed an address
+// before a handoff (/clear, /resume, /branch) — such as another agent's
+// BroadcastTo — still reaches whoever took it over, instead of queuing into
+// an abandoned inbox nothing will ever drain.
+func TestSendFollowsHandoffToTheAddressABroadcastNamed(t *testing.T) {
+	s, _ := newTestStore(t)
+	capableSession(s, sidA, "/work/a", "")
+	capableSession(s, sidB, "/work/b", "")
+	addrA, addrB := s.Address(sidA), s.Address(sidB)
+
+	// A and B each receive a broadcast naming the other, the way a real
+	// broadcast's BroadcastTo would.
+	if _, _, err := s.DeliverBroadcast(sidA, "status please", "alex", "", []string{addrB}, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.DeliverBroadcast(sidB, "status please", "alex", "", []string{addrA}, 2); err != nil {
+		t.Fatal(err)
+	}
+	mA := claimOneMsg(t, s, sidA)
+	if !reflect.DeepEqual(mA.BroadcastTo, []string{addrB}) {
+		t.Fatalf("A's broadcast_to = %v", mA.BroadcastTo)
+	}
+	claimOneMsg(t, s, sidB) // drain B's copy; irrelevant to the handoff below
+
+	// B hands off to C (/clear): B must already be offline, like a real one.
+	s.Bye(sidB)
+	s.Hello(sidC, "pc", "/work/b", "", true)
+	if err := s.HandOff(sidB, sidC); err != nil {
+		t.Fatalf("HandOff = %v", err)
+	}
+
+	// A sends to the address B's broadcast_to named. It must reach C, not
+	// queue into B's abandoned (closed) inbox.
+	if _, err := s.Send(sidA, addrB, "coordinating", ""); err != nil {
+		t.Fatal(err)
+	}
+	if s.Pending(sidB) {
+		t.Fatal("the send queued into the handed-off session's abandoned inbox")
+	}
+	if got := claimOneMsg(t, s, sidC); got.Body != "coordinating" {
+		t.Fatalf("C's inbox = %+v", got)
+	}
+}
+
+// Fix round 2, finding 1: the hop limit guards a handoff cycle (which
+// HandOff itself should never create, but Send's walk must still
+// terminate rather than loop forever on corrupted state).
+func TestSendFollowsHandoffBoundedHops(t *testing.T) {
+	s, _ := newTestStore(t)
+	capableSession(s, sidA, "/work/a", "")
+	addrA := s.Address(sidA)
+	// Build a chain of maxMoveHops+2 handoffs, well past the bound.
+	prev := sidA
+	for i := 0; i < maxMoveHops+2; i++ {
+		// A distinct 6-char prefix per hop, so each gets its own address.
+		next := fmt.Sprintf("c%05d-2222-3333-4444-555555555555", i)
+		s.Hello(next, "pc", "/work/a", "", true)
+		s.Bye(prev)
+		if err := s.HandOff(prev, next); err != nil {
+			t.Fatalf("HandOff %d = %v", i, err)
+		}
+		prev = next
+	}
+	if _, err := s.Send(sidA, addrA, "hi", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Whatever it resolved to (bounded by maxMoveHops), it must be some
+	// session in the chain, not a hang or a panic.
+	if s.Pending(sidA) {
+		t.Fatal("queued into the very first, long-abandoned session")
 	}
 }
 

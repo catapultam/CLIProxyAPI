@@ -500,7 +500,10 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	if !ok {
 		return Message{}, ErrUnknownTarget
 	}
-	target := s.byID[targetID]
+	// to may name a session from before a handoff (/clear, /resume,
+	// /branch): follow MovedTo to whoever actually took it over, so this
+	// doesn't queue into an abandoned inbox nothing will ever drain.
+	_, target := s.followHandoffsLocked(targetID, s.byID[targetID])
 	msg.To = s.addressLocked(target)
 	s.enqueueLocked(target, msg)
 	return msg, nil

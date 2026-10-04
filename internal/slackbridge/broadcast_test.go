@@ -361,46 +361,67 @@ func TestBroadcastToNamesTheOtherRecipients(t *testing.T) {
 	}
 }
 
-// Task fix round 1 (finding 2): an offline session's name can be reused by
-// a later, unrelated one (nameFree skips offline sessions). BroadcastTo
-// must list unique bus addresses, resolving to the intended other session,
-// never a name that could now mean someone else, and never the recipient
-// itself.
+// Task fix round 2 (finding 2): an offline session's name can be reused by
+// a later, unrelated one (nameFree skips offline sessions), and the
+// original holder can then reconnect under the same session id. Hello
+// never clears a session's stored name, and nameFree refuses to let the
+// reconnected original reclaim a name another live session now holds, so
+// both end up live and named "flyer" at once — exactly the ambiguity
+// BroadcastTo must survive by using addresses, resolving to the intended
+// other session, never a name that could now mean someone else, and never
+// the recipient itself.
 func TestBroadcastToSurvivesOfflineNameReuse(t *testing.T) {
 	b, _, bus := newTestBridge(t)
+	addrA := bus.Address(sidA)
 	// sidA ("flyer") goes offline, freeing its name.
 	bus.Bye(sidA)
-	// A different, later session reconnects and claims the freed name.
+	// A different session claims the freed name.
 	bus.Hello(sidC, "pc", "/work/newcomer", "flyer", true)
 	addrB := bus.Address(sidB)
 	addrC := bus.Address(sidC)
+	// The original holder reconnects with the same session id. It can't
+	// reclaim "flyer" (sidC holds it live), but its own stored name is
+	// still "flyer" from before, so it goes live again still named that,
+	// alongside sidC.
+	bus.Hello(sidA, "pc", "/work/flyer", "flyer", true)
 
 	b.handleEvent("EvBr1", msg("UALEX", "all: status please", "1700011900.000001", ""))
-	if bus.Pending(sidA) {
-		t.Fatal("an offline session (whose name was reused) got the broadcast")
-	}
+	mA := claimOne(t, bus, sidA)
 	mB := claimOne(t, bus, sidB)
 	mC := claimOne(t, bus, sidC)
-	if !mB.Broadcast || !mC.Broadcast {
-		t.Fatalf("mB = %+v, mC = %+v", mB, mC)
+	if !mA.Broadcast || !mB.Broadcast || !mC.Broadcast {
+		t.Fatalf("mA = %+v, mB = %+v, mC = %+v", mA, mB, mC)
 	}
 
-	if !reflect.DeepEqual(mB.BroadcastTo, []string{addrC}) {
-		t.Fatalf("B broadcast_to = %v, want [%s]", mB.BroadcastTo, addrC)
+	want := map[string][]string{
+		sidA: {addrB, addrC},
+		sidB: {addrA, addrC},
+		sidC: {addrA, addrB},
 	}
-	if !reflect.DeepEqual(mC.BroadcastTo, []string{addrB}) {
-		t.Fatalf("C broadcast_to = %v, want [%s]", mC.BroadcastTo, addrB)
+	got := map[string][]string{sidA: mA.BroadcastTo, sidB: mB.BroadcastTo, sidC: mC.BroadcastTo}
+	for sid, w := range want {
+		if !sameSet(got[sid], w) {
+			t.Fatalf("%s broadcast_to = %v, want set %v", sid, got[sid], w)
+		}
 	}
-	for _, addr := range append(append([]string{}, mB.BroadcastTo...), mC.BroadcastTo...) {
-		if addr == "flyer" {
-			t.Fatal("broadcast_to used the reused name instead of an address")
-		}
-		sid, ok := bus.Resolve(addr)
-		if !ok {
-			t.Fatalf("broadcast_to target %q doesn't resolve", addr)
-		}
-		if sid != sidB && sid != sidC {
-			t.Fatalf("broadcast_to target %q resolved to an unexpected session %s", addr, sid)
+	// Every listed target resolves to the intended other session: never
+	// the ambiguous name both sidA and sidC now answer to, and never the
+	// recipient itself.
+	for sid, m := range map[string]agentbus.Message{sidA: mA, sidB: mB, sidC: mC} {
+		for _, addr := range m.BroadcastTo {
+			if addr == "flyer" {
+				t.Fatalf("%s's broadcast_to used the ambiguous name instead of an address", sid)
+			}
+			resolved, ok := bus.Resolve(addr)
+			if !ok {
+				t.Fatalf("%s's broadcast_to target %q doesn't resolve", sid, addr)
+			}
+			if resolved == sid {
+				t.Fatalf("%s's broadcast_to named itself: %q", sid, addr)
+			}
+			if resolved != sidA && resolved != sidB && resolved != sidC {
+				t.Fatalf("%s's broadcast_to target %q resolved to an unexpected session %s", sid, addr, resolved)
+			}
 		}
 	}
 }
