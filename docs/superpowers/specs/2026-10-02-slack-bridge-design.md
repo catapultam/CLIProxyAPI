@@ -1092,3 +1092,39 @@ backing map are gone.
 
 **Mod 0.3.9.** `register.ts`'s `VERSION` and `.claude-plugin/plugin.json`
 both move to 0.3.9.
+
+### Broadcast coordination (mod 0.3.10)
+
+A broadcast's recipients couldn't tell they weren't the only one asked, so
+two agents could both answer the same `all:` or duplicate a split of work.
+Each delivered message now carries `BroadcastTo` (`broadcast_to`,
+bridge-only, capped at `MaxBroadcastTo`=30): the broadcast's other
+recipients, by their unique bus **address**, never a display name (a name
+can be reused once the session that had it goes offline, so two different
+sessions can hold it over time). `BroadcastCount` (`broadcast_count`) is the
+true total, including the recipient itself, independent of any capping, so
+a large broadcast still reports an honest "to N agents" even once the list
+is truncated. Only `DeliverBroadcast` and `DeliverCommandBroadcast` set
+either field, always alongside `Broadcast`, computed once per broadcast in
+`slackbridge/broadcast.go` from `Peers()` addresses, and neither is ever
+settable through `/send`.
+
+Both the per-message header (`inject.go`'s `messageHead`/`broadcastWhere`,
+the mod's `broadcastMark`) read "(broadcast from `<owner>` to all `<N>`
+agents; also sent to: `agentbus:<address>`, ...)" instead of the old bare
+"(broadcast to all agents)", with "(showing 30 of `<N-1>` others)" appended
+when the list was capped short of all the other recipients. A broadcast
+queued before these fields existed (`BroadcastCount` zero, no list) renders
+as the old bare text, with no number. Fix round 1: the coordination
+instruction — coordinate over the agentbus first (`SendMessage` to each
+`agentbus:<address>` in `BroadcastTo`), agree who answers what, reply to
+Slack for only one's own part, dismiss with `ignore` when it doesn't concern
+the recipient — now rides on every delivery of a broadcast message itself
+(`inject.go`'s messages loop, and the mod's `formatMessage`/`formatDM`/
+`formatGroup`), not only the one-time orientation note; a session already
+noted (unchanged peers) never gets that note resent, so the note's own
+broadcast line is now a short pointer to the message's own text rather than
+the authoritative instruction. The instruction is omitted entirely for a
+sole recipient (`BroadcastTo` empty) — nobody to coordinate with. **Mod
+0.3.10.** `register.ts`'s `VERSION` and `.claude-plugin/plugin.json` both
+move to 0.3.10.

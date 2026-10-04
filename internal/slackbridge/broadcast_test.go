@@ -323,6 +323,129 @@ func TestBroadcastCommand(t *testing.T) {
 	}
 }
 
+// Task: a broadcast to 3 agents gives each delivered message a BroadcastTo
+// naming the other two, by the same label the help list uses (name, else
+// address), with each recipient's own label left out.
+func TestBroadcastToNamesTheOtherRecipients(t *testing.T) {
+	b, _, bus := newTestBridge(t)
+	bus.Hello(sidC, "pc", "/work/third", "", true)
+	addrA := bus.Address(sidA)
+	addrB := bus.Address(sidB)
+	addrC := bus.Address(sidC)
+
+	b.handleEvent("EvBt1", msg("UALEX", "all: status please", "1700011700.000001", ""))
+	mA := claimBroadcast(t, bus, sidA, "status please", "")
+	mB := claimBroadcast(t, bus, sidB, "status please", "")
+	mC := claimOne(t, bus, sidC)
+	if !mC.FromUser || !mC.Broadcast || mC.Body != "status please" {
+		t.Fatalf("sidC = %+v", mC)
+	}
+
+	// BroadcastTo names the other recipients by bus address (never sidA's
+	// display name "flyer"), and BroadcastCount is 3 for every one of them.
+	want := map[string][]string{
+		sidA: {addrB, addrC},
+		sidB: {addrA, addrC},
+		sidC: {addrA, addrB},
+	}
+	got := map[string][]string{sidA: mA.BroadcastTo, sidB: mB.BroadcastTo, sidC: mC.BroadcastTo}
+	for sid, w := range want {
+		if !sameSet(got[sid], w) {
+			t.Fatalf("%s broadcast_to = %v, want set %v", sid, got[sid], w)
+		}
+	}
+	for sid, m := range map[string]agentbus.Message{sidA: mA, sidB: mB, sidC: mC} {
+		if m.BroadcastCount != 3 {
+			t.Fatalf("%s broadcast_count = %d, want 3", sid, m.BroadcastCount)
+		}
+	}
+}
+
+// Task fix round 2 (finding 2): an offline session's name can be reused by
+// a later, unrelated one (nameFree skips offline sessions), and the
+// original holder can then reconnect under the same session id. Hello
+// never clears a session's stored name, and nameFree refuses to let the
+// reconnected original reclaim a name another live session now holds, so
+// both end up live and named "flyer" at once — exactly the ambiguity
+// BroadcastTo must survive by using addresses, resolving to the intended
+// other session, never a name that could now mean someone else, and never
+// the recipient itself.
+func TestBroadcastToSurvivesOfflineNameReuse(t *testing.T) {
+	b, _, bus := newTestBridge(t)
+	addrA := bus.Address(sidA)
+	// sidA ("flyer") goes offline, freeing its name.
+	bus.Bye(sidA)
+	// A different session claims the freed name.
+	bus.Hello(sidC, "pc", "/work/newcomer", "flyer", true)
+	addrB := bus.Address(sidB)
+	addrC := bus.Address(sidC)
+	// The original holder reconnects with the same session id. It can't
+	// reclaim "flyer" (sidC holds it live), but its own stored name is
+	// still "flyer" from before, so it goes live again still named that,
+	// alongside sidC.
+	bus.Hello(sidA, "pc", "/work/flyer", "flyer", true)
+
+	b.handleEvent("EvBr1", msg("UALEX", "all: status please", "1700011900.000001", ""))
+	mA := claimOne(t, bus, sidA)
+	mB := claimOne(t, bus, sidB)
+	mC := claimOne(t, bus, sidC)
+	if !mA.Broadcast || !mB.Broadcast || !mC.Broadcast {
+		t.Fatalf("mA = %+v, mB = %+v, mC = %+v", mA, mB, mC)
+	}
+
+	want := map[string][]string{
+		sidA: {addrB, addrC},
+		sidB: {addrA, addrC},
+		sidC: {addrA, addrB},
+	}
+	got := map[string][]string{sidA: mA.BroadcastTo, sidB: mB.BroadcastTo, sidC: mC.BroadcastTo}
+	for sid, w := range want {
+		if !sameSet(got[sid], w) {
+			t.Fatalf("%s broadcast_to = %v, want set %v", sid, got[sid], w)
+		}
+	}
+	// Every listed target resolves to the intended other session: never
+	// the ambiguous name both sidA and sidC now answer to, and never the
+	// recipient itself.
+	for sid, m := range map[string]agentbus.Message{sidA: mA, sidB: mB, sidC: mC} {
+		for _, addr := range m.BroadcastTo {
+			if addr == "flyer" {
+				t.Fatalf("%s's broadcast_to used the ambiguous name instead of an address", sid)
+			}
+			resolved, ok := bus.Resolve(addr)
+			if !ok {
+				t.Fatalf("%s's broadcast_to target %q doesn't resolve", sid, addr)
+			}
+			if resolved == sid {
+				t.Fatalf("%s's broadcast_to named itself: %q", sid, addr)
+			}
+			if resolved != sidA && resolved != sidB && resolved != sidC {
+				t.Fatalf("%s's broadcast_to target %q resolved to an unexpected session %s", sid, addr, resolved)
+			}
+		}
+	}
+}
+
+// sameSet reports whether a and b hold the same strings, ignoring order.
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := map[string]int{}
+	for _, x := range a {
+		counts[x]++
+	}
+	for _, x := range b {
+		counts[x]--
+	}
+	for _, c := range counts {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func TestClankerBroadcast(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	if _, _, err := b.state.allow("UJANE", "jane"); err != nil {

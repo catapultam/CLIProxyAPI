@@ -8,7 +8,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// maxMoveHops bounds how far Ack follows a chain of handoffs.
+// maxMoveHops bounds how far Ack and delivery follow a chain of handoffs.
 const maxMoveHops = 8
 
 // ErrHandOffRefused is a /hello "previous" the Store won't let the new
@@ -80,6 +80,24 @@ func (s *Store) HandOff(previous, id string) error {
 		mover.SessionMoved(previous, id)
 	}
 	return nil
+}
+
+// followHandoffsLocked walks id's chain of handoffs (HandOff's MovedTo) to
+// the live successor that would actually read a message sent to it, the
+// same way Ack already follows the chain for ids it hands back. A peer
+// addressing a session by a name or address from before a handoff (/clear,
+// /resume, /branch) still reaches whoever took it over, instead of queuing
+// into an abandoned inbox nothing will ever drain. Bounded by maxMoveHops
+// to guard against a cycle. The caller holds s.mu.
+func (s *Store) followHandoffsLocked(id string, sess *session) (string, *session) {
+	for hop := 0; sess != nil && sess.MovedTo != "" && hop < maxMoveHops; hop++ {
+		next, ok := s.byID[sess.MovedTo]
+		if !ok {
+			break
+		}
+		id, sess = sess.MovedTo, next
+	}
+	return id, sess
 }
 
 // ResolveLive is Resolve limited to sessions that aren't offline.

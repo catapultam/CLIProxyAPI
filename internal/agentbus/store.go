@@ -41,6 +41,9 @@ const (
 	// oldest go first, so a flood in a linked conversation can't fill an
 	// inbox.
 	maxQueuedGuest = 50
+	// MaxBroadcastTo caps the names a broadcast message's BroadcastTo
+	// lists, so a huge broadcast doesn't balloon every delivered message.
+	MaxBroadcastTo = 30
 )
 
 // Peer statuses.
@@ -110,6 +113,20 @@ type Message struct {
 	// ..."). Only DeliverBroadcast and DeliverCommandBroadcast set it, always
 	// with FromUser; clients can never send it.
 	Broadcast bool `json:"broadcast,omitempty"`
+	// BroadcastTo lists a broadcast's other recipients (this message's own
+	// one left out), by their unique bus address — never a name, which can
+	// repeat once an offline session's name is reused by a later one. It
+	// lets a recipient SendMessage the others to coordinate. Capped at
+	// MaxBroadcastTo. Only DeliverBroadcast and DeliverCommandBroadcast set
+	// it, always with Broadcast; clients can never send it.
+	BroadcastTo []string `json:"broadcast_to,omitempty"`
+	// BroadcastCount is a broadcast's total recipients, including this
+	// message's own one (so it is always at least len(BroadcastTo)+1). A
+	// broadcast delivered before this field existed has it zero (legacy),
+	// rendered with no number. Only DeliverBroadcast and
+	// DeliverCommandBroadcast set it, always with Broadcast; clients can
+	// never send it.
+	BroadcastCount int `json:"broadcast_count,omitempty"`
 	// SlackUserID is the Slack user ID of the owner who sent Command. Only
 	// DeliverCommand sets it, and /wait re-checks it before handing the
 	// command out.
@@ -483,7 +500,10 @@ func (s *Store) Send(fromID, to, body, replyTo string) (Message, error) {
 	if !ok {
 		return Message{}, ErrUnknownTarget
 	}
-	target := s.byID[targetID]
+	// to may name a session from before a handoff (/clear, /resume,
+	// /branch): follow MovedTo to whoever actually took it over, so this
+	// doesn't queue into an abandoned inbox nothing will ever drain.
+	_, target := s.followHandoffsLocked(targetID, s.byID[targetID])
 	msg.To = s.addressLocked(target)
 	s.enqueueLocked(target, msg)
 	return msg, nil
@@ -909,9 +929,12 @@ func (s *Store) Load() error {
 // cleanLoadedMessage drops an invalid reply_to, any via validVia rejects on
 // a Slack user's or guest's message (and every via on anything else), an
 // approval on anything but a Slack user's message or with an invalid request
-// id, a broadcast mark on anything but a Slack user's message and, on a
-// message from a session, a sender name validName rejects (keeping the
-// sender's address). It reports whether it changed m.
+// id, a broadcast mark on anything but a Slack user's message, BroadcastTo
+// and BroadcastCount on anything that isn't marked Broadcast (trimming
+// BroadcastTo to MaxBroadcastTo and clamping a negative BroadcastCount to
+// zero either way) and, on a message from a session, a sender name
+// validName rejects (keeping the sender's address). It reports whether it
+// changed m.
 func cleanLoadedMessage(m *Message) bool {
 	changed := false
 	if m.ReplyTo != "" && !validReplyTo.MatchString(m.ReplyTo) {
@@ -928,6 +951,24 @@ func cleanLoadedMessage(m *Message) bool {
 	}
 	if m.Broadcast && (!m.FromUser || m.Guest) {
 		m.Broadcast = false
+		changed = true
+	}
+	if !m.Broadcast {
+		if len(m.BroadcastTo) > 0 {
+			m.BroadcastTo = nil
+			changed = true
+		}
+		if m.BroadcastCount != 0 {
+			m.BroadcastCount = 0
+			changed = true
+		}
+	}
+	if len(m.BroadcastTo) > MaxBroadcastTo {
+		m.BroadcastTo = m.BroadcastTo[:MaxBroadcastTo]
+		changed = true
+	}
+	if m.BroadcastCount < 0 {
+		m.BroadcastCount = 0
 		changed = true
 	}
 	if m.FromUser || m.Guest {

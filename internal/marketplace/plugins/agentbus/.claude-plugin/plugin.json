@@ -1,1 +1,1 @@
-{ "name": "agentbus", "version": "0.3.9", "description": "Show Claude Code sessions on other machines in ListAgents and reach them with SendMessage, through the CLIProxyAPI agentbus" }
+{ "name": "agentbus", "version": "0.3.10", "description": "Show Claude Code sessions on other machines in ListAgents and reach them with SendMessage, through the CLIProxyAPI agentbus" }
