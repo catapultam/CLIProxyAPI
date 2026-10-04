@@ -2,7 +2,8 @@ package auth
 
 import (
 	"context"
-	"path/filepath"
+	"crypto/sha256"
+	"encoding/hex"
 	"sort"
 	"strings"
 	"time"
@@ -89,24 +90,25 @@ func isNextResetColdPick(ctx context.Context) bool {
 	return marked
 }
 
-// nextResetAuthIdentity returns the credential identity to use in logs: the
-// credential file's basename when known, otherwise the auth ID. It
-// deliberately never returns Auth.Label, which for file-based OAuth
-// credentials holds the account's email address (see
-// internal/watcher/synthesizer/file.go) and must not be logged. This matches
-// the auth_file convention in formatOauthIdentity (conductor_execution.go).
+// nextResetAuthIdentity returns an opaque, stable identifier for logging: the
+// first 12 hex characters of the SHA-256 hash of the auth ID. File-based
+// credential IDs and file names routinely embed the account's email address
+// (e.g. "claude-12345678-alice@example.com.json"; see
+// internal/watcher/synthesizer/file.go), and so does Auth.Label. None of
+// those may ever appear in a log line, so this intentionally logs neither
+// the ID, the file name, nor Label. The hash is stable for a given
+// credential, so separate log lines for the same account can still be
+// correlated without revealing which account it is.
 func nextResetAuthIdentity(auth *Auth) string {
 	if auth == nil {
 		return ""
 	}
-	name := strings.TrimSpace(auth.FileName)
-	if name == "" {
-		name = strings.TrimSpace(auth.ID)
-	}
-	if name == "" {
+	id := strings.TrimSpace(auth.ID)
+	if id == "" {
 		return ""
 	}
-	return filepath.Base(name)
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:6])
 }
 
 // NewNextResetSelector returns a selector that reads the shared poll store.
@@ -148,8 +150,8 @@ func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, op
 				}
 			}
 			selectorLogEntry(ctx).Infof(
-				"next-reset: cold pick | auth=%s weekly_used=%.1f%% weekly_reset=%s ready=%d",
-				nextResetAuthIdentity(picked.auth), picked.weeklyUsedPct, picked.weeklyResetsAt.Format(time.RFC3339), readyCount,
+				"next-reset: cold pick | auth=%s provider=%s weekly_used=%.1f%% weekly_reset=%s ready=%d",
+				nextResetAuthIdentity(picked.auth), provider, picked.weeklyUsedPct, picked.weeklyResetsAt.Format(time.RFC3339), readyCount,
 			)
 		}
 		return picked.auth, nil
@@ -205,7 +207,13 @@ func (s *NextResetSelector) assess(auth *Auth, model string, now time.Time) next
 	a.tier = nextResetReady
 	a.weeklyResetsAt = w.ResetsAt
 	a.weeklyUsedPct = w.UsedPct
-	if snap.Short.Known {
+	// Only a short window that is actually still open can make this
+	// credential near full on short-window grounds: a window whose ResetsAt
+	// has passed (or is zero/missing) is stale and must not demote a
+	// credential that has since rolled over. nextResetExhausted above already
+	// handles the "still open but fully used" case; this guards the near-full
+	// floor specifically.
+	if snap.Short.Known && snap.Short.ResetsAt.After(now) {
 		a.shortUsedPct = snap.Short.UsedPct
 	}
 	return a

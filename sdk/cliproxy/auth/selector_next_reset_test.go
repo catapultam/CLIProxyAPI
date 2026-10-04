@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strconv"
@@ -31,15 +33,26 @@ func claudeAuth(id string, weeklyUsed float64, weeklyResetIn time.Duration) *Aut
 	}}
 }
 
-// claudeAuthWithShortUsed is claudeAuth plus a 5h-window usage reading that is
-// still allowed (not rejected, not exhausted), for near-full tests driven by
-// the short window rather than the weekly one.
-func claudeAuthWithShortUsed(id string, weeklyUsed float64, weeklyResetIn time.Duration, shortUsed float64) *Auth {
+// claudeAuthWithShortWindow is claudeAuth plus a 5h-window usage reading
+// (allowed, not rejected) whose reset time is explicit, for deterministic
+// boundary tests on the short-window near-full floor. A zero resetAt omits
+// the 5h-Reset signal entirely, so Short.Known is still true (via
+// Utilization) but Short.ResetsAt stays the zero time.
+func claudeAuthWithShortWindow(id string, weeklyUsed float64, weeklyResetIn time.Duration, shortUsed float64, resetAt time.Time) *Auth {
 	a := claudeAuth(id, weeklyUsed, weeklyResetIn)
 	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Utilization"] = strconv.FormatFloat(shortUsed/100, 'f', 4, 64)
-	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Reset"] = strconv.FormatInt(nrNow.Add(time.Hour).Unix(), 10)
 	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Status"] = "allowed"
+	if !resetAt.IsZero() {
+		a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Reset"] = strconv.FormatInt(resetAt.Unix(), 10)
+	}
 	return a
+}
+
+// claudeAuthWithShortUsed is claudeAuthWithShortWindow with the short window
+// resetting comfortably in the future (1h out), for tests that only care
+// about the usage floor, not the reset boundary.
+func claudeAuthWithShortUsed(id string, weeklyUsed float64, weeklyResetIn time.Duration, shortUsed float64) *Auth {
+	return claudeAuthWithShortWindow(id, weeklyUsed, weeklyResetIn, shortUsed, nrNow.Add(time.Hour))
 }
 
 func codexAuth(id string, weeklyUsed float64, weeklyResetIn time.Duration) *Auth {
@@ -272,7 +285,7 @@ func TestNextResetColdPickLogsUsageAndReadyCount(t *testing.T) {
 	a := claudeAuth("a", 20, 10*time.Hour)
 	b := claudeAuth("b", 50, 100*time.Hour)
 	s := nrSelector()
-	got, err := s.Pick(withNextResetColdPick(context.Background()), "", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{b, a})
+	got, err := s.Pick(withNextResetColdPick(context.Background()), "claude", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{b, a})
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
@@ -289,8 +302,13 @@ func TestNextResetColdPickLogsUsageAndReadyCount(t *testing.T) {
 	if line == "" {
 		t.Fatalf("expected an Info log for the cold pick, got entries: %v", hook.AllEntries())
 	}
-	if !strings.Contains(line, "auth=a") {
-		t.Fatalf("log line missing chosen auth: %q", line)
+	sum := sha256.Sum256([]byte("a"))
+	wantHash := hex.EncodeToString(sum[:6])
+	if !strings.Contains(line, "auth="+wantHash) {
+		t.Fatalf("log line missing chosen auth's opaque hash %q: %q", wantHash, line)
+	}
+	if !strings.Contains(line, "provider=claude") {
+		t.Fatalf("log line missing provider: %q", line)
 	}
 	if !strings.Contains(line, "weekly_used=20.0%") {
 		t.Fatalf("log line missing weekly used pct: %q", line)
@@ -316,17 +334,22 @@ func TestNextResetPerRequestPickDoesNotLog(t *testing.T) {
 	}
 }
 
-func TestNextResetColdPickLogsIdentityNeverLabelEmail(t *testing.T) {
+func TestNextResetColdPickLogsOpaqueHashNeverEmailOrFileName(t *testing.T) {
 	hook := setupNextResetLogHook(t)
-	a := claudeAuth("acct-opaque-1", 20, 10*time.Hour)
+	// Realistic file-based credential: both the ID and the file name embed
+	// the account's email, exactly like the OAuth file synthesizer produces
+	// (internal/watcher/synthesizer/file.go). Label is also the email.
+	const id = "claude-12345678-alice@example.com.json"
+	a := claudeAuth(id, 20, 10*time.Hour)
+	a.FileName = "claude-12345678-alice@example.com.json"
 	a.Label = "alice@example.com"
 	s := nrSelector()
-	got, err := s.Pick(withNextResetColdPick(context.Background()), "", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{a})
+	got, err := s.Pick(withNextResetColdPick(context.Background()), "claude", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{a})
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
-	if got.ID != "acct-opaque-1" {
-		t.Fatalf("got %s, want acct-opaque-1", got.ID)
+	if got.ID != id {
+		t.Fatalf("got %s, want %s", got.ID, id)
 	}
 
 	var line string
@@ -339,10 +362,15 @@ func TestNextResetColdPickLogsIdentityNeverLabelEmail(t *testing.T) {
 		t.Fatalf("expected a cold pick log line")
 	}
 	if strings.Contains(line, "alice@example.com") || strings.Contains(line, "@") {
-		t.Fatalf("log line leaked the account email (Label): %q", line)
+		t.Fatalf("log line leaked the account email: %q", line)
 	}
-	if !strings.Contains(line, "auth=acct-opaque-1") {
-		t.Fatalf("log line missing the auth ID: %q", line)
+	if strings.Contains(line, "claude-12345678") {
+		t.Fatalf("log line leaked the credential file name or ID: %q", line)
+	}
+	sum := sha256.Sum256([]byte(id))
+	wantHash := hex.EncodeToString(sum[:6])
+	if !strings.Contains(line, "auth="+wantHash) {
+		t.Fatalf("log line missing the opaque hash %q: %q", wantHash, line)
 	}
 }
 
@@ -393,6 +421,68 @@ func TestNextResetShortWindowBelowFloorDoesNotDemote(t *testing.T) {
 	b := claudeAuth("b", 50, 100*time.Hour)
 	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "a" {
 		t.Fatalf("got %s, want a (89%% is below the short-window near-full floor)", got.ID)
+	}
+}
+
+func TestNextResetShortWindowDemotesWhenStillOpenByOneNanosecond(t *testing.T) {
+	// a's short window resets 1ns after now, i.e. it is still (barely) open,
+	// and sits above the floor, so a is demoted despite its earlier weekly
+	// reset and weekly headroom. Injected directly into the polled store: the
+	// wire signals only carry whole-second Unix timestamps and would truncate
+	// away the 1ns offset.
+	a := &Auth{ID: "a", Provider: "claude", Status: StatusActive}
+	b := claudeAuth("b", 50, 100*time.Hour)
+	s := nrSelector()
+	s.polled.set("a", nextResetSnapshot{
+		Weekly:     nextResetWindow{Known: true, UsedPct: 10, ResetsAt: nrNow.Add(10 * time.Hour)},
+		Short:      nextResetWindow{Known: true, UsedPct: 92, ResetsAt: nrNow.Add(time.Nanosecond)},
+		ObservedAt: nrNow,
+	})
+	if got := nrPick(t, s, "claude-sonnet-5-5", a, b); got.ID != "b" {
+		t.Fatalf("got %s, want b (a's short window is still open and near full)", got.ID)
+	}
+}
+
+func TestNextResetShortWindowNotDemotedAtOrAfterItsReset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		resetAt time.Time
+	}{
+		{"exactly at reset", nrNow},
+		{"reset already passed", nrNow.Add(-time.Minute)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// a's short window has reset (or is resetting this instant), so
+			// its stale 92% reading must not demote it: the window no longer
+			// blocks or burdens the credential, and a wins on its earlier
+			// weekly reset.
+			a := claudeAuthWithShortWindow("a", 10, 10*time.Hour, 92, tc.resetAt)
+			b := claudeAuth("b", 50, 100*time.Hour)
+			if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "a" {
+				t.Fatalf("got %s, want a (a's short window reset is not in the future)", got.ID)
+			}
+		})
+	}
+}
+
+func TestNextResetShortWindowZeroOrMissingResetsAtDoesNotDemote(t *testing.T) {
+	// No 5h-Reset signal at all: Short.Known is still true (Utilization is
+	// present) but Short.ResetsAt stays the zero time, which must never
+	// satisfy ResetsAt.After(now).
+	a := claudeAuthWithShortWindow("a", 10, 10*time.Hour, 92, time.Time{})
+	b := claudeAuth("b", 50, 100*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "a" {
+		t.Fatalf("got %s, want a (zero/missing short-window ResetsAt must not demote)", got.ID)
+	}
+}
+
+func TestNextResetUnknownShortWindowDoesNotDemote(t *testing.T) {
+	// No 5h signals at all: Short.Known is false, so shortUsedPct stays zero
+	// and can never trigger the near-full floor.
+	a := claudeAuth("a", 10, 10*time.Hour)
+	b := claudeAuth("b", 50, 100*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "a" {
+		t.Fatalf("got %s, want a (unknown short window must not demote)", got.ID)
 	}
 }
 
