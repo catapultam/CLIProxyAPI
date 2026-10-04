@@ -1092,3 +1092,24 @@ backing map are gone.
 
 **Mod 0.3.9.** `register.ts`'s `VERSION` and `.claude-plugin/plugin.json`
 both move to 0.3.9.
+
+### Broadcast coordination (mod 0.3.10)
+
+A broadcast's recipients couldn't tell they weren't the only one asked, so
+two agents could both answer the same `all:` or duplicate a split of work.
+Each delivered message now carries `BroadcastTo` (`broadcast_to`, bridge-only,
+capped at 30): the broadcast's other recipients, by the same label the help
+list uses (name, else address). Only `DeliverBroadcast` and
+`DeliverCommandBroadcast` set it, always alongside `Broadcast`, computed once
+per broadcast in `slackbridge/broadcast.go` and never settable through
+`/send`. Both the per-message header (`inject.go`'s `messageHead`, the mod's
+`broadcastMark`) now read "(broadcast from `<owner>` to all `<N>` agents;
+also sent to: `<names>`)" instead of the old bare "(broadcast to all
+agents)", N counting the recipient itself. `inject.go`'s one-time note
+(shown to mod and non-mod sessions alike, since it goes through the same
+request-injection pipeline) replaces its old "answer only if relevant"
+sentence with an instruction to coordinate over the agentbus first
+(`SendMessage` to the names in `BroadcastTo`), agree who answers what, reply
+to Slack for only one's own part, and dismiss with `ignore` when it doesn't
+concern the recipient. **Mod 0.3.10.** `register.ts`'s `VERSION` and
+`.claude-plugin/plugin.json` both move to 0.3.10.

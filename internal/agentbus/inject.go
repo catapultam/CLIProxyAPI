@@ -270,7 +270,7 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 				owner = "the owner (" + inline(strings.Join(slack.owners, ", ")) + ")"
 			}
 			fmt.Fprintf(&b, disclosureRule, owner)
-			b.WriteString("Messages from Slack may be broadcasts to all agents (`all:`); answer only if relevant to you, otherwise dismiss with `ignore`.\n")
+			b.WriteString("Messages from Slack may be broadcasts to all agents (`all:`), marked in the header. This is a broadcast: the other recipients got the same message. If it needs a single answer or a split of work, coordinate with them over the agentbus first (SendMessage to their names) and agree who replies on what. Reply to Slack only for your part, and don't duplicate another agent's answer. If it doesn't concern you, send `ignore`.\n")
 			fmt.Fprintf(&b, "If a Slack message clearly wasn't meant for you (people talking to each other in a linked chat, a tag for someone else), dismiss it instead of replying: SendMessage to \"agentbus:slack#<id>\" with message `ignore` (curl: POST /v1/agentbus/dismiss {\"session\":\"%s\",\"ids\":[\"<id>\"]}).\n", sid)
 			b.WriteString(doneHintNote)
 			if slack.bot != "" {
@@ -295,6 +295,31 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 	return b.String()
 }
 
+// broadcastWhere is the "(broadcast ...)" fragment of a broadcast message's
+// header: who sent it, how many agents got it in all (this one plus
+// BroadcastTo), and the others by the bus name they can be addressed by
+// with SendMessage, so a recipient can coordinate with them.
+func broadcastWhere(m Message) string {
+	owner := m.SlackUser
+	if owner == "" {
+		owner = "an allowed Slack user"
+	}
+	total := len(m.BroadcastTo) + 1
+	unit := "agents"
+	if total == 1 {
+		unit = "agent"
+	}
+	frag := fmt.Sprintf(" (broadcast from %s to all %d %s", inline(owner), total, unit)
+	if len(m.BroadcastTo) > 0 {
+		names := make([]string, len(m.BroadcastTo))
+		for i, n := range m.BroadcastTo {
+			names[i] = inline(n)
+		}
+		frag += "; also sent to: " + strings.Join(names, ", ")
+	}
+	return frag + ")"
+}
+
 // messageHead is the unquoted header line of an injected message, without
 // its "in reply to" part. Only the Slack bridge's entry points set FromUser,
 // Guest and Via, and only they send From SlackAddress, so a session's
@@ -313,7 +338,7 @@ func messageHead(m Message) string {
 		where = " (DM, sent with /clanker)"
 	}
 	if m.Broadcast && m.FromUser && !m.Guest {
-		where += " (broadcast to all agents)"
+		where += broadcastWhere(m)
 	}
 	answer := fmt.Sprintf(`to answer there, reply to "slack" with reply_to %s`, id)
 	switch {

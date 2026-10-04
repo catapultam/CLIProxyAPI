@@ -419,7 +419,7 @@ test('session.end with clear says bye, then the next tick follows the session to
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
   // The old id goes along, so the bus hands the name, inbox and Slack routing to the new one.
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.9', previous: DEFAULT_SESSION_ID })
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.10', previous: DEFAULT_SESSION_ID })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
@@ -436,11 +436,11 @@ test('both hellos and every wait carry the mod version', async ($, on) => {
 
   const hellos = calls.filter(c => c.url.endsWith('/hello'))
   expect(hellos.length).toBe(2)
-  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.9' })
-  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.9' })
+  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.10' })
+  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.10' })
   const waits = calls.filter(c => c.url.includes('/wait?'))
   expect(waits.length).toBeGreaterThan(0)
-  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.9')
+  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.10')
 })
 
 test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {
@@ -1435,17 +1435,17 @@ test('a message sent with Ask an agent or /clanker is framed as private, answere
   }
 })
 
-test('a broadcast is marked as one in every Slack instruction framing', async ($, on) => {
+test('a broadcast is marked as one, naming the other recipients, in every Slack instruction framing', async ($, on) => {
   const prompts = await promptsFor($, on, [
-    { id: 'm_b1', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true },
-    { id: 'm_b2', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, via: 'dm' },
-    { id: 'm_b3', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, via: 'group' },
+    { id: 'm_b1', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: ['beta', 'gamma'] },
+    { id: 'm_b2', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: ['beta'], via: 'dm' },
+    { id: 'm_b3', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex', broadcast: true, broadcast_to: [], via: 'group' },
     { id: 'm_b4', from: 'slack', body: 'status?', from_user: true, slack_user: 'alex' },
     { id: 'm_b5', from: 'pc/x-111111', body: 'status?', broadcast: true },
   ])
-  expect(at(prompts, 0)).toContain('agentbus message m_b1 from alex via Slack (broadcast to all agents), relayed')
-  expect(at(prompts, 1)).toContain('agentbus message m_b2 from alex via Slack (DM) (broadcast to all agents), relayed')
-  expect(at(prompts, 2)).toContain('agentbus message m_b3 from alex via Slack (in a group conversation) (broadcast to all agents), relayed')
+  expect(at(prompts, 0)).toContain('agentbus message m_b1 from alex via Slack (broadcast from alex to all 3 agents; also sent to: beta, gamma), relayed')
+  expect(at(prompts, 1)).toContain('agentbus message m_b2 from alex via Slack (DM) (broadcast from alex to all 2 agents; also sent to: beta), relayed')
+  expect(at(prompts, 2)).toContain('agentbus message m_b3 from alex via Slack (in a group conversation) (broadcast from alex to all 1 agent), relayed')
   expect(at(prompts, 3)).not.toContain('broadcast')
-  expect(at(prompts, 4)).not.toContain('broadcast to all agents')
+  expect(at(prompts, 4)).not.toContain('broadcast')
 })

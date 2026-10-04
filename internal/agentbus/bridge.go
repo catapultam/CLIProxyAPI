@@ -234,15 +234,29 @@ func (s *Store) DeliverVia(target, body, slackUser, via string) (sessionID, msgI
 }
 
 // DeliverBroadcast is DeliverVia for an owner's broadcast to all agents
-// ("all: message"): the message is marked Broadcast. Only the Slack bridge
-// calls it, and together with DeliverCommandBroadcast it is the only way a
-// message gets Broadcast.
-func (s *Store) DeliverBroadcast(target, body, slackUser, via string) (sessionID, msgID string, err error) {
+// ("all: message"): the message is marked Broadcast, and to names the
+// broadcast's other recipients (BroadcastTo). Only the Slack bridge calls
+// it, and together with DeliverCommandBroadcast it is the only way a
+// message gets Broadcast or BroadcastTo.
+func (s *Store) DeliverBroadcast(target, body, slackUser, via string, to []string) (sessionID, msgID string, err error) {
 	return s.deliverFromSlack(target, body, via, func(m *Message) {
 		m.FromUser = true
 		m.SlackUser = slackUser
 		m.Broadcast = true
+		m.BroadcastTo = cappedBroadcastTo(to)
 	})
+}
+
+// cappedBroadcastTo copies to for a broadcast message's BroadcastTo,
+// trimmed to MaxBroadcastTo entries. A nil or empty to yields nil.
+func cappedBroadcastTo(to []string) []string {
+	if len(to) == 0 {
+		return nil
+	}
+	if len(to) > MaxBroadcastTo {
+		to = to[:MaxBroadcastTo]
+	}
+	return append([]string(nil), to...)
 }
 
 // DeliverGuest queues a message from a guest: a Slack user who isn't

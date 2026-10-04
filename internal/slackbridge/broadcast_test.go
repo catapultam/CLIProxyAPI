@@ -323,6 +323,56 @@ func TestBroadcastCommand(t *testing.T) {
 	}
 }
 
+// Task: a broadcast to 3 agents gives each delivered message a BroadcastTo
+// naming the other two, by the same label the help list uses (name, else
+// address), with each recipient's own label left out.
+func TestBroadcastToNamesTheOtherRecipients(t *testing.T) {
+	b, _, bus := newTestBridge(t)
+	bus.Hello(sidC, "pc", "/work/third", "", true)
+	addrB := bus.Address(sidB)
+	addrC := bus.Address(sidC)
+
+	b.handleEvent("EvBt1", msg("UALEX", "all: status please", "1700011700.000001", ""))
+	mA := claimBroadcast(t, bus, sidA, "status please", "")
+	mB := claimBroadcast(t, bus, sidB, "status please", "")
+	mC := claimOne(t, bus, sidC)
+	if !mC.FromUser || !mC.Broadcast || mC.Body != "status please" {
+		t.Fatalf("sidC = %+v", mC)
+	}
+
+	want := map[string][]string{
+		sidA: {addrB, addrC},
+		sidB: {"flyer", addrC},
+		sidC: {"flyer", addrB},
+	}
+	got := map[string][]string{sidA: mA.BroadcastTo, sidB: mB.BroadcastTo, sidC: mC.BroadcastTo}
+	for sid, w := range want {
+		if !sameSet(got[sid], w) {
+			t.Fatalf("%s broadcast_to = %v, want set %v", sid, got[sid], w)
+		}
+	}
+}
+
+// sameSet reports whether a and b hold the same strings, ignoring order.
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := map[string]int{}
+	for _, x := range a {
+		counts[x]++
+	}
+	for _, x := range b {
+		counts[x]--
+	}
+	for _, c := range counts {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func TestClankerBroadcast(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	if _, _, err := b.state.allow("UJANE", "jane"); err != nil {

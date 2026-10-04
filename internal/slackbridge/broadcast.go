@@ -24,10 +24,12 @@ const (
 )
 
 // broadcastPlan is who a broadcast goes to and what: body, or cmd for a
-// command. skipped counts the sessions left out because they can't run
-// commands.
+// command. labels is parallel to sids: each recipient's BroadcastTo label
+// (its name, else its address, the same label the help list uses). skipped
+// counts the sessions left out because they can't run commands.
 type broadcastPlan struct {
 	sids    []string
+	labels  []string
 	body    string
 	cmd     *agentbus.Command
 	skipped int
@@ -89,28 +91,58 @@ func (b *Bridge) planBroadcast(user allowedUser, body string) (broadcastPlan, st
 	} else if len(body) > agentbus.MaxBodyBytes {
 		return broadcastPlan{}, tooLarge
 	}
-	for _, sid := range b.liveSessions() {
+	for _, r := range b.liveSessions() {
 		if plan.cmd != nil {
-			if _, capable, errCapable := b.bus.CommandCapable(sid); errCapable != nil || !capable {
+			if _, capable, errCapable := b.bus.CommandCapable(r.sid); errCapable != nil || !capable {
 				plan.skipped++
 				continue
 			}
 		}
-		plan.sids = append(plan.sids, sid)
+		plan.sids = append(plan.sids, r.sid)
+		plan.labels = append(plan.labels, r.label)
 	}
 	return plan, ""
 }
 
+// liveRecipient is one session a broadcast can reach: its id and the label
+// (its name, else its address) it is named by in another recipient's
+// BroadcastTo.
+type liveRecipient struct {
+	sid, label string
+}
+
 // liveSessions lists the sessions that aren't offline, most recent first,
-// as help shows them (the bridge's own peer left out).
-func (b *Bridge) liveSessions() []string {
-	var out []string
+// as help shows them (the bridge's own peer left out), paired with each
+// one's BroadcastTo label.
+func (b *Bridge) liveSessions() []liveRecipient {
+	var out []liveRecipient
 	for _, p := range b.bus.Peers() {
 		if p.Address == agentbus.SlackAddress || p.Status == agentbus.StatusOffline {
 			continue
 		}
-		if sid, ok := b.bus.Resolve(p.Address); ok {
-			out = append(out, sid)
+		sid, ok := b.bus.Resolve(p.Address)
+		if !ok {
+			continue
+		}
+		label := p.Name
+		if label == "" {
+			label = p.Address
+		}
+		out = append(out, liveRecipient{sid: sid, label: label})
+	}
+	return out
+}
+
+// otherLabels returns labels without the entry at i, as a fresh slice, so
+// each broadcast recipient's BroadcastTo names only the others.
+func otherLabels(labels []string, i int) []string {
+	if len(labels) <= 1 {
+		return nil
+	}
+	out := make([]string, 0, len(labels)-1)
+	for j, l := range labels {
+		if j != i {
+			out = append(out, l)
 		}
 	}
 	return out
@@ -126,14 +158,15 @@ func (b *Bridge) runBroadcast(ev messageEvent, user allowedUser, plan broadcastP
 	}
 	var first string
 	delivered := 0
-	for _, sid := range plan.sids {
+	for i, sid := range plan.sids {
+		others := otherLabels(plan.labels, i)
 		var nsid, msgID, queued, command string
 		var err error
 		if plan.cmd != nil {
-			nsid, msgID, err = b.bus.DeliverCommandBroadcast(sid, *plan.cmd, user.Label, user.ID, b.viaOf(ev))
+			nsid, msgID, err = b.bus.DeliverCommandBroadcast(sid, *plan.cmd, user.Label, user.ID, b.viaOf(ev), others)
 			queued, command = reactionCommand, plan.cmd.Name
 		} else {
-			nsid, msgID, err = b.bus.DeliverBroadcast(sid, plan.body, user.Label, b.viaOf(ev))
+			nsid, msgID, err = b.bus.DeliverBroadcast(sid, plan.body, user.Label, b.viaOf(ev), others)
 			queued = reactionQueued
 		}
 		if err != nil {
