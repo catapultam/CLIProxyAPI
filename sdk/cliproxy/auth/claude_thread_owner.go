@@ -224,17 +224,20 @@ func StartClaudeThreadOwnerPersistence(ctx context.Context, path string) {
 		return
 	}
 	claudeThreadOwnerStatePath.Store(path)
-	claudeThreadOwners.load(path)
+	store := claudeThreadOwners
+	store.load(path)
+	// The saver keeps the store and path it started with rather than reading the
+	// package variables from its own goroutine.
 	go func() {
 		ticker := time.NewTicker(claudeThreadOwnerSaveEvery)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				SaveClaudeThreadOwners()
+				saveClaudeThreadOwners(store, path)
 				return
 			case <-ticker.C:
-				SaveClaudeThreadOwners()
+				saveClaudeThreadOwners(store, path)
 			}
 		}
 	}()
@@ -247,7 +250,11 @@ func SaveClaudeThreadOwners() {
 	if path == "" {
 		return
 	}
-	if errSave := claudeThreadOwners.save(path); errSave != nil {
+	saveClaudeThreadOwners(claudeThreadOwners, path)
+}
+
+func saveClaudeThreadOwners(store *claudeThreadOwnerStore, path string) {
+	if errSave := store.save(path); errSave != nil {
 		log.Warnf("claude thread owners: save state %s: %v", path, errSave)
 	}
 }
