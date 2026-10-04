@@ -409,6 +409,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			var event bytes.Buffer
 			var upstreamMessageID string
 			upstreamCompleted := false
+			safeguards := helps.NewClaudeSafeguardFiller(bodyForUpstream)
 			flushEvent := func() bool {
 				if event.Len() == 0 {
 					return true
@@ -434,6 +435,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					return
 				}
 				line = e.restoreResponseModel(restoredLine, req.Model)
+				line = safeguards.FillStreamLine(line)
 				event.Write(line)
 				event.WriteByte('\n')
 				if len(bytes.TrimSpace(line)) == 0 {
@@ -464,6 +466,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					}
 					return
 				}
+			}
+			if safeguards.Filled() {
+				helps.LogClaudeSafeguardFill(httpResp.Header, safeguards.ToolUses())
 			}
 			if upstreamCompleted {
 				commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))

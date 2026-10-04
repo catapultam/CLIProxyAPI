@@ -424,6 +424,12 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 	}
 	data = e.restoreResponseModel(data, req.Model)
+	if !upstreamStream {
+		var filled bool
+		if data, filled = helps.FillClaudeSafeguardResults(bodyForUpstream, data); filled {
+			helps.LogClaudeSafeguardFill(httpResp.Header, len(gjson.GetBytes(data, "safeguard_results.0.status.tool_uses").Map()))
+		}
+	}
 	cacheClaudeThinkingReplayResponse(ctx, replayScope, data)
 	var param any
 	out := sdktranslator.TranslateNonStream(
