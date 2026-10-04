@@ -133,9 +133,12 @@ access:
 routing:
   strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, next-reset
   # next-reset spends the quota closest to being lost first: among Claude and Codex OAuth
-  # credentials with weekly usage under 98%, the one whose weekly window resets soonest is
-  # picked (earliest-deadline-first); credentials at or above 98% weekly usage are used last
-  # instead of first. Credentials with an exhausted short or weekly window (or, for Fable
+  # credentials that are not near full, the one whose weekly window resets soonest is picked
+  # (earliest-deadline-first). A credential is near full, and used last instead of first, when
+  # its weekly usage is at or above 98%, or its short window (5h for Claude, primary for Codex)
+  # usage is at or above 90% -- the short-window floor keeps the selector from herding every
+  # request onto one account just because its weekly reset is close, when that account's short
+  # window is nearly spent. Credentials with an exhausted short or weekly window (or, for Fable
   # models, the Fable sub-limit) are skipped until that window resets, and credentials without
   # quota data are rotated. Other providers rotate round-robin. Claude usage is also polled
   # from the usage endpoint for idle credentials.

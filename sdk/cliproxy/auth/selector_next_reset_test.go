@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,6 +29,17 @@ func claudeAuth(id string, weeklyUsed float64, weeklyResetIn time.Duration) *Aut
 			"Anthropic-Ratelimit-Unified-7d-Status":      "allowed",
 		},
 	}}
+}
+
+// claudeAuthWithShortUsed is claudeAuth plus a 5h-window usage reading that is
+// still allowed (not rejected, not exhausted), for near-full tests driven by
+// the short window rather than the weekly one.
+func claudeAuthWithShortUsed(id string, weeklyUsed float64, weeklyResetIn time.Duration, shortUsed float64) *Auth {
+	a := claudeAuth(id, weeklyUsed, weeklyResetIn)
+	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Utilization"] = strconv.FormatFloat(shortUsed/100, 'f', 4, 64)
+	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Reset"] = strconv.FormatInt(nrNow.Add(time.Hour).Unix(), 10)
+	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Status"] = "allowed"
+	return a
 }
 
 func codexAuth(id string, weeklyUsed float64, weeklyResetIn time.Duration) *Auth {
@@ -301,6 +313,151 @@ func TestNextResetPerRequestPickDoesNotLog(t *testing.T) {
 		if strings.Contains(e.Message, "next-reset: cold pick") {
 			t.Fatalf("unexpected cold-pick log for a per-request pick: %q", e.Message)
 		}
+	}
+}
+
+func TestNextResetColdPickLogsIdentityNeverLabelEmail(t *testing.T) {
+	hook := setupNextResetLogHook(t)
+	a := claudeAuth("acct-opaque-1", 20, 10*time.Hour)
+	a.Label = "alice@example.com"
+	s := nrSelector()
+	got, err := s.Pick(withNextResetColdPick(context.Background()), "", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{a})
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if got.ID != "acct-opaque-1" {
+		t.Fatalf("got %s, want acct-opaque-1", got.ID)
+	}
+
+	var line string
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "next-reset: cold pick") {
+			line = e.Message
+		}
+	}
+	if line == "" {
+		t.Fatalf("expected a cold pick log line")
+	}
+	if strings.Contains(line, "alice@example.com") || strings.Contains(line, "@") {
+		t.Fatalf("log line leaked the account email (Label): %q", line)
+	}
+	if !strings.Contains(line, "auth=acct-opaque-1") {
+		t.Fatalf("log line missing the auth ID: %q", line)
+	}
+}
+
+func TestNextResetNearFullBoundaryBelow98IsNotNearFull(t *testing.T) {
+	// a resets sooner and is at 97.99% weekly usage, just under the floor, so
+	// it still competes on reset deadline and wins.
+	a := claudeAuth("a", 97.99, 10*time.Hour)
+	b := claudeAuth("b", 50, 100*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "a" {
+		t.Fatalf("got %s, want a (97.99%% is below the near-full floor)", got.ID)
+	}
+}
+
+func TestNextResetNearFullBoundaryAtExactly98IsNearFull(t *testing.T) {
+	// a resets sooner but is at exactly 98% weekly usage, at the floor, so it
+	// is pushed behind b. This fails if ">=" is weakened to ">".
+	a := claudeAuth("a", 98, 10*time.Hour)
+	b := claudeAuth("b", 50, 100*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "b" {
+		t.Fatalf("got %s, want b (a is at the near-full floor)", got.ID)
+	}
+}
+
+func TestNextResetBothNearFullOrdersByEarliestResetWithinGroup(t *testing.T) {
+	// Both a and b are at or above the near-full floor. Within the near-full
+	// group, ordering still follows earliest reset first.
+	a := claudeAuth("a", 98, 10*time.Hour)
+	b := claudeAuth("b", 99, 100*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", b, a); got.ID != "a" {
+		t.Fatalf("got %s, want a (earlier reset wins within the near-full group)", got.ID)
+	}
+}
+
+func TestNextResetShortWindowNearFullDemotesEvenWithWeeklyHeadroom(t *testing.T) {
+	// a resets sooner and has plenty of weekly headroom, but its 5h window is
+	// at 92% (>= nextResetShortWindowNearFullPct), so it is demoted behind b.
+	a := claudeAuthWithShortUsed("a", 10, 10*time.Hour, 92)
+	b := claudeAuth("b", 50, 100*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "b" {
+		t.Fatalf("got %s, want b (a's short window is near full)", got.ID)
+	}
+}
+
+func TestNextResetShortWindowBelowFloorDoesNotDemote(t *testing.T) {
+	// Same as above but a's short window is at 89%, just under the floor, so
+	// a still wins on its earlier weekly reset.
+	a := claudeAuthWithShortUsed("a", 10, 10*time.Hour, 89)
+	b := claudeAuth("b", 50, 100*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "a" {
+		t.Fatalf("got %s, want a (89%% is below the short-window near-full floor)", got.ID)
+	}
+}
+
+func TestNextResetSessionAffinityLogsColdPickAndFailoverOnly(t *testing.T) {
+	hook := setupNextResetLogHook(t)
+
+	a := claudeAuth("a", 20, 10*time.Hour)
+	b := claudeAuth("b", 50, 100*time.Hour)
+	fallback := &NextResetSelector{polled: newNextResetPolledStore(), now: func() time.Time { return nrNow }}
+	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: fallback, TTL: time.Hour})
+	defer affinity.Stop()
+
+	opts := cliproxyexecutor.Options{
+		Headers:  http.Header{"X-Claude-Code-Session-Id": []string{"sess-cold"}},
+		Metadata: make(map[string]any),
+	}
+	coldPicks := func() int {
+		n := 0
+		for _, e := range hook.AllEntries() {
+			if strings.Contains(e.Message, "next-reset: cold pick") {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Cold binding: the session has no cached auth, so the fallback selector
+	// is consulted and should log once.
+	picked, err := affinity.Pick(context.Background(), "claude", "claude-sonnet-5-5", opts, []*Auth{a, b})
+	if err != nil {
+		t.Fatalf("cold pick: %v", err)
+	}
+	if picked.ID != "a" {
+		t.Fatalf("cold pick got %s, want a", picked.ID)
+	}
+	if got := coldPicks(); got != 1 {
+		t.Fatalf("after cold pick, cold-pick logs = %d, want 1", got)
+	}
+
+	// Cache hit: same session, same bound auth. Returned directly from the
+	// affinity cache without consulting the fallback selector, so no
+	// additional log line.
+	picked, err = affinity.Pick(context.Background(), "claude", "claude-sonnet-5-5", opts, []*Auth{a, b})
+	if err != nil {
+		t.Fatalf("cache hit pick: %v", err)
+	}
+	if picked.ID != "a" {
+		t.Fatalf("cache hit got %s, want a", picked.ID)
+	}
+	if got := coldPicks(); got != 1 {
+		t.Fatalf("after cache hit, cold-pick logs = %d, want still 1", got)
+	}
+
+	// Failover: the bound auth becomes unavailable, so the fallback selector
+	// is consulted again and should log once more.
+	a.Disabled = true
+	picked, err = affinity.Pick(context.Background(), "claude", "claude-sonnet-5-5", opts, []*Auth{a, b})
+	if err != nil {
+		t.Fatalf("failover pick: %v", err)
+	}
+	if picked.ID != "b" {
+		t.Fatalf("failover got %s, want b", picked.ID)
+	}
+	if got := coldPicks(); got != 2 {
+		t.Fatalf("after failover, cold-pick logs = %d, want 2", got)
 	}
 }
 
