@@ -1067,8 +1067,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		// Cached auth not available, reselect via fallback selector for even distribution.
+		// This is a failover, not a per-request pick, so next-reset logs it.
+		auth, err := s.fallback.Pick(withNextResetColdPick(ctx), provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
 		}
@@ -1098,7 +1099,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	// Cold binding: this session has no cached auth yet, so the fallback selector
+	// is consulted once for the binding rather than on every request.
+	auth, err := s.fallback.Pick(withNextResetColdPick(ctx), provider, model, opts, fallbackAuths)
 	if err != nil {
 		return nil, err
 	}
@@ -1190,7 +1193,8 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	}
 
 	fallbackAuths := highestPriorityAuths(available)
-	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	// No LCP match: this is a cold binding for the prefix, not a per-request pick.
+	auth, errPick := s.fallback.Pick(withNextResetColdPick(ctx), provider, model, opts, fallbackAuths)
 	if errPick != nil {
 		return nil, true, errPick
 	}

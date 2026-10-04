@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
 var nrNow = time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
@@ -166,6 +169,138 @@ func TestNextResetNewerPollOverridesOlderSignals(t *testing.T) {
 	s.polled.set("a", nextResetSnapshot{Weekly: nextResetWindow{Known: true, UsedPct: 50, ResetsAt: nrNow.Add(5 * time.Hour)}, ObservedAt: nrNow})
 	if got := nrPick(t, s, "", a, b); got.ID != "a" {
 		t.Fatalf("got %s", got.ID)
+	}
+}
+
+// setupNextResetLogHook captures Info-and-above log entries written to the
+// standard logrus logger for the duration of the test, restoring the prior
+// level and hooks on cleanup.
+func setupNextResetLogHook(t *testing.T) *logtest.Hook {
+	t.Helper()
+	_, hook := logtest.NewNullLogger()
+	oldLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+
+	savedHooks := make(log.LevelHooks)
+	for lvl, hs := range log.StandardLogger().Hooks {
+		savedHooks[lvl] = append([]log.Hook(nil), hs...)
+	}
+	log.AddHook(hook)
+	t.Cleanup(func() {
+		log.SetLevel(oldLevel)
+		log.StandardLogger().ReplaceHooks(savedHooks)
+	})
+	return hook
+}
+
+func TestNextResetEarliestResetWinsOverOldScoreFormula(t *testing.T) {
+	// a resets in 20h at 60% used (old score (100-60)/20=2.0); b resets in 40h
+	// at 10% used (old score (100-10)/40=2.25). The old formula favored b;
+	// earliest-deadline-first means a is picked since neither is near full.
+	a := claudeAuth("a", 60, 20*time.Hour)
+	b := claudeAuth("b", 10, 40*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", b, a); got.ID != "a" {
+		t.Fatalf("got %s, want a", got.ID)
+	}
+}
+
+func TestNextResetNoFlipFlopAsUsageRises(t *testing.T) {
+	// Same reset deadlines as above, but a's usage has climbed to 80%. a is
+	// still picked: usage rising does not flip the pick back to b as long as
+	// a's reset remains the sooner one and a is not near full.
+	a := claudeAuth("a", 80, 20*time.Hour)
+	b := claudeAuth("b", 10, 40*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", b, a); got.ID != "a" {
+		t.Fatalf("got %s, want a (no flip-flop)", got.ID)
+	}
+}
+
+func TestNextResetSoonerResetBeatsFresherAccount(t *testing.T) {
+	// fresh resets in 7 days at 0% used; soon resets in 2 days at 50% used.
+	// Earliest-deadline-first picks soon even though fresh has far more
+	// unused headroom.
+	fresh := claudeAuth("fresh", 0, 7*24*time.Hour)
+	soon := claudeAuth("soon", 50, 2*24*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", fresh, soon); got.ID != "soon" {
+		t.Fatalf("got %s, want soon", got.ID)
+	}
+}
+
+func TestNextResetNearFullFloorUsesSoonerAccountLast(t *testing.T) {
+	// a resets sooner but is at 98.5% weekly usage (>= nextResetNearFullPct),
+	// so it is pushed behind b even though a's reset is earlier.
+	a := claudeAuth("a", 98.5, 10*time.Hour)
+	b := claudeAuth("b", 50, 100*time.Hour)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "b" {
+		t.Fatalf("got %s, want b (a is near full)", got.ID)
+	}
+	// With only the near-full credential ready, it is still picked: the floor
+	// only reorders among Ready candidates, it never removes the last one.
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a); got.ID != "a" {
+		t.Fatalf("got %s, want a when it is the only ready candidate", got.ID)
+	}
+}
+
+func TestNextResetEqualResetTimesBreakOnUsedPctThenID(t *testing.T) {
+	resetIn := 24 * time.Hour
+	a := claudeAuth("a", 50, resetIn)
+	b := claudeAuth("b", 20, resetIn)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "b" {
+		t.Fatalf("got %s, want b (lower weekly used pct at equal reset time)", got.ID)
+	}
+	c := claudeAuth("c", 20, resetIn)
+	d := claudeAuth("d", 20, resetIn)
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", d, c); got.ID != "c" {
+		t.Fatalf("got %s, want c (lower ID at equal reset time and used pct)", got.ID)
+	}
+}
+
+func TestNextResetColdPickLogsUsageAndReadyCount(t *testing.T) {
+	hook := setupNextResetLogHook(t)
+	a := claudeAuth("a", 20, 10*time.Hour)
+	b := claudeAuth("b", 50, 100*time.Hour)
+	s := nrSelector()
+	got, err := s.Pick(withNextResetColdPick(context.Background()), "", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{b, a})
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if got.ID != "a" {
+		t.Fatalf("got %s, want a", got.ID)
+	}
+
+	var line string
+	for _, e := range hook.AllEntries() {
+		if e.Level == log.InfoLevel && strings.Contains(e.Message, "next-reset: cold pick") {
+			line = e.Message
+		}
+	}
+	if line == "" {
+		t.Fatalf("expected an Info log for the cold pick, got entries: %v", hook.AllEntries())
+	}
+	if !strings.Contains(line, "auth=a") {
+		t.Fatalf("log line missing chosen auth: %q", line)
+	}
+	if !strings.Contains(line, "weekly_used=20.0%") {
+		t.Fatalf("log line missing weekly used pct: %q", line)
+	}
+	if !strings.Contains(line, "ready=2") {
+		t.Fatalf("log line missing ready candidate count: %q", line)
+	}
+}
+
+func TestNextResetPerRequestPickDoesNotLog(t *testing.T) {
+	hook := setupNextResetLogHook(t)
+	a := claudeAuth("a", 20, 10*time.Hour)
+	s := nrSelector()
+	// No withNextResetColdPick marker: this simulates a sessionless, per-request
+	// pick, which must not produce an Info line on every request.
+	if _, err := s.Pick(context.Background(), "", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{a}); err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "next-reset: cold pick") {
+			t.Fatalf("unexpected cold-pick log for a per-request pick: %q", e.Message)
+		}
 	}
 }
 

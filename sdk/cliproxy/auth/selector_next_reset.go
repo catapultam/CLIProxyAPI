@@ -12,9 +12,12 @@ import (
 const (
 	// nextResetStaleAfter is how old weekly data may be and still drive ranking.
 	nextResetStaleAfter = 6 * time.Hour
-	// nextResetMinHours floors the hours-to-reset divisor so a window about to
-	// reset does not produce an unbounded score.
-	nextResetMinHours = 0.5
+	// nextResetNearFullPct is the weekly-usage floor at and above which a Ready
+	// credential is treated as near full. Near-full credentials are ranked after
+	// every credential that still has headroom, so an account that is almost out
+	// of weekly quota is spent last instead of being picked first merely because
+	// its reset happens to land soonest.
+	nextResetNearFullPct = 98.0
 )
 
 type nextResetTier int
@@ -30,24 +33,60 @@ const (
 type nextResetAssessment struct {
 	auth           *Auth
 	tier           nextResetTier
-	score          float64
 	weeklyResetsAt time.Time
 	weeklyUsedPct  float64
 	blockedUntil   time.Time
 }
 
 // NextResetSelector spends the quota that is closest to being lost first. For
-// Claude and Codex OAuth credentials it ranks by remaining weekly percent per
-// hour until the weekly reset, skips credentials whose short or weekly window
-// (or, for Fable models, the Fable sub-limit) is exhausted, and rotates
-// credentials it has no data for. Each pick ranks only the candidates CPA
-// offers, which are already scoped to the providers serving the model.
+// Claude and Codex OAuth credentials it is earliest-deadline-first: among Ready
+// credentials, the one whose weekly window resets soonest is picked, except
+// that a credential at or above nextResetNearFullPct weekly usage is pushed to
+// the back of the line so a near-exhausted account is spent last rather than
+// first. It skips credentials whose short or weekly window (or, for Fable
+// models, the Fable sub-limit) is exhausted until that window resets, and
+// rotates credentials it has no data for. Each pick ranks only the candidates
+// CPA offers, which are already scoped to the providers serving the model.
 // With session affinity on it is the fallback selector, so it decides cold
 // bindings and failover while affinity keeps sessions on their credential.
 type NextResetSelector struct {
 	rotation RoundRobinSelector
 	polled   *nextResetPolledStore
 	now      func() time.Time
+}
+
+// nextResetColdPickKey marks a context as originating from a cold session
+// binding or a failover reselect, as opposed to a per-request pick made for a
+// session with no affinity (which would log on every request). Only picks
+// made under this marker are logged at Info; see withNextResetColdPick.
+type nextResetColdPickKey struct{}
+
+// withNextResetColdPick marks ctx so NextResetSelector logs the pick it makes.
+// Callers should only apply this to picks that happen once per cold binding or
+// failover, never to picks that can repeat on every request for the same
+// session, or the resulting log line becomes per-request noise.
+func withNextResetColdPick(ctx context.Context) context.Context {
+	return context.WithValue(ctx, nextResetColdPickKey{}, true)
+}
+
+func isNextResetColdPick(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	marked, _ := ctx.Value(nextResetColdPickKey{}).(bool)
+	return marked
+}
+
+// nextResetAuthLabel returns the auth's human readable label for logging, or
+// its ID when no label is set.
+func nextResetAuthLabel(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if label := strings.TrimSpace(auth.Label); label != "" {
+		return label
+	}
+	return auth.ID
 }
 
 // NewNextResetSelector returns a selector that reads the shared poll store.
@@ -62,7 +101,9 @@ func (s *NextResetSelector) clock() time.Time {
 	return time.Now()
 }
 
-// Pick selects the credential with the most weekly quota at risk.
+// Pick selects the credential whose weekly quota is closest to being lost,
+// i.e. earliest-deadline-first among credentials with headroom (see
+// sortNextReset).
 func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := s.clock()
 	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
@@ -78,7 +119,20 @@ func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, op
 	sortNextReset(ranked)
 
 	if ranked[0].tier == nextResetReady {
-		return ranked[0].auth, nil
+		picked := ranked[0]
+		if isNextResetColdPick(ctx) {
+			readyCount := 0
+			for _, a := range ranked {
+				if a.tier == nextResetReady {
+					readyCount++
+				}
+			}
+			selectorLogEntry(ctx).Infof(
+				"next-reset: cold pick | auth=%s weekly_used=%.1f%% weekly_reset=%s ready=%d",
+				nextResetAuthLabel(picked.auth), picked.weeklyUsedPct, picked.weeklyResetsAt.Format(time.RFC3339), readyCount,
+			)
+		}
+		return picked.auth, nil
 	}
 	tier := ranked[0].tier
 	if tier == nextResetUnavailable {
@@ -128,16 +182,7 @@ func (s *NextResetSelector) assess(auth *Auth, model string, now time.Time) next
 		a.tier = nextResetTrial
 		return a
 	}
-	hours := w.ResetsAt.Sub(now).Hours()
-	if hours < nextResetMinHours {
-		hours = nextResetMinHours
-	}
-	remaining := 100 - w.UsedPct
-	if remaining < 0 {
-		remaining = 0
-	}
 	a.tier = nextResetReady
-	a.score = remaining / hours
 	a.weeklyResetsAt = w.ResetsAt
 	a.weeklyUsedPct = w.UsedPct
 	return a
@@ -171,8 +216,12 @@ func nextResetExhausted(w nextResetWindow, now time.Time) bool {
 	return w.Rejected || w.UsedPct >= 100
 }
 
-// sortNextReset orders by tier, then for Ready credentials by score (desc),
-// earlier weekly reset, less used, and finally by ID.
+// sortNextReset orders by tier, then for Ready credentials by: (a) headroom,
+// credentials below nextResetNearFullPct weekly usage before those at or
+// above it, so a near-full account is used last rather than first; (b)
+// earlier weekly reset first, spending the quota closest to being lost
+// first; (c) lower weekly used percent first; and finally (d) auth ID, for a
+// deterministic order.
 func sortNextReset(as []nextResetAssessment) {
 	sort.SliceStable(as, func(i, j int) bool {
 		x, y := as[i], as[j]
@@ -180,8 +229,10 @@ func sortNextReset(as []nextResetAssessment) {
 			return x.tier < y.tier
 		}
 		if x.tier == nextResetReady {
-			if x.score != y.score {
-				return x.score > y.score
+			xNearFull := x.weeklyUsedPct >= nextResetNearFullPct
+			yNearFull := y.weeklyUsedPct >= nextResetNearFullPct
+			if xNearFull != yNearFull {
+				return !xNearFull
 			}
 			if !x.weeklyResetsAt.Equal(y.weeklyResetsAt) {
 				return x.weeklyResetsAt.Before(y.weeklyResetsAt)
