@@ -413,6 +413,15 @@ func nextResetRequestFactsFrom(body []byte) nextResetRequestFacts {
 	return f
 }
 
+// requestPinnedToCredential reports a request that only the credential that
+// served its conversation so far can answer: a thread continuation, or a
+// history with advisor results. Such a request never moves, and is served by
+// the credential it read even when a concurrent request re-bound the session.
+func requestPinnedToCredential(body []byte) bool {
+	f := nextResetRequestFactsFrom(body)
+	return f.thread || f.advisor
+}
+
 func nextResetBodyUsesOneHourTTL(body []byte) bool {
 	isOneHour := func(v gjson.Result) bool { return v.Get("cache_control.ttl").String() == "1h" }
 	if isOneHour(gjson.ParseBytes(body)) {

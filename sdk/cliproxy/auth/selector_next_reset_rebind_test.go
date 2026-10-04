@@ -670,76 +670,240 @@ func TestNextResetRebindCompactionMetadataThroughPick(t *testing.T) {
 
 type rebindRoleKey struct{}
 
-// TestNextResetRebindConcurrentCacheHitCannotUndoMove interleaves two requests
-// of one session deterministically: both read binding b, then the first moves
-// the session to a, and only then does the second (which would not move)
-// re-bind. The second must follow the move instead of restoring b.
-func TestNextResetRebindConcurrentCacheHitCannotUndoMove(t *testing.T) {
-	f := newRebindFixture(t)
-	b := claudeAuth("b", 20, 100*time.Hour)
-	a := claudeAuth("a", 20, 10*time.Hour)
-	f.bind(b)
-	f.observe("b", 1000, time.Hour) // cold: a move is free
-
-	stayerRead := make(chan struct{})
+// raceAgainstMove interleaves two requests of one session deterministically:
+// the second request (body secondBody) reads binding b and parks; the first
+// moves the session to a; then the second resumes. It returns what the second
+// request was served.
+func raceAgainstMove(t *testing.T, f *rebindFixture, a, b *Auth, secondBody string) *Auth {
+	t.Helper()
+	secondRead := make(chan struct{})
 	moverDone := make(chan struct{})
 	f.affinity.afterCacheReadHook = func(ctx context.Context) {
-		if ctx.Value(rebindRoleKey{}) == "stayer" {
-			close(stayerRead)
+		if ctx.Value(rebindRoleKey{}) == "second" {
+			close(secondRead)
 			<-moverDone
 		}
 	}
+	defer func() { f.affinity.afterCacheReadHook = nil }()
 
-	advisor := `{"messages":[{"role":"assistant","content":[{"type":"advisor_redacted_result","data":"x"}]}]}`
-	stayerOpts := f.opts(advisor) // advisor results: this request never moves
+	secondOpts := f.opts(secondBody)
 	type result struct {
 		auth *Auth
 		err  error
 	}
-	stayer := make(chan result, 1)
+	second := make(chan result, 1)
 	go func() {
-		ctx := context.WithValue(context.Background(), rebindRoleKey{}, "stayer")
-		got, err := f.affinity.Pick(ctx, "claude", rebindModel, stayerOpts, []*Auth{a, b})
-		stayer <- result{got, err}
+		ctx := context.WithValue(context.Background(), rebindRoleKey{}, "second")
+		got, err := f.affinity.Pick(ctx, "claude", rebindModel, secondOpts, []*Auth{a, b})
+		second <- result{got, err}
 	}()
 
-	<-stayerRead // the stayer holds a read of b
+	<-secondRead // the second request holds a read of b
 	moved, err := f.affinity.Pick(context.Background(), "claude", rebindModel, f.opts(""), []*Auth{a, b})
 	if err != nil || moved.ID != "a" {
 		t.Fatalf("mover got %v, %v; want a", moved, err)
 	}
 	close(moverDone)
 
-	res := <-stayer
-	if res.err != nil || res.auth.ID != "a" {
-		t.Fatalf("stayer got %v, %v; want a (the concurrent move)", res.auth, res.err)
+	res := <-second
+	if res.err != nil {
+		t.Fatalf("second request: %v", res.err)
 	}
-	f.affinity.afterCacheReadHook = nil
-	if got := f.pick(f.opts(""), a, b); got.ID != "a" {
-		t.Fatalf("binding after both requests is %s, want a", got.ID)
+	return res.auth
+}
+
+func (f *rebindFixture) cachedBinding() string {
+	id, _ := f.affinity.cache.Get("claude::" + f.canon + "::" + canonicalModelKey(rebindModel))
+	return id
+}
+
+func newRaceFixture(t *testing.T) (*rebindFixture, *Auth, *Auth) {
+	f := newRebindFixture(t)
+	b := claudeAuth("b", 20, 100*time.Hour)
+	a := claudeAuth("a", 20, 10*time.Hour)
+	f.bind(b)
+	f.observe("b", 1000, time.Hour) // cold: a move is free
+	return f, a, b
+}
+
+const (
+	raceAdvisorBody = `{"messages":[{"role":"assistant","content":[{"type":"advisor_redacted_result","data":"x"}]}]}`
+	raceThreadBody  = `{"thread":{"type":"continue","previous_message_id":"msg_01"},"messages":[{"role":"user","content":"hi"}]}`
+)
+
+// A request pinned to its credential (advisor results) that read b before a
+// concurrent move is still served by b, while the move's binding stays.
+func TestNextResetRebindConcurrentMovePinnedRequestServedByReadAuth(t *testing.T) {
+	f, a, b := newRaceFixture(t)
+	if got := raceAgainstMove(t, f, a, b, raceAdvisorBody); got.ID != "b" {
+		t.Fatalf("advisor-bearing request got %s, want b (the credential it read)", got.ID)
+	}
+	if got := f.cachedBinding(); got != "a" {
+		t.Fatalf("cache holds %q after the race, want a", got)
 	}
 	if st, _ := f.tracker.session(nextResetRebindKey(f.canon, rebindModel)); !st.movedAt.Equal(f.now) {
 		t.Fatalf("movedAt = %v, want %v", st.movedAt, f.now)
 	}
 }
 
+// The pinned request writes nothing: the move's binding survives it and later
+// requests stay on a.
+func TestNextResetRebindConcurrentMoveBindingPreservedByPinnedRequest(t *testing.T) {
+	f, a, b := newRaceFixture(t)
+	if got := raceAgainstMove(t, f, a, b, raceThreadBody); got.ID != "b" {
+		t.Fatalf("thread continuation got %s, want b", got.ID)
+	}
+	if got := f.cachedBinding(); got != "a" {
+		t.Fatalf("pinned request rewrote the binding to %q, want a", got)
+	}
+	if got := f.pick(f.opts(""), a, b); got.ID != "a" {
+		t.Fatalf("next request got %s, want a", got.ID)
+	}
+}
+
+// A request with no guard that read b before a concurrent move follows the
+// move instead of restoring b.
+func TestNextResetRebindConcurrentCacheHitCannotUndoMove(t *testing.T) {
+	f, a, b := newRaceFixture(t)
+	if got := raceAgainstMove(t, f, a, b, ""); got.ID != "a" {
+		t.Fatalf("unguarded request got %s, want a (the concurrent move)", got.ID)
+	}
+	if got := f.cachedBinding(); got != "a" {
+		t.Fatalf("cache holds %q after the race, want a", got)
+	}
+}
+
+// raceFallbackInheritance parks a request on the fallback-binding path after
+// it read the fallback key (bound to auth-b), re-binds that key to auth-a with
+// a failover, then resumes it. It returns what the parked request was served.
+func raceFallbackInheritance(t *testing.T, sel *SessionAffinitySelector, provider string, parked, rebinder cliproxyexecutor.Options) *Auth {
+	t.Helper()
+	a, b := &Auth{ID: "auth-a"}, &Auth{ID: "auth-b"}
+	read := make(chan struct{})
+	rebound := make(chan struct{})
+	sel.afterCacheReadHook = func(ctx context.Context) {
+		if ctx.Value(rebindRoleKey{}) == "parked" {
+			close(read)
+			<-rebound
+		}
+	}
+	defer func() { sel.afterCacheReadHook = nil }()
+
+	type result struct {
+		auth *Auth
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ctx := context.WithValue(context.Background(), rebindRoleKey{}, "parked")
+		got, err := sel.Pick(ctx, provider, "gpt-test", parked, []*Auth{a, b})
+		done <- result{got, err}
+	}()
+	<-read
+	// auth-b is unavailable to this request, so it fails over and re-binds the
+	// fallback key to auth-a.
+	if got, err := sel.Pick(context.Background(), provider, "gpt-test", rebinder, []*Auth{a}); err != nil || got.ID != "auth-a" {
+		t.Fatalf("failover got %v, %v; want auth-a", got, err)
+	}
+	close(rebound)
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("parked request: %v", res.err)
+	}
+	return res.auth
+}
+
+func cacheAliases(sel *SessionAffinitySelector, key string) (string, []string) {
+	sel.cache.mu.Lock()
+	defer sel.cache.mu.Unlock()
+	e, ok := sel.cache.entries[key]
+	if !ok {
+		return "", nil
+	}
+	return e.authID, append([]string(nil), e.aliases...)
+}
+
+// A request inheriting a fallback (conversation) binding must not overwrite
+// the alias group when the binding changed after it was read.
+func TestSessionAffinityFallbackAliasInheritanceIsConditional(t *testing.T) {
+	sel := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &RoundRobinSelector{}, TTL: time.Hour})
+	defer sel.Stop()
+	const provider = "fallback-race"
+	conv := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation":{"id":"conv-race"}}`)}
+	combined := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation":{"id":"conv-race"},"prompt_cache_key":"pck-race"}`)}
+	if got, _ := sel.Pick(context.Background(), provider, "gpt-test", conv, []*Auth{{ID: "auth-b"}}); got.ID != "auth-b" {
+		t.Fatalf("bind got %s", got.ID)
+	}
+
+	if got := raceFallbackInheritance(t, sel, provider, combined, conv); got.ID != "auth-a" {
+		t.Fatalf("inheriting request got %s, want auth-a (the current binding)", got.ID)
+	}
+	convKey := provider + "::conv:conv-race::gpt-test"
+	pckKey := provider + "::pck:pck-race::gpt-test"
+	for _, key := range []string{convKey, pckKey} {
+		if got, _ := sel.cache.Get(key); got != "auth-a" {
+			t.Fatalf("%s bound to %q, want auth-a", key, got)
+		}
+	}
+}
+
+// A subagent inheriting its parent's binding binds only its own key: the
+// parent group is neither merged nor rewritten, even when the parent was
+// re-bound concurrently.
+func TestSessionAffinitySubagentInheritanceKeepsParentGroupIsolated(t *testing.T) {
+	sel := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &RoundRobinSelector{}, TTL: time.Hour})
+	defer sel.Stop()
+	const provider = "subagent-race"
+	parent := cliproxyexecutor.Options{Headers: http.Header{"X-Claude-Code-Session-Id": []string{"S"}}}
+	child := cliproxyexecutor.Options{Headers: http.Header{
+		"X-Claude-Code-Session-Id": []string{"S"},
+		"X-Claude-Code-Agent-Id":   []string{"worker"},
+	}}
+	parentKey := provider + "::claude:S::gpt-test"
+	childKey := provider + "::claude:S:agent:worker::gpt-test"
+	if got, _ := sel.Pick(context.Background(), provider, "gpt-test", parent, []*Auth{{ID: "auth-b"}}); got.ID != "auth-b" {
+		t.Fatalf("bind got %s", got.ID)
+	}
+
+	if got := raceFallbackInheritance(t, sel, provider, child, parent); got.ID != "auth-a" {
+		t.Fatalf("subagent got %s, want auth-a (the parent's current binding)", got.ID)
+	}
+	if id, aliases := cacheAliases(sel, parentKey); id != "auth-a" || len(aliases) != 1 || aliases[0] != parentKey {
+		t.Fatalf("parent group = %q %v, want auth-a [%s]", id, aliases, parentKey)
+	}
+	if id, aliases := cacheAliases(sel, childKey); id != "auth-a" || len(aliases) != 1 || aliases[0] != childKey {
+		t.Fatalf("child group = %q %v, want auth-a [%s]", id, aliases, childKey)
+	}
+}
+
 func TestSessionCacheCompareAndSetAliases(t *testing.T) {
 	c := NewSessionCache(time.Hour)
 	defer c.Stop()
-	if _, ok := c.CompareAndSetAliases("b", "a", "k"); ok {
+	if _, ok := c.CompareAndSetAliases("k", "b", "a", "k"); ok {
 		t.Fatal("swapped a missing binding")
 	}
 	c.SetAliases("b", "k", "alias")
-	if cur, ok := c.CompareAndSetAliases("x", "a", "k"); ok || cur != "b" {
+	if cur, ok := c.CompareAndSetAliases("k", "x", "a", "k"); ok || cur != "b" {
 		t.Fatalf("stale expectation: cur=%q ok=%v", cur, ok)
 	}
-	if cur, ok := c.CompareAndSetAliases("b", "a", "k", "alias"); !ok || cur != "a" {
+	if cur, ok := c.CompareAndSetAliases("k", "b", "a", "k", "alias"); !ok || cur != "a" {
 		t.Fatalf("swap: cur=%q ok=%v", cur, ok)
 	}
 	for _, key := range []string{"k", "alias"} {
 		if got, _ := c.Get(key); got != "a" {
 			t.Fatalf("%s bound to %q, want a", key, got)
 		}
+	}
+	// Comparing one key while writing another leaves the compared group alone.
+	if _, ok := c.CompareAndSetAliases("k", "a", "a", "child"); !ok {
+		t.Fatal("compare on parent, write child failed")
+	}
+	c.mu.Lock()
+	parentAliases := append([]string(nil), c.entries["k"].aliases...)
+	childAliases := append([]string(nil), c.entries["child"].aliases...)
+	c.mu.Unlock()
+	if len(parentAliases) != 2 || len(childAliases) != 1 || childAliases[0] != "child" {
+		t.Fatalf("parent aliases %v, child aliases %v", parentAliases, childAliases)
 	}
 }
 

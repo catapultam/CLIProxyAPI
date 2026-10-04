@@ -151,19 +151,21 @@ func (c *SessionCache) SetAliases(authID string, sessionIDs ...string) {
 }
 
 // CompareAndSetAliases binds sessionIDs to authID, like SetAliases, but only
-// while sessionIDs[0] is still bound to expectedAuthID. It returns the binding
-// of sessionIDs[0] after the call ("" when there is none) and whether the
-// binding was written. A request that read a binding uses this so it cannot
-// overwrite a newer binding written concurrently by another request.
-func (c *SessionCache) CompareAndSetAliases(expectedAuthID, authID string, sessionIDs ...string) (string, bool) {
-	if c == nil || expectedAuthID == "" || authID == "" || len(sessionIDs) == 0 || sessionIDs[0] == "" {
+// while compareKey is still bound to expectedAuthID. It returns the binding of
+// compareKey after the call ("" when there is none) and whether the binding
+// was written. A request that read compareKey uses this so it cannot overwrite
+// a newer binding written concurrently by another request. compareKey need not
+// be among sessionIDs: a fork that inherits its parent's binding compares the
+// parent key but writes only its own, leaving the parent group untouched.
+func (c *SessionCache) CompareAndSetAliases(compareKey, expectedAuthID, authID string, sessionIDs ...string) (string, bool) {
+	if c == nil || compareKey == "" || expectedAuthID == "" || authID == "" || len(sessionIDs) == 0 {
 		return "", false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ensureInitializedLocked()
 	now := time.Now()
-	entry, ok := c.entries[sessionIDs[0]]
+	entry, ok := c.entries[compareKey]
 	if !ok || !now.Before(entry.expiresAt) {
 		return "", false
 	}

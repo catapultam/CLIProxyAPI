@@ -1069,9 +1069,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	// so a request holding a stale read cannot undo a concurrent re-binding.
 	rebind := func(expected, authID string) (string, bool) {
 		if bindAliases {
-			return s.cache.CompareAndSetAliases(expected, authID, cacheKey, fallbackKey)
+			return s.cache.CompareAndSetAliases(cacheKey, expected, authID, cacheKey, fallbackKey)
 		}
-		return s.cache.CompareAndSetAliases(expected, authID, cacheKey)
+		return s.cache.CompareAndSetAliases(cacheKey, expected, authID, cacheKey)
 	}
 	findAvailable := func(authID string) *Auth {
 		for _, auth := range available {
@@ -1103,8 +1103,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
 				return bound, nil
 			}
-			// Another request re-bound the session after this one read it;
-			// follow the current binding instead of overwriting it.
+			// Another request re-bound the session after this one read it.
+			// A request pinned to its credential (thread continuation or
+			// advisor results) is still served by the credential it read, but
+			// writes nothing, so the newer binding stays.
+			if requestPinnedToCredential(opts.OriginalRequest) {
+				entry.Infof("session-affinity: cache hit, pinned request keeps its auth after concurrent re-bind | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
+				return bound, nil
+			}
+			// Any other request follows the current binding.
 			if auth := findAvailable(current); auth != nil {
 				entry.Infof("session-affinity: cache hit after concurrent re-bind | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
@@ -1125,21 +1132,43 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return auth, nil
 	}
 
-	if fallbackKey != "" {
+	if fallbackKey != "" && (!isSubagent || s.subagentAffinity) {
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
-			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					if !isSubagent || s.subagentAffinity {
-						bind(auth.ID)
-						s.noteNextResetRequest(primaryID, model, opts)
-						if isFork {
-							entry.Infof("session-affinity: fork cache hit | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-						} else {
-							entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-						}
-						return auth, nil
-					}
+			if s.afterCacheReadHook != nil {
+				s.afterCacheReadHook(ctx)
+			}
+			// Inherit the fallback binding only while it still holds (compare
+			// on fallbackKey). Aliases merge into the fallback group; a fork or
+			// subagent binds its own key alone, so the parent group is never
+			// merged or rewritten.
+			inheritKeys := []string{cacheKey}
+			if bindAliases {
+				inheritKeys = append(inheritKeys, fallbackKey)
+			}
+			for attempt := 0; attempt < 3; attempt++ {
+				auth := findAvailable(cachedAuthID)
+				if auth == nil {
+					break
 				}
+				current, swapped := s.cache.CompareAndSetAliases(fallbackKey, auth.ID, auth.ID, inheritKeys...)
+				if swapped {
+					s.noteNextResetRequest(primaryID, model, opts)
+					if isFork {
+						entry.Infof("session-affinity: fork cache hit | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+					} else {
+						entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+					}
+					return auth, nil
+				}
+				if current == "" {
+					break
+				}
+				// The fallback binding changed after this request read it.
+				if requestPinnedToCredential(opts.OriginalRequest) {
+					entry.Infof("session-affinity: fallback cache hit, pinned request keeps its auth after concurrent re-bind | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+					return auth, nil
+				}
+				cachedAuthID = current
 			}
 		}
 	}
