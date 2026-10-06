@@ -52,6 +52,14 @@ func (s *Server) setupRoutes() {
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
 
+	// Claude Code sends a best-effort HEAD /api/hello connection-warming probe
+	// at every session start, unauthenticated. Without a route it falls to
+	// NoRoute and logs a 404, which rotates real errors out of the error-log
+	// ring. Answer it directly instead.
+	s.engine.HEAD("/api/hello", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)

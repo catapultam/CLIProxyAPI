@@ -22,6 +22,7 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -206,6 +207,15 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 		}
 	}
 
+	// Fill safeguard_results for any provider that reached this handler
+	// without them: the Claude executor already fills its own responses, so
+	// this only acts on providers served through the Claude endpoint that
+	// didn't (e.g. a non-Claude model translated into Claude's response shape).
+	if filledResp, filled := helps.FillClaudeSafeguardResults(rawJSON, resp); filled {
+		resp = filledResp
+		helps.LogClaudeSafeguardHandlerFill(modelName, len(gjson.GetBytes(resp, "safeguard_results.0.status.tool_uses").Map()))
+	}
+
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
@@ -239,6 +249,11 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	// The Claude executor already fills its own responses with
+	// safeguard_results; this filler only acts when they're still missing or
+	// unusable by the time they reach the handler (e.g. a non-Claude provider
+	// served through the Claude endpoint).
+	safeguards := helps.NewClaudeSafeguardFiller(rawJSON)
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
@@ -293,23 +308,28 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 
 			// Write the first chunk
 			if len(chunk) > 0 {
+				chunk = safeguards.FillChunk(chunk)
 				_, _ = c.Writer.Write(chunk)
 				flusher.Flush()
 			}
 
 			// Continue streaming the rest
-			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, safeguards)
+			if safeguards.Filled() {
+				helps.LogClaudeSafeguardHandlerFill(modelName, safeguards.ToolUses())
+			}
 			return
 		}
 	}
 }
 
-func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, safeguards *helps.ClaudeSafeguardFiller) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
 			if len(chunk) == 0 {
 				return
 			}
+			chunk = safeguards.FillChunk(chunk)
 			_, _ = c.Writer.Write(chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {

@@ -687,6 +687,37 @@ func TestNewServerAppliesTrustedProxyConfiguration(t *testing.T) {
 	}
 }
 
+// Claude Code sends a best-effort, unauthenticated HEAD /api/hello probe at
+// every session start. It must answer 200 directly rather than fall to
+// NoRoute, which would log a 404 and rotate real errors out of the error log.
+func TestApiHelloHead(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodHead, "/api/hello", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
+	}
+}
+
+// GET /api/hello is not registered; only the HEAD probe is answered.
+func TestApiHelloGetIsNotRouted(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/hello", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusOK {
+		t.Fatalf("GET /api/hello unexpectedly returned 200")
+	}
+}
+
 func TestHealthz(t *testing.T) {
 	server := newTestServer(t)
 

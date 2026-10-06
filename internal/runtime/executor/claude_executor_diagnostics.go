@@ -2,11 +2,13 @@ package executor
 
 import (
 	"bytes"
+	"net/http"
 	"strings"
 
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -122,4 +124,44 @@ func claudeMessageIDFromSSE(data []byte) string {
 		return ""
 	}
 	return messageID
+}
+
+// logClaudeSafeguardUpstream400 warns when an auto-mode request's upstream
+// response was rejected with 400. Claude Code's client only reads
+// safeguard_results from a response that completes normally, so a 400 means
+// this response never reaches it with them, pushing Claude Code toward its
+// own (billed) classifier for the rest of the session.
+func logClaudeSafeguardUpstream400(bodyForUpstream []byte, header http.Header, errBody []byte) {
+	if !helps.ClaudeRequestWantsSafeguards(bodyForUpstream) {
+		return
+	}
+	log.WithFields(log.Fields{
+		"upstream_request_id": helps.HeaderValueCaseInsensitive(header, "request-id"),
+		"message":             truncateClaudeSafeguardMessage(gjson.GetBytes(errBody, "error.message").String()),
+	}).Warn("claude: upstream 400 on an auto-mode request; Claude Code stops server review for this session")
+}
+
+// logClaudeSafeguardStatusNotAvailable warns when the upstream answered
+// safeguard_results with a usable but non-"available" status (for example
+// "unsupported", or "unavailable" with a status-level reason). Claude Code
+// may also treat this as a reason to stop server review for the session.
+func logClaudeSafeguardStatusNotAvailable(typ, reason string, header http.Header) {
+	if typ == "" || typ == "available" {
+		return
+	}
+	log.WithFields(log.Fields{
+		"status":              typ,
+		"reason":              reason,
+		"upstream_request_id": helps.HeaderValueCaseInsensitive(header, "request-id"),
+	}).Warn("claude: upstream safeguard_results status is not available; Claude Code may stop server review for this session")
+}
+
+// truncateClaudeSafeguardMessage truncates s to at most 300 runes, so an
+// oversized upstream error message never bloats the log line.
+func truncateClaudeSafeguardMessage(s string) string {
+	r := []rune(s)
+	if len(r) <= 300 {
+		return s
+	}
+	return string(r[:300])
 }

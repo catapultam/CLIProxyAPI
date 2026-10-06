@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -171,5 +172,123 @@ func TestFillClaudeSafeguardResultsNonStream(t *testing.T) {
 	}
 	if out, filled := FillClaudeSafeguardResults([]byte(safeguardsRequest), []byte(`{"type":"error"}`)); filled || string(out) != `{"type":"error"}` {
 		t.Fatalf("error bodies must not be touched: %s", out)
+	}
+}
+
+func TestFillClaudeSafeguardResultsNonStreamTreatsNullAndEmptyAsMissing(t *testing.T) {
+	for _, existing := range []string{`null`, `[]`} {
+		resp := `{"id":"msg_1","content":[{"type":"tool_use","id":"toolu_X","name":"Bash","input":{}}],"safeguard_results":` + existing + `}`
+		out, filled := FillClaudeSafeguardResults([]byte(safeguardsRequest), []byte(resp))
+		if !filled {
+			t.Fatalf("existing=%s: expected fill", existing)
+		}
+		res := gjson.GetBytes(out, "safeguard_results")
+		if res.Get("0.status.tool_uses.toolu_X.type").String() != "unavailable" {
+			t.Fatalf("existing=%s: bad fill: %s", existing, res.Raw)
+		}
+	}
+}
+
+// TestSafeguardFillerStreamReplacesUnusableResults covers the three shapes
+// Claude Code's client parser treats as server_no_result: a null value, an
+// empty array, and an array without a dangerous_tool_use entry. Each must be
+// overwritten by the stop-carrying message_delta, not left alone.
+func TestSafeguardFillerStreamReplacesUnusableResults(t *testing.T) {
+	for _, existing := range []string{`null`, `[]`, `[{"type":"other"}]`} {
+		f := NewClaudeSafeguardFiller([]byte(safeguardsRequest))
+		line := `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","safeguard_results":` + existing + `}}`
+		out := feedLines(t, f, []string{line})
+		if !f.Filled() {
+			t.Fatalf("existing=%s: expected fill", existing)
+		}
+		toolUsesOf(t, out[0])
+	}
+}
+
+// TestSafeguardFillerStreamMessageStartNullDoesNotDisarm verifies that a
+// message_start carrying "safeguard_results":null does not stop the filler
+// from watching: the later stop-carrying message_delta must still be filled.
+func TestSafeguardFillerStreamMessageStartNullDoesNotDisarm(t *testing.T) {
+	f := NewClaudeSafeguardFiller([]byte(safeguardsRequest))
+	out := feedLines(t, f, []string{
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5-5","content":[],"safeguard_results":null}}`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_A","name":"Bash","input":{}}}`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+	})
+	if !f.Filled() {
+		t.Fatal("expected the later stop delta to still be filled")
+	}
+	toolUsesOf(t, out[2])
+}
+
+// TestSafeguardFillerStreamKeepsUsableUnsupportedReportsStatus checks that a
+// real "unsupported" answer passes through untouched (as in
+// TestSafeguardFillerStreamKeepsUnsupported) and that UpstreamStatus reports
+// it for diagnostics.
+func TestSafeguardFillerStreamKeepsUsableUnsupportedReportsStatus(t *testing.T) {
+	f := NewClaudeSafeguardFiller([]byte(safeguardsRequest))
+	line := `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","safeguard_results":[{"type":"dangerous_tool_use","status":{"type":"unsupported","reason":"not_entitled"}}]}}`
+	if out := feedLines(t, f, []string{line}); out[0] != line || f.Filled() {
+		t.Fatalf("a real server answer must pass through: %s", out[0])
+	}
+	typ, reason := f.UpstreamStatus()
+	if typ != "unsupported" || reason != "not_entitled" {
+		t.Fatalf("UpstreamStatus() = (%q, %q), want (unsupported, not_entitled)", typ, reason)
+	}
+}
+
+func TestSafeguardFillerUpstreamStatusEmptyWhenFilled(t *testing.T) {
+	f := NewClaudeSafeguardFiller([]byte(safeguardsRequest))
+	feedLines(t, f, []string{`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`})
+	if !f.Filled() {
+		t.Fatal("expected fill")
+	}
+	if typ, reason := f.UpstreamStatus(); typ != "" || reason != "" {
+		t.Fatalf("UpstreamStatus() = (%q, %q), want empty when the filler filled it itself", typ, reason)
+	}
+}
+
+func TestSafeguardFillerFillChunkMultiLine(t *testing.T) {
+	f := NewClaudeSafeguardFiller([]byte(safeguardsRequest))
+	chunk := []byte("event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_A","name":"Bash","input":{}}}` + "\n\n")
+	out := f.FillChunk(chunk)
+	if !bytes.Equal(out, chunk) {
+		t.Fatalf("non-stop chunk must be byte-identical: got %q, want %q", out, chunk)
+	}
+
+	stopChunk := []byte("event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}` + "\n\n")
+	filled := f.FillChunk(stopChunk)
+	if !f.Filled() {
+		t.Fatal("expected the stop chunk to be filled")
+	}
+	lines := strings.Split(string(filled), "\n")
+	if lines[0] != "event: message_delta" {
+		t.Fatalf("event line changed: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], `"toolu_A"`) || !strings.Contains(lines[1], "unavailable") {
+		t.Fatalf("data line not filled: %q", lines[1])
+	}
+	// Trailing blank lines (the SSE event terminator) must be preserved.
+	if lines[2] != "" || lines[3] != "" {
+		t.Fatalf("trailing blank lines lost: %#v", lines)
+	}
+
+	// Once done, FillChunk must stop touching chunks (fast path).
+	again := f.FillChunk([]byte(`data: {"type":"message_stop"}` + "\n\n"))
+	if string(again) != `data: {"type":"message_stop"}`+"\n\n" {
+		t.Fatalf("filler kept mutating after done: %q", again)
+	}
+}
+
+func TestSafeguardFillerFillChunkInactive(t *testing.T) {
+	f := NewClaudeSafeguardFiller([]byte(`{"model":"claude-opus-5-5","messages":[]}`))
+	chunk := []byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n")
+	if out := f.FillChunk(chunk); !bytes.Equal(out, chunk) {
+		t.Fatalf("inactive filler must not touch chunks: %q", out)
+	}
+	if out := (*ClaudeSafeguardFiller)(nil).FillChunk(chunk); !bytes.Equal(out, chunk) {
+		t.Fatalf("nil filler must not touch chunks: %q", out)
 	}
 }

@@ -358,6 +358,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		if httpResp.StatusCode == http.StatusBadRequest {
+			logClaudeSafeguardUpstream400(bodyForUpstream, httpResp.Header, b)
+		}
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
@@ -428,6 +431,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		var filled bool
 		if data, filled = helps.FillClaudeSafeguardResults(bodyForUpstream, data); filled {
 			helps.LogClaudeSafeguardFill(httpResp.Header, len(gjson.GetBytes(data, "safeguard_results.0.status.tool_uses").Map()))
+		} else if helps.ClaudeRequestWantsSafeguards(bodyForUpstream) {
+			if typ, reason, ok := helps.ClaudeSafeguardResponseStatus(data); ok {
+				logClaudeSafeguardStatusNotAvailable(typ, reason, httpResp.Header)
+			}
 		}
 	}
 	cacheClaudeThinkingReplayResponse(ctx, replayScope, data)
