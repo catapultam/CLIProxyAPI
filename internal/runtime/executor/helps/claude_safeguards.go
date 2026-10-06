@@ -22,12 +22,13 @@ func LogClaudeSafeguardFill(headers http.Header, toolUses int) {
 // LogClaudeSafeguardHandlerFill records that a response reached the Claude
 // handler without usable safeguard_results for an auto-mode request — for
 // example a non-Claude provider served through the Claude endpoint — and the
-// handler filled them as unavailable (retryable).
+// handler filled them as unavailable (retryable). That is expected for every
+// non-Claude model, so it logs at debug level.
 func LogClaudeSafeguardHandlerFill(model string, toolUses int) {
 	log.WithFields(log.Fields{
 		"model":     model,
 		"tool_uses": toolUses,
-	}).Warn("claude: response reached the Claude handler without safeguard_results for an auto-mode request; filled them as unavailable (retryable)")
+	}).Debug("claude: response reached the Claude handler without safeguard_results for an auto-mode request; filled them as unavailable (retryable)")
 }
 
 // Claude Code in auto mode sends a `safeguards` request field and reads the
