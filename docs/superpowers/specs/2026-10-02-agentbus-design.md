@@ -235,9 +235,14 @@ Fix, in the mod only (no proxy change for this part):
 - The messages are taken from the held list before the append is awaited, so parallel tool results
   (concurrency-safe tools run at once) can't deliver them twice; a refused or failed append puts them
   back at the front (the 100-message cap is applied again after that).
-- A turn that ended while the append was in flight (`turn.start` counter changed, or no turn running):
-  no turn will read the row, stored or not, so the messages run as prompts (a stored row may repeat
-  them).
+- A turn that ended while appends were in flight (`turn.start` counter changed, or no turn running): no
+  turn will read those rows, stored or not, so `turn.complete` runs every in-flight batch as prompts,
+  oldest first, before the held messages that came later (a stored row may repeat them). The hooks then
+  find their batches empty. A node model of these interleavings (two or three appends at once, one
+  refused, the next turn already started) is `sims/2026-10-06-agentbus-midturn-batches.mjs`
+  (`node <file>`; it asserts its results). Not ordered: an older batch whose append is refused while a
+  newer batch is still in flight goes back to the held list, so a turn that ends then runs the newer
+  batch first (nothing is lost or repeated).
 - Not unit-tested: the plugin test world has no `session.append` backend (a plugin's append rejects
   there), so the tests cover only the refused path. The stored-row path was checked by reading and in a
   live engine.

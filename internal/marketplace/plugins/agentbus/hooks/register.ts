@@ -849,9 +849,11 @@ let inTurn = false
 // can tell.
 let turnSeq = 0
 const midTurn: BusMessage[] = []
-// The batch a tool.call hook is appending right now, if any. A turn that ends meanwhile runs it as prompts
-// before the held messages (which came later), and empties it, so the hook leaves it alone afterwards.
-let appending: BusMessage[] | undefined
+// The batches tool.call hooks are appending now, oldest first (parallel tool results can append at once;
+// each hook takes the held messages in order, so this is their arrival order). A turn that ends meanwhile
+// runs every batch as prompts, oldest first, before the held messages (which came later), and empties
+// each, so its hook leaves it alone afterwards. Each hook removes only its own batch when it is done.
+const appending: BusMessage[][] = []
 // The messages delivered into the running turn. A turn that does not end with an answer (interrupted,
 // refused, or an API error) may never have acted on them, so they run again as prompts after it.
 let deliveredThisTurn: BusMessage[] = []
@@ -1048,8 +1050,7 @@ export const register: Register = on => {
     // Taken before the append is awaited, so a parallel tool result (concurrency-safe tools run at once,
     // each result through this hook) can't deliver them again; put back at the front if it fails.
     const msgs = midTurn.splice(0)
-    const batch = msgs
-    appending = batch
+    appending.push(msgs)
     const seq = turnSeq
     const text = msgs.map(m => formatMessage({ ...m, body: defang(m.body) })).join('\n\n')
     let ok = false
@@ -1059,12 +1060,15 @@ export const register: Register = on => {
     } catch {
       ok = false
     }
-    if (appending === batch) appending = undefined
+    const at = appending.indexOf(msgs)
+    if (at >= 0) appending.splice(at, 1)
     if (!inTurn || seq !== turnSeq) {
       // The turn ended while the row was being appended: no turn will read it now, whether or not it was
-      // stored. turn.complete already ran these messages as prompts, before the held ones that came
-      // later (batch emptied); a stored row may repeat them (a repeat beats a loss).
-      for (const m of batch.splice(0)) void submitMessage($, m)
+      // stored. turn.complete already ran these messages as prompts, in order before the held ones that
+      // came later, and emptied msgs, so this runs nothing; a stored row may repeat them (a repeat beats a
+      // loss). msgs is still full only if a new turn started without a turn.complete in between; then
+      // its messages run here.
+      for (const m of msgs.splice(0)) void submitMessage($, m)
       return answered
     }
     if (!ok) {
@@ -1202,10 +1206,12 @@ export const register: Register = on => {
       if (e.reason !== 'answer') for (const m of deliveredThisTurn) void submitMessage($, m)
       deliveredThisTurn = []
       if (e.reason !== 'error') void turnCompleted($)
-      // A batch still being appended came before the held messages: it runs first (emptied here, so the
-      // hook doesn't run it again). Then the messages held for a tool result that never came.
-      if (appending) for (const m of appending.splice(0)) void submitMessage($, m)
-      appending = undefined
+      // Batches still being appended came before the held messages: they run first, oldest first (each
+      // emptied here, so its hook doesn't run it again; the hook removes it from the list). Then the
+      // messages held for a tool result that never came.
+      for (const batch of appending) for (const m of batch.splice(0)) void submitMessage($, m)
+      // Emptied, so the list can go: a hook whose append never settles must not keep an entry for good.
+      appending.length = 0
       for (const m of midTurn.splice(0)) void submitMessage($, m)
     }
     return next(e)

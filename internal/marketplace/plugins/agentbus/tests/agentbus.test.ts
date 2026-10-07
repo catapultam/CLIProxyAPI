@@ -1800,7 +1800,7 @@ test('a submit that never settles does not hold up the next message', async ($, 
   expect(seen.length).toBe(2)
 })
 
-test('past the held-message cap none is lost and the order holds', async ($, on) => {
+test('past the held-message cap (the oldest runs as a prompt at once) none is lost and the order holds', async ($, on) => {
   const many = Array.from({ length: 101 }, (_, i) => ({ ...SLACK_MSG, id: `m_b${(i + 16).toString(16)}`, body: `msg ${i}` }))
   const { t, prompts, clock } = await midTurn($, on, many)
   await $.tool.call(call('Bash'))

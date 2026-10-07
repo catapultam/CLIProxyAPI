@@ -287,9 +287,9 @@ func (s *Store) mayReadImageLocked(owner, sid string) bool {
 // handleImage hands session ?session= the image ?id= that a Slack message
 // to it (or to a session it took over) carried, as JSON with the bytes in
 // base64, or with &raw=1 as the bytes themselves (Content-Type the checked
-// image type, nosniff). Any other session gets the same 404 as an unknown id. It waits up
-// to 20 s for a download in progress (then 504), answers 410 once the image
-// expired and 502 with the reason when the download failed.
+// image type, nosniff). Any other session gets the same 404 as an unknown
+// id. It waits up to 20 s for a download in progress (then 504), answers 410
+// once the image expired and 502 with the reason when the download failed.
 func (s *Store) handleImage(c *gin.Context) {
 	sid, id := strings.TrimSpace(c.Query("session")), strings.TrimSpace(c.Query("id"))
 	if sid == "" {
