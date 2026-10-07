@@ -31,7 +31,7 @@ type Command = {
   output?: string
   timeout?: number
 }
-type BusMessage = {
+export type BusMessage = {
   id: string
   from: string
   body: string
@@ -800,7 +800,7 @@ export function defang(body: string): string {
 
 // One terminal line per delivered message: who sent it (the Slack user for a Slack message) and the start
 // of its text, so the person at the prompt sees what reached the model mid-turn. Control characters out.
-function previewLine(m: BusMessage): string {
+export function previewLine(m: BusMessage): string {
   const clean = (v: string | undefined) => oneLine(v).replace(/[\u0000-\u001F\u007F-\u009F]/g, '').trim()
   const who = m.from === 'slack' && m.slack_user ? `${clean(m.slack_user)} via Slack` : clean(m.from)
   const body = clean(m.body)

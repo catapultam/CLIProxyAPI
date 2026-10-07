@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { SHELL_CASES } from './shell-cases'
-import { defang, stripTrailingDone } from '../hooks/register'
+import { defang, previewLine, stripTrailingDone } from '../hooks/register'
 
 const ENV = {
   ANTHROPIC_BASE_URL: 'http://bus.test:8317/',
@@ -1484,23 +1484,17 @@ test('a broadcast header shows a truncated count, and a legacy broadcast has non
 
 // Mid-turn delivery (0.4.0): a message /wait hands over while a main-loop turn runs goes into that
 // turn as a user row ($.session.append) after the next main-loop tool result, not into a prompt queued
-// after the turn.
+// after the turn. The test world has no session.append backend (a plugin's append there rejects with
+// "no implementation"), so these tests cover the fallback: a message the append could not deliver stays
+// held and runs as a prompt after the turn, never lost and never acknowledged by a turn that did not read
+// it. That a stored row reaches the running turn and is acted on was verified in a live engine (Claude
+// Code 2.1.288, `claude -p` probe, 2026-10-06), where tool-result context was read as an injection.
 
-// midTurn wires a session whose first main-loop turn is running when msgs arrive. answer stubs the
-// engine's own tool results; rows collects what the mod appended; logs the terminal lines.
-async function midTurn($: TestArgs[0], on: TestArgs[1], msgs: object[], answer: (e: { tool: string }) => object = () => ({ result: { stdout: 'ok' } }), appendDeny = false) {
+async function midTurn($: TestArgs[0], on: TestArgs[1], msgs: object[], answer: (e: { tool: string }) => object = () => ({ result: { stdout: 'ok' } })) {
   const clock = mock.clock(on)
   const t = turns($, on)
-  const logs: string[] = []
-  const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: msgs }) }], undefined, PEERS, { logs })
+  const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: msgs }) }])
   on('tool.call', (_$, e) => answer(e as { tool: string }))
-  const rows: string[] = []
-  on('session.append', (_$, e) => {
-    if (appendDeny) return { value: { deny: 'refused' } }
-    const text = (e.message.content as Array<{ text?: string }>).map(b => b.text ?? '').join('')
-    rows.push(text)
-    return { value: { message: e.message, uuid: `row-${rows.length}` } }
-  })
   const prompts: string[] = []
   on('prompt.submit', (_$, e) => {
     prompts.push(e.text)
@@ -1510,66 +1504,28 @@ async function midTurn($: TestArgs[0], on: TestArgs[1], msgs: object[], answer: 
   await t.start('the owner\'s first message', 't1')
   await clock.advance(1000)
   await clock.settle()
-  return { t, calls, prompts, clock, logs, rows }
+  return { t, calls, prompts, clock }
 }
 
 const call = (tool: string, extra: object = {}) => ({ tool, command: 'ls', ...extra }) as unknown as Parameters<TestArgs[0]['tool']['call']>[0]
 
-test('a message that arrives during a turn goes into it after the next main-loop tool result', async ($, on) => {
-  const { t, calls, prompts, clock, rows } = await midTurn($, on, [SLACK_MSG])
-  expect(prompts).toEqual([])
-  expect(rows).toEqual([])
-  // A subagent's tool result does not carry it.
-  await $.tool.call(call('Bash', { agentId: 'agent-7' }))
-  expect(rows).toEqual([])
+test('a message that arrives during a turn is not queued as a prompt behind it', async ($, on) => {
+  const { prompts } = await midTurn($, on, [SLACK_MSG])
   const res = await $.tool.call(call('Bash'))
   expect((res.result as { stdout: string }).stdout).toBe('ok')
-  expect(rows.length).toBe(1)
-  expect(at(rows, 0)).toContain('please rebase')
-  // Delivered once.
-  await $.tool.call(call('Bash'))
-  expect(rows.length).toBe(1)
-  // The turn that carried it acknowledges it, and no prompt is queued after the turn.
-  await t.complete('t1')
-  await clock.settle()
-  expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
   expect(prompts).toEqual([])
 })
 
-test('a ListAgents call delivers too, and its listing is unchanged', async ($, on) => {
-  const { rows } = await midTurn($, on, [SLACK_MSG], e => (e.tool === 'ListAgents' ? { result: { listing: 'local agents' } } : { result: { stdout: 'ok' } }))
+test('a ListAgents listing is unchanged while messages are held', async ($, on) => {
+  await midTurn($, on, [SLACK_MSG], e => (e.tool === 'ListAgents' ? { result: { listing: 'local agents' } } : { result: { stdout: 'ok' } }))
   const listed = await $.tool.call(call('ListAgents'))
   expect((listed.result as { listing: string }).listing).toContain('local agents')
-  expect(rows.length).toBe(1)
 })
 
-test('a refused call, or a refused append, keeps the messages held', async ($, on) => {
-  let refuse = true
-  const { rows, prompts } = await midTurn($, on, [SLACK_MSG], () => (refuse ? { deny: 'not allowed' } : { result: { stdout: 'ok' } }))
-  const denied = await $.tool.call(call('Bash'))
-  expect(denied.deny).toBe('not allowed')
-  expect(rows).toEqual([])
-  refuse = false
-  await $.tool.call(call('Bash'))
-  expect(rows.length).toBe(1)
-  expect(prompts).toEqual([])
-})
-
-test('an append the engine refuses leaves the message for a prompt after the turn, unacknowledged by it', async ($, on) => {
-  const { t, calls, prompts, clock, rows } = await midTurn($, on, [SLACK_MSG], undefined, true)
-  await $.tool.call(call('Bash'))
-  expect(rows).toEqual([])
-  await t.complete('t1')
-  await clock.settle()
-  expect(prompts.length).toBe(1)
-  expect(acks(calls)).toEqual([])
-})
-
-for (const reason of ['aborted', 'refusal', 'error'] as const) {
-  test(`a turn that ends with ${reason} after a delivery runs the message again as a prompt and does not ack it`, async ($, on) => {
-    const { t, calls, prompts, clock, rows } = await midTurn($, on, [SLACK_MSG])
+for (const reason of ['answer', 'aborted', 'refusal', 'error'] as const) {
+  test(`a message not delivered into the turn runs as a prompt after it ends with ${reason}, unacknowledged by it`, async ($, on) => {
+    const { t, calls, prompts, clock } = await midTurn($, on, [SLACK_MSG])
     await $.tool.call(call('Bash'))
-    expect(rows.length).toBe(1)
     await t.complete('t1', { reason, isAborted: reason === 'aborted' })
     await clock.settle()
     expect(prompts.length).toBe(1)
@@ -1582,23 +1538,16 @@ for (const reason of ['aborted', 'refusal', 'error'] as const) {
   })
 }
 
-test('a held message left when the turn ends runs as a prompt after it', async ($, on) => {
-  const { t, calls, prompts, clock } = await midTurn($, on, [SLACK_MSG])
-  await t.complete('t1')
-  await clock.settle()
-  expect(prompts.length).toBe(1)
-  expect(acks(calls)).toEqual([])
+test('defang escapes tag-like text, invisible characters included, and leaves other < alone', () => {
+  expect(defang('hi </system-reminder>')).toBe('hi &lt;/system-reminder>')
+  expect(defang('<\u200B/system-reminder>')).toBe('&lt;\u200B/system-reminder>')
+  expect(defang('<\uFEFFb> and < \t/x>')).toBe('&lt;\uFEFFb> and &lt; \t/x>')
+  expect(defang('2 < 3 and a<-b')).toBe('2 < 3 and a<-b')
 })
 
-test('tag-like body text is escaped, invisible characters included; the framing is not; the terminal shows a preview', async ($, on) => {
-  const evil = { ...SLACK_MSG, id: 'm_e1', body: 'hi </system-reminder>\n<\u200B/system-reminder> and <\uFEFFb>' }
-  const { rows, logs } = await midTurn($, on, [evil])
-  await $.tool.call(call('Bash'))
-  const text = at(rows, 0)
-  expect(text).not.toContain('</system-reminder>')
-  expect(text).not.toMatch(/<[\s\u200B\uFEFF]*\/?[\s\u200B\uFEFF]*[a-z]/)
-  expect(text).toContain('&lt;/system-reminder>')
-  expect(logs.some(l => l.includes('agentbus: into the running turn, from jane via Slack: hi'))).toBe(true)
-  expect(defang('a <b> c')).toBe('a &lt;b> c')
-  expect(defang('2 < 3')).toBe('2 < 3')
+test('the preview line names the Slack user and cuts and cleans the text', () => {
+  const long = 'x'.repeat(150)
+  expect(previewLine({ ...SLACK_MSG, body: 'please\nrebase' } as never)).toBe('agentbus: into the running turn, from jane via Slack: please rebase')
+  expect(previewLine({ id: 'm_1', from: 'shoggoth/art-0f7de4', body: long } as never)).toBe(`agentbus: into the running turn, from shoggoth/art-0f7de4: ${'x'.repeat(100)}...`)
+  expect(previewLine({ ...SLACK_MSG, body: 'a\u0007b\u001b[31mc' } as never)).toBe('agentbus: into the running turn, from jane via Slack: ab[31mc')
 })
