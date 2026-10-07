@@ -753,16 +753,28 @@ let workingTimer: { cancel: () => void } | undefined
 // answer older messages while newer ones wait.
 let inTurn = false
 const midTurn: BusMessage[] = []
+// The messages delivered into the running turn. A turn that does not end with an answer (interrupted,
+// refused, or an API error) may never have acted on them, so they run again as prompts after it.
+let deliveredThisTurn: BusMessage[] = []
 
 // Holds a message /wait handed over during a main-loop turn until the next main-loop tool result
 // carries it; a Slack user's or guest's message is tracked for its read receipt, as submitMessage does.
-function holdForTurn(m: BusMessage) {
+// Past MAX_PENDING_READS held messages the oldest runs as a prompt after the turn instead: none is lost.
+function holdForTurn($: EngineInterface, m: BusMessage) {
   if ((m.from_user === true || m.guest === true) && MESSAGE_ID.test(m.id)) {
     pendingReads.delete(m.id)
     pendingReads.set(m.id, { session, resolved: false, started: false })
+    while (pendingReads.size > MAX_PENDING_READS) {
+      const oldest = pendingReads.keys().next().value
+      if (oldest === undefined) break
+      pendingReads.delete(oldest)
+    }
   }
   midTurn.push(m)
-  while (midTurn.length > MAX_PENDING_READS) midTurn.shift()
+  while (midTurn.length > MAX_PENDING_READS) {
+    const oldest = midTurn.shift()
+    if (oldest) void submitMessage($, oldest)
+  }
 }
 
 // Takes the held messages for a main-loop tool result: they are in the running turn from now on, so
@@ -773,7 +785,22 @@ function takeForTurn(): BusMessage[] {
     const pending = pendingReads.get(m.id)
     if (pending) pending.started = true
   }
+  deliveredThisTurn.push(...taken)
   return taken
+}
+
+// A delivered message's text inside a tool result's context: no tag-like text (an opening or closing
+// tag of any name) can end the reminder that carries it or open a new block. quote() already prefixes
+// every body line, so a body can't pass for a header line either.
+function defang(text: string): string {
+  return text.replace(/<(\s*\/?\s*[A-Za-z!?])/g, '&lt;$1')
+}
+
+// One terminal line per delivered message: who sent it and the start of its text, so the person at the
+// prompt sees what reached the model mid-turn.
+function previewLine(m: BusMessage): string {
+  const body = oneLine(m.body).trim()
+  return `agentbus: into the running turn, from ${oneLine(m.from)}: ${body.length > 100 ? body.slice(0, 100) + '...' : body}`
 }
 
 // working tells the proxy a turn handling these messages, delivered to session sid, is still
@@ -865,7 +892,7 @@ async function waitOnce($: EngineInterface) {
         if (m.from_user === true && m.guest !== true) void runCommand($, m, m.command)
         continue
       }
-      if (inTurn) holdForTurn(m)
+      if (inTurn) holdForTurn($, m)
       else void submitMessage($, m)
     }
   } else if (status !== 204) {
@@ -875,6 +902,21 @@ async function waitOnce($: EngineInterface) {
 }
 
 export const register: Register = on => {
+  // Registered first, so it is this plugin's outermost tool.call hook and sees the result after the
+  // ListAgents and SendMessage hooks below rewrote it. Every main-loop tool result the model asked for
+  // carries the messages held since the last one: the model reads them inside the running turn, after
+  // the result. Not a subagent's call, not one another plugin made ($.tool.call), not a refused or
+  // abandoned call: the messages then stay held for the next result, or run as prompts after the turn.
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId || next.origin.plugin !== 'engine' || midTurn.length === 0) return next(e)
+    const answered = await next(e)
+    if (next.signal.aborted || answered.deny !== undefined || midTurn.length === 0) return answered
+    const taken = takeForTurn()
+    for (const m of taken) $.ui.log(previewLine(m))
+    scheduleWorking($)
+    return { ...answered, context: [...(answered.context ?? []), ...taken.map(m => defang(formatMessage(m)))] }
+  })
+
   on('session.start', async ($, e, next) => {
     base = ((await $.env.get('ANTHROPIC_BASE_URL')) ?? '').replace(/\/+$/, '')
     token = (await $.env.get('ANTHROPIC_AUTH_TOKEN')) ?? ''
@@ -976,6 +1018,7 @@ export const register: Register = on => {
   // Only the main loop raises turn.start (a subagent's run doesn't).
   on('turn.start', async ($, e, next) => {
     inTurn = true
+    deliveredThisTurn = []
     turnStarted(e.text)
     scheduleWorking($)
     return next(e)
@@ -989,21 +1032,15 @@ export const register: Register = on => {
     if (!e.agentId) {
       cancelWorking()
       inTurn = false
+      // A turn that did not end with an answer may never have acted on the messages delivered into
+      // it: they run again as prompts (submitMessage tracks them afresh, so this turn doesn't ack them).
+      if (e.reason !== 'answer') for (const m of deliveredThisTurn) void submitMessage($, m)
+      deliveredThisTurn = []
       if (e.reason !== 'error') void turnCompleted($)
       // Messages held for a tool result that never came (the turn ended first) run as prompts now.
       for (const m of midTurn.splice(0)) void submitMessage($, m)
     }
     return next(e)
-  })
-
-  // Every main-loop tool result carries the messages held since the last one: the model reads them
-  // inside the running turn, after the result. A subagent's result never does, nor a refused call.
-  on('tool.call', async ($, e, next) => {
-    const answered = await next(e)
-    if (e.agentId || answered.deny !== undefined || midTurn.length === 0) return answered
-    const taken = takeForTurn()
-    $.ui.log(`agentbus: ${taken.length} message${taken.length === 1 ? '' : 's'} delivered into the running turn`)
-    return { ...answered, context: [...(answered.context ?? []), ...taken.map(m => formatMessage(m))] }
   })
 
   on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {

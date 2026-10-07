@@ -226,10 +226,22 @@ sessions whose model calls bypass the proxy.
 Fix, in the mod only (no proxy change):
 - `turn.start` / `turn.complete` (main loop) mark a running turn.
 - During a turn, a message `/wait` hands over is held, not submitted.
-- Every main-loop tool result (`tool.call`, no `agentId`, not a refused call) carries the held messages
-  as `context`: the model reads them inside the running turn, right after that result. A subagent's
-  tool result never carries them. The terminal shows one log line per delivery.
+- The mod's outermost `tool.call` hook (registered first, so it sees the result after the mod's own
+  ListAgents / SendMessage hooks) adds the held messages as `context` to the next main-loop tool result
+  the model asked for: the model reads them inside the running turn, right after that result. Never on
+  a subagent's call, a call another plugin made (`next.origin.plugin` is not `engine`), a refused call
+  (`deny`) or an abandoned one (`next.signal.aborted`): the messages then stay held.
+- The text is the same framed text a prompt gets, with tag-like text escaped (`<` before a tag name or
+  `/` becomes `&lt;`), so a body can't end the reminder that carries it.
+- The model reads the context; the person at the terminal does not see it. The terminal gets one log
+  line per message: who sent it and the first 100 characters.
 - A turn that ends before another tool result: the held messages run as prompts after it, as before.
-- Read receipts: a message delivered into a turn is acknowledged when that turn completes; one that runs
-  as a prompt, when its own turn completes. Commands are unchanged (run by the mod, never shown as text).
+- A turn that does not end with an answer (interrupted, refused, API error): the messages delivered into
+  it run again as prompts after it (a possible repeat beats a lost message), and that turn does not
+  acknowledge them; their own prompt's turn does.
+- More than 100 held messages: the oldest runs as a prompt after the turn; none is dropped.
+- Read receipts: a message delivered into a turn is acknowledged when that turn completes with an answer,
+  and the ⏳ timer restarts (15 s) when messages are delivered. Commands are unchanged (run by the mod,
+  never shown as text).
 - It works the same for sessions that bypass the proxy, because it needs only the plugin hooks.
+- Open for the owner: mid-turn messages are not shown in full in the terminal (only the preview line).
