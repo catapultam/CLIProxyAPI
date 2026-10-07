@@ -58,4 +58,13 @@ reset(); { const [gA, rA] = gate(), [gB, rB] = gate()
   midTurn.push('a1'); const A = hook(gA, false); midTurn.push('b1'); const B = hook(gB, true)
   rA(); await A; midTurn.push('c1'); complete(); rB(); await B
   assert.deepEqual(out, ['b1', 'a1', 'c1']) }
-console.log('agentbus mid-turn model: 7 cases ok')
+// 8: a hook whose append never settles: turn.complete runs its batch and leaves no entry behind.
+reset(); { const [gA] = gate()
+  midTurn.push('a1'); void hook(gA, true); complete()
+  assert.deepEqual(out, ['a1']); assert.equal(appending.length, 0) }
+// 9: the next turn's hook pushes a batch while the old turn's hook is still in flight; then both settle.
+reset(); { const [gA, rA] = gate(), [gN, rN] = gate()
+  midTurn.push('a1'); const A = hook(gA, true); complete(); inTurn = true; turnSeq++
+  midTurn.push('n1'); const N = hook(gN, true); rA(); await A; rN(); await N
+  assert.deepEqual(out, ['a1', 'n1(row)']); assert.equal(appending.length, 0) }
+console.log('agentbus mid-turn model: 9 cases ok')
