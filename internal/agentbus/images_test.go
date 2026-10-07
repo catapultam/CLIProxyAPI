@@ -154,6 +154,22 @@ func TestImageRouteServesTheRecipientOnly(t *testing.T) {
 	}
 }
 
+func TestImageRouteRawServesTheBytesToTheRecipientOnly(t *testing.T) {
+	s, _, r := newImageServer(t)
+	s.Hello(sidA, "pc", "/a", "", true)
+	s.Hello(sidB, "pc", "/b", "", true)
+	id := deliverPNG(t, s, sidA)
+	s.FinishImage(id, pngData)
+	w := do(r, http.MethodGet, "/v1/agentbus/image?session="+sidA+"&id="+id+"&raw=1", "")
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "image/png" || !bytes.Equal(w.Body.Bytes(), pngData) {
+		t.Fatalf("raw = %d %q %d bytes", w.Code, w.Header().Get("Content-Type"), w.Body.Len())
+	}
+	// raw changes the answer's form only: another session still gets the 404.
+	if w := do(r, http.MethodGet, "/v1/agentbus/image?session="+sidB+"&id="+id+"&raw=1", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("raw, other session = %d", w.Code)
+	}
+}
+
 func TestImageRouteWaitsForThePendingDownload(t *testing.T) {
 	s, _, r := newImageServer(t)
 	s.Hello(sidA, "pc", "/a", "", true)
@@ -330,7 +346,9 @@ func TestInjectListsImages(t *testing.T) {
 	post(r, sidA, "", stringContentBody)
 	text := strings.Join(lastUserTexts(got.body), "\n")
 	if !strings.Contains(text, "Attached images: a.png (image/png, id "+refs[0].ID+")") ||
-		!strings.Contains(text, "/v1/agentbus/image?session="+sidA+"&id=<id>") ||
+		!strings.Contains(text, "curl -fsS -o <file> ") ||
+		!strings.Contains(text, "/v1/agentbus/image?session="+sidA+"&id=<id>&raw=1") ||
+		strings.Contains(text, "jq") || strings.Contains(text, "base64 -d") ||
 		!strings.Contains(text, "Files not relayed: notes.pdf (only PNG, JPEG, GIF and WebP images are relayed)") {
 		t.Fatalf("note = %s", text)
 	}

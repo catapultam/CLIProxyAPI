@@ -845,6 +845,9 @@ let workingTimer: { cancel: () => void } | undefined
 // after the turn ends, and the session would answer older messages while newer ones wait. (A tool
 // result's `context` was tried first: the model read a message there as an injection and ignored it.)
 let inTurn = false
+// Counts main-loop turns (turn.start), so a delivery that was still being appended when its turn ended
+// can tell.
+let turnSeq = 0
 const midTurn: BusMessage[] = []
 // The messages delivered into the running turn. A turn that does not end with an answer (interrupted,
 // refused, or an API error) may never have acted on them, so they run again as prompts after it.
@@ -992,7 +995,8 @@ async function deliverWaited($: EngineInterface, m: BusMessage) {
     }
   }
   if (inTurn) holdForTurn($, m)
-  else await submitMessage($, m)
+  // Not awaited: a submit that never settled would hold up every later message.
+  else void submitMessage($, m)
 }
 
 async function waitOnce($: EngineInterface) {
@@ -1000,16 +1004,20 @@ async function waitOnce($: EngineInterface) {
   const { status, json } = await bus($, 'GET', `/wait${query}`)
   if (status === 200) {
     for (const m of ((json?.messages as BusMessage[]) ?? [])) {
-      // Only attachImages sets attached, below.
+      // Only deliverWaited (attachImages) sets attached.
       delete m.attached
       if (m.command) {
         // Only the proxy's Slack bridge sets command, always with from_user, for an owner, never on
         // a guest's message. Any other command message is dropped: never run, and never shown to
-        // the model as text.
-        if (m.from_user === true && m.guest !== true) void runCommand($, m, m.command)
+        // the model as text. Through the chain too, so a command never overtakes an earlier message
+        // that is still fetching its images; not awaited there, so it can't hold up later ones.
+        if (m.from_user === true && m.guest !== true) {
+          const cmd = m.command
+          deliveryChain = deliveryChain.then(() => void runCommand($, m, cmd))
+        }
         continue
       }
-      deliveryChain = deliveryChain.then(() => deliverWaited($, m)).catch(() => undefined)
+      deliveryChain = deliveryChain.then(() => deliverWaited($, m)).catch(err => $.ui.log(`agentbus: a message could not be delivered: ${oneLine(String(err)).slice(0, 200)}`))
     }
   } else if (status !== 204) {
     // 409: another waiter for this session (the old wait.sh hook) holds the long poll.
@@ -1031,6 +1039,7 @@ export const register: Register = on => {
     // Taken before the append is awaited, so a parallel tool result (concurrency-safe tools run at once,
     // each result through this hook) can't deliver them again; put back at the front if it fails.
     const msgs = midTurn.splice(0)
+    const seq = turnSeq
     const text = msgs.map(m => formatMessage({ ...m, body: defang(m.body) })).join('\n\n')
     let ok = false
     try {
@@ -1039,8 +1048,18 @@ export const register: Register = on => {
     } catch {
       ok = false
     }
+    if (!inTurn || seq !== turnSeq) {
+      // The turn ended while the row was being appended: no turn will read it now, whether or not it was
+      // stored, so the messages run as prompts (a stored row may repeat them; a repeat beats a loss).
+      for (const m of msgs) void submitMessage($, m)
+      return answered
+    }
     if (!ok) {
       midTurn.unshift(...msgs)
+      while (midTurn.length > MAX_PENDING_READS) {
+        const oldest = midTurn.shift()
+        if (oldest) void submitMessage($, oldest)
+      }
       return answered
     }
     deliveredIntoTurn(msgs)
@@ -1150,6 +1169,7 @@ export const register: Register = on => {
   // Only the main loop raises turn.start (a subagent's run doesn't).
   on('turn.start', async ($, e, next) => {
     inTurn = true
+    turnSeq++
     deliveredThisTurn = []
     turnStarted(e.text)
     scheduleWorking($)

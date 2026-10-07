@@ -1175,9 +1175,12 @@ thread). Before, only the text reached the session.
   (`HandOff`, as for its inbox); another session gets the same 404 as an
   unknown id (no `session` is a 400). It waits up to 20 s for a download in progress (then 504),
   answers 410 for an expired image, and 502 `{error}` when the download
-  failed.
-- **Mod.** Before it submits or holds a Slack user's message, `waitOnce`
-  gets each image (`saveImage`; on a 504 it asks again, up to 3 more
+  failed. With `&raw=1` a 200 is the image bytes themselves (Content-Type
+  the image type), for a plain `curl -fsS -o <file>`. The request log skips
+  this route, like the upload: the answer holds a whole image.
+- **Mod.** Before it submits or holds a Slack user's message, the mod
+  (`deliverWaited`, in the ordered delivery chain `waitOnce` feeds, so the
+  long-poll never waits for it) gets each image (`saveImage`; on a 504 it asks again, up to 3 more
   times), and saves it in the temp folder as
   `agentbus-img-<id>.<ext>` (extension from the type). The id must be 32
   hex characters before it goes into a URL or a path. The plugin API
@@ -1195,8 +1198,10 @@ thread). Before, only the text reached the session.
   file(s) that this agentbus plugin can't show; update it to 0.4.1 or
   later.]" (`MinImageModVersion`).
 - **Without the mod.** When the proxy injects the message into a request
-  instead, the injected text names the images and how to get one with curl
-  from `/image`.
+  instead, the injected text names the images and how to save one with
+  `curl -fsS -o <file> ".../image?session=<sid>&id=<id>&raw=1"` (no `jq` or
+  base64 tool needed, so it also works in Git for Windows' bash), to open
+  with the Read tool.
 
 **Mod 0.4.1.** `register.ts`'s `VERSION` and `.claude-plugin/plugin.json`
 both move to 0.4.1.

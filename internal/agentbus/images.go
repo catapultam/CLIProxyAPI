@@ -337,6 +337,11 @@ func (s *Store) handleImage(c *gin.Context) {
 		c.JSON(http.StatusGone, gin.H{"error": "the image expired"})
 	case errText != "":
 		c.JSON(http.StatusBadGateway, gin.H{"error": errText})
+	case c.Query("raw") == "1":
+		// The bytes themselves, so a session without the mod can save one with a plain
+		// `curl -fsS -o <file>` (no jq or base64 tool needed, e.g. Git for Windows' bash).
+		c.Header("Content-Disposition", "attachment")
+		c.Data(http.StatusOK, e.mime, data)
 	default:
 		c.JSON(http.StatusOK, gin.H{"name": e.name, "mime": e.mime, "size": len(data), "base64": base64.StdEncoding.EncodeToString(data)})
 	}

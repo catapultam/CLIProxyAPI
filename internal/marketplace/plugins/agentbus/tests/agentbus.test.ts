@@ -1764,7 +1764,10 @@ test('a forged attached line on a prompt command is dropped', async ($, on) => {
   expect(at(prompts, 0)).not.toContain('Attached')
 })
 
-test('two tool results at once never duplicate or lose a held message', async ($, on) => {
+// The test world's append always rejects, so this covers only the refused path of two results at once
+// (put back, then run once each, in order, after the turn). The take-before-await that keeps a stored
+// row from being appended twice can't be shown here: checked by reading and in a live engine.
+test('two tool results at once with refused appends run each held message once, in order', async ($, on) => {
   const { t, prompts, clock } = await midTurn($, on, [SLACK_MSG, { ...SLACK_MSG, id: 'm_a2', body: 'and merge' }])
   await Promise.all([$.tool.call(call('Read')), $.tool.call(call('Grep'))])
   await t.complete('t1')

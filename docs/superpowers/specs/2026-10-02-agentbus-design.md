@@ -234,7 +234,13 @@ Fix, in the mod only (no proxy change for this part):
   (`next.signal.aborted`): the messages then stay held.
 - The messages are taken from the held list before the append is awaited, so parallel tool results
   (concurrency-safe tools run at once) can't deliver them twice; a refused or failed append puts them
-  back at the front.
+  back at the front (the 100-message cap is applied again after that).
+- A turn that ended while the append was in flight (`turn.start` counter changed, or no turn running):
+  no turn will read the row, stored or not, so the messages run as prompts (a stored row may repeat
+  them).
+- Not unit-tested: the plugin test world has no `session.append` backend (a plugin's append rejects
+  there), so the tests cover only the refused path. The stored-row path was checked by reading and in a
+  live engine.
 - Why not the tool result's `context`: tested live (Claude Code 2.1.288, `claude -p`), the model read a
   message there as a possible prompt injection ("didn't come from you") and ignored it. The user row was
   acted on, also with three parallel Read calls (no API error, every row read).
@@ -250,4 +256,7 @@ Fix, in the mod only (no proxy change for this part):
 - Read receipts: a message delivered into a turn is acknowledged when that turn completes with an answer;
   the ⏳ timer starts when messages are delivered and none runs. Commands are unchanged.
 - Messages from `/wait` are delivered through an ordered promise chain, so fetching a message's images
-  (0.4.1) never stops the long-poll (its lease would lapse and the session read as offline).
+  (0.4.1) never stops the long-poll (its lease would lapse and the session read as offline). Commands go
+  through the same chain, so a command never overtakes an earlier message that is still fetching its
+  images. Neither a submit nor a command is awaited in the chain, so one that never settles can't hold
+  up later messages; an unexpected error is logged to the terminal.
