@@ -748,9 +748,10 @@ const WORKING_AFTER_MS = 15000
 let workingTimer: { cancel: () => void } | undefined
 
 // True while a main-loop turn runs (turn.start to turn.complete). A message /wait hands over
-// meanwhile goes into that turn with the next main-loop tool result (midTurn), so the model reads it
-// at once. A prompt submitted mid-turn would only run after the turn ends, and the session would
-// answer older messages while newer ones wait.
+// meanwhile is held (midTurn) and goes into that turn after the next main-loop tool result, as a user
+// row ($.session.append), so the model reads it at once. A prompt submitted mid-turn would only run
+// after the turn ends, and the session would answer older messages while newer ones wait. (A tool
+// result's `context` was tried first: the model read a message there as an injection and ignored it.)
 let inTurn = false
 const midTurn: BusMessage[] = []
 // The messages delivered into the running turn. A turn that does not end with an answer (interrupted,
@@ -777,30 +778,33 @@ function holdForTurn($: EngineInterface, m: BusMessage) {
   }
 }
 
-// Takes the held messages for a main-loop tool result: they are in the running turn from now on, so
-// that turn's completion acknowledges them.
-function takeForTurn(): BusMessage[] {
-  const taken = midTurn.splice(0)
-  for (const m of taken) {
+// Marks delivered messages as in the running turn: that turn's completion acknowledges them.
+function deliveredIntoTurn(msgs: BusMessage[]) {
+  for (const m of msgs) {
     const pending = pendingReads.get(m.id)
     if (pending) pending.started = true
   }
-  deliveredThisTurn.push(...taken)
-  return taken
+  deliveredThisTurn.push(...msgs)
 }
 
-// A delivered message's text inside a tool result's context: no tag-like text (an opening or closing
-// tag of any name) can end the reminder that carries it or open a new block. quote() already prefixes
-// every body line, so a body can't pass for a header line either.
-function defang(text: string): string {
-  return text.replace(/<(\s*\/?\s*[A-Za-z!?])/g, '&lt;$1')
+// Characters a reader can't see, which could hide a tag from a plain pattern.
+const INVISIBLE = '\\s\\u00AD\\u200B-\\u200F\\u2060-\\u2064\\uFEFF'
+const TAG_LIKE = new RegExp(`<([${INVISIBLE}]*\\/?[${INVISIBLE}]*[A-Za-z!?])`, 'g')
+
+// A delivered message body: tag-like text (an opening or closing tag of any name, invisible characters
+// allowed) is escaped, so a body can't open or close a block of the engine's. quote() already prefixes
+// every body line, so a body can't pass for a header line either. The mod's own framing stays as is.
+export function defang(body: string): string {
+  return body.replace(TAG_LIKE, '&lt;$1')
 }
 
-// One terminal line per delivered message: who sent it and the start of its text, so the person at the
-// prompt sees what reached the model mid-turn.
+// One terminal line per delivered message: who sent it (the Slack user for a Slack message) and the start
+// of its text, so the person at the prompt sees what reached the model mid-turn. Control characters out.
 function previewLine(m: BusMessage): string {
-  const body = oneLine(m.body).trim()
-  return `agentbus: into the running turn, from ${oneLine(m.from)}: ${body.length > 100 ? body.slice(0, 100) + '...' : body}`
+  const clean = (v: string | undefined) => oneLine(v).replace(/[\u0000-\u001F\u007F-\u009F]/g, '').trim()
+  const who = m.from === 'slack' && m.slack_user ? `${clean(m.slack_user)} via Slack` : clean(m.from)
+  const body = clean(m.body)
+  return `agentbus: into the running turn, from ${who}: ${body.length > 100 ? body.slice(0, 100) + '...' : body}`
 }
 
 // working tells the proxy a turn handling these messages, delivered to session sid, is still
@@ -822,7 +826,8 @@ function cancelWorking() {
 }
 
 // Starts a fresh "still working" timer, 15s out, for every message the main loop's current turn
-// carries (whatever turnStarted just marked started); nothing if it carries none. A turn that ends
+// carries (whatever turnStarted, or a delivery into the turn, marked started); nothing if it carries
+// none. A turn that ends
 // first cancels it (cancelWorking), so only a turn still running at the deadline posts /working.
 function scheduleWorking($: EngineInterface) {
   cancelWorking()
@@ -908,13 +913,24 @@ export const register: Register = on => {
   // the result. Not a subagent's call, not one another plugin made ($.tool.call), not a refused or
   // abandoned call: the messages then stay held for the next result, or run as prompts after the turn.
   on('tool.call', async ($, e, next) => {
-    if (e.agentId || next.origin.plugin !== 'engine' || midTurn.length === 0) return next(e)
+    if (e.agentId || next.origin.plugin !== 'engine') return next(e)
+    // Whatever arrived while the tool ran counts too, so the check for held messages comes after it.
     const answered = await next(e)
     if (next.signal.aborted || answered.deny !== undefined || midTurn.length === 0) return answered
-    const taken = takeForTurn()
-    for (const m of taken) $.ui.log(previewLine(m))
-    scheduleWorking($)
-    return { ...answered, context: [...(answered.context ?? []), ...taken.map(m => defang(formatMessage(m)))] }
+    const msgs = [...midTurn]
+    const text = msgs.map(m => formatMessage({ ...m, body: defang(m.body) })).join('\n\n')
+    try {
+      const appended = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+      if (appended.deny !== undefined) return answered
+    } catch {
+      return answered
+    }
+    // Delivered: take exactly these (more may have arrived during the append; they wait for the next).
+    midTurn.splice(0, msgs.length)
+    deliveredIntoTurn(msgs)
+    for (const m of msgs) $.ui.log(previewLine(m))
+    if (!workingTimer) scheduleWorking($)
+    return answered
   })
 
   on('session.start', async ($, e, next) => {
