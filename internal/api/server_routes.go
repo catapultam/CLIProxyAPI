@@ -73,6 +73,7 @@ func (s *Server) setupRoutes() {
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.GET("/usage", s.pooledUsageHandler)
+		v1.GET("/auto-mode", s.autoModeHandler)
 		s.agentbus.Register(v1.Group("/agentbus"))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)

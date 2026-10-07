@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/automode"
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
@@ -82,6 +83,10 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		return
 	}
 
+	// Record this session's auto-mode server-review status (if observable)
+	// so a status line can read it back from GET /v1/auto-mode.
+	observeAutoModeFromRequest(c, rawJSON)
+
 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
 
@@ -133,6 +138,41 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
+}
+
+// claudeAFKModeBeta is the anthropic-beta token Claude Code sends while a
+// session is in auto mode (with or without server-side classifier review).
+const claudeAFKModeBeta = "afk-mode-2026-01-31"
+
+// observeAutoModeFromRequest records this request's auto-mode server-review
+// status with the automode tracker, when it is observable: the request
+// identifies a session, is not a subagent request, and carries a non-empty
+// tools array (so title-generation and other side requests are skipped).
+func observeAutoModeFromRequest(c *gin.Context, rawJSON []byte) {
+	sessionID := strings.TrimSpace(c.GetHeader("x-claude-code-session-id"))
+	if sessionID == "" || strings.TrimSpace(c.GetHeader("x-claude-code-agent-id")) != "" {
+		return
+	}
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		return
+	}
+
+	afk := claudeBetaHasAFKMode(c.GetHeader("anthropic-beta"))
+	safeguards := gjson.GetBytes(rawJSON, "safeguards").Exists()
+	automode.Observe(sessionID, afk, safeguards, time.Now())
+}
+
+// claudeBetaHasAFKMode reports whether a comma-separated anthropic-beta
+// header value includes claudeAFKModeBeta, matched case-insensitively with
+// surrounding whitespace trimmed from each token.
+func claudeBetaHasAFKMode(betaHeader string) bool {
+	for _, token := range strings.Split(betaHeader, ",") {
+		if strings.EqualFold(strings.TrimSpace(token), claudeAFKModeBeta) {
+			return true
+		}
+	}
+	return false
 }
 
 // rewriteClaudeDDModelInBody decodes model IDs of the form claude-fable-5-dd-<reversed>
