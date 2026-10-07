@@ -51,24 +51,40 @@ func TestObserveSinceTracksModeChangesOnly(t *testing.T) {
 		t.Fatalf("after first observe: %+v", state)
 	}
 
-	// Mode changes server -> local: Since moves to the change time.
+	// One local observation after server is not yet a fallback.
 	tracker.Observe("sess", true, false, t1)
 	state, _ = tracker.Lookup("sess")
-	if state.Mode != ModeLocal || !state.Since.Equal(t1) {
-		t.Fatalf("after mode change: %+v, want Mode=%s Since=%v", state, ModeLocal, t1)
-	}
-	if !state.Updated.Equal(t1) {
-		t.Fatalf("Updated after mode change = %v, want %v", state.Updated, t1)
+	if state.Mode != ModeServer || !state.Since.Equal(t0) || !state.Updated.Equal(t1) {
+		t.Fatalf("after one local observation: %+v, want Mode=%s Since=%v Updated=%v", state, ModeServer, t0, t1)
 	}
 
-	// Repeated same mode: Since stays at the change time, Updated advances.
+	// The second in a row confirms it: Since is when the run began.
 	tracker.Observe("sess", true, false, t2)
 	state, _ = tracker.Lookup("sess")
-	if state.Mode != ModeLocal || !state.Since.Equal(t1) {
-		t.Fatalf("after repeated mode: %+v, want Mode=%s Since=%v", state, ModeLocal, t1)
+	if state.Mode != ModeLocal || !state.Since.Equal(t1) || !state.Updated.Equal(t2) {
+		t.Fatalf("after confirmed fallback: %+v, want Mode=%s Since=%v Updated=%v", state, ModeLocal, t1, t2)
 	}
-	if !state.Updated.Equal(t2) {
-		t.Fatalf("Updated after repeated mode = %v, want %v", state.Updated, t2)
+
+	// Repeated same mode: Since stays, Updated advances.
+	t3 := t2.Add(time.Minute)
+	tracker.Observe("sess", true, false, t3)
+	state, _ = tracker.Lookup("sess")
+	if state.Mode != ModeLocal || !state.Since.Equal(t1) || !state.Updated.Equal(t3) {
+		t.Fatalf("after repeated mode: %+v, want Mode=%s Since=%v Updated=%v", state, ModeLocal, t1, t3)
+	}
+}
+
+func TestObserveSideRequestDoesNotFlipServer(t *testing.T) {
+	tracker := NewTracker()
+	t0 := time.Unix(1000, 0)
+
+	tracker.Observe("sess", true, true, t0)
+	tracker.Observe("sess", true, false, t0.Add(time.Second)) // side request
+	tracker.Observe("sess", true, true, t0.Add(2*time.Second))
+	tracker.Observe("sess", true, false, t0.Add(3*time.Second)) // another one
+	state, _ := tracker.Lookup("sess")
+	if state.Mode != ModeServer || !state.Since.Equal(t0) {
+		t.Fatalf("interleaved side requests flipped the state: %+v", state)
 	}
 }
 

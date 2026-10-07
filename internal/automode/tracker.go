@@ -36,6 +36,10 @@ type State struct {
 	// Updated is when this session was last observed, regardless of
 	// whether Mode changed.
 	Updated time.Time
+
+	// localSince is when an unconfirmed run of local observations began
+	// while Mode is still ModeServer; zero when there is none.
+	localSince time.Time
 }
 
 // Tracker holds the latest auto-mode State per session. It is safe for
@@ -93,9 +97,24 @@ func (t *Tracker) Observe(sessionID string, afk bool, safeguards bool, now time.
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	existing, seen := t.entries[sessionID]
+	// A side request (a compaction, say) can carry the auto-mode beta and
+	// tools without safeguards while server review is still on. The real
+	// fallback is permanent, so server -> local needs two local observations
+	// in a row; any server observation in between cancels it.
+	if seen && existing.Mode == ModeServer && mode == ModeLocal && existing.localSince.IsZero() {
+		existing.localSince = now
+		existing.Updated = now
+		t.entries[sessionID] = existing
+		t.pruneLocked(now)
+		return
+	}
 	since := now
-	if existing, ok := t.entries[sessionID]; ok && existing.Mode == mode {
+	switch {
+	case seen && existing.Mode == mode:
 		since = existing.Since
+	case seen && mode == ModeLocal && !existing.localSince.IsZero():
+		since = existing.localSince
 	}
 	t.entries[sessionID] = State{Mode: mode, Since: since, Updated: now}
 
