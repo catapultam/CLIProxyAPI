@@ -4,7 +4,7 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.4.0'
+export const VERSION = '0.4.1'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
@@ -58,7 +58,16 @@ export type BusMessage = {
   // with no number. Set only with broadcast.
   broadcast_count?: number
   command?: Command
+  // The files an allowed user's Slack message carried: each relayed image's id for GET /image, and
+  // the files not relayed (no id) with why. Set only with from_user.
+  images?: ImageRef[]
+  // The lines naming the images saved for this message (attachImages). Only this mod sets it; waitOnce
+  // drops any value a message arrives with.
+  attached?: string
 }
+
+// An image a Slack message carried, as the proxy's agentbus.ImageRef marshals it.
+type ImageRef = { id?: string; name?: string; mime?: string; size?: number; error?: string }
 
 let base = ''
 let token = ''
@@ -230,7 +239,14 @@ function slackRules(m: BusMessage): string {
   return `\n${DISCLOSURE_RULE}${dismiss}${done}`
 }
 
+// The framed message, then the lines naming its saved images (outside the quoted body). Only a
+// Slack user's message carries them.
 export function formatMessage(m: BusMessage): string {
+  const framed = frameMessage(m)
+  return m.attached && m.from_user === true && m.guest !== true ? `${framed}\n\n${m.attached}` : framed
+}
+
+function frameMessage(m: BusMessage): string {
   const re = m.reply_to && MESSAGE_ID.test(m.reply_to) ? ` (in reply to ${m.reply_to})` : ''
   const id = oneLine(m.id)
   // Only the proxy's Slack bridge can set guest, from_user and via, or send from "slack"; clients
@@ -552,7 +568,11 @@ async function osKey($: EngineInterface): Promise<string> {
 
 // A fresh path in the temp folder for a command's {out} file.
 async function tempPath($: EngineInterface, os: string, id: string): Promise<string> {
-  const file = `agentbus-${id.replace(/[^A-Za-z0-9_-]/g, '') || 'out'}.png`
+  return tempFile($, os, `agentbus-${id.replace(/[^A-Za-z0-9_-]/g, '') || 'out'}.png`)
+}
+
+// The path of file (a plain name) in this machine's temp folder.
+async function tempFile($: EngineInterface, os: string, file: string): Promise<string> {
   if (os === 'windows') {
     const dir = (await $.env.get('TEMP')) || (await $.env.get('TMP')) || 'C:\\Windows\\Temp'
     return `${dir.replace(/[\\/]+$/, '')}\\${file}`
@@ -580,6 +600,78 @@ async function removeFile($: EngineInterface, os: string, path: string) {
   } catch {
     // Best effort.
   }
+}
+
+// An image id as the proxy makes them (16 random bytes in hex); only such an id goes into a path.
+const IMAGE_ID = /^[0-9a-f]{32}$/
+// How many more times saveImage asks for an image the proxy is still downloading (each ask waits up
+// to 20 s there).
+const IMAGE_RETRIES = 3
+// The file extension for each image type the proxy relays.
+const IMAGE_EXTENSIONS: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }
+
+// Gets one relayed image from the proxy (GET /image, which waits for Slack up to 20 s) and saves it in
+// the temp folder as agentbus-img-<id>.<ext>. The bytes come as base64 text, and the plugin API writes
+// only text (and at most 4 MiB), so the OS decodes them from standard input: PowerShell (by its absolute
+// path, the file path from the environment) on Windows, base64 -d through sh (the path as $1) elsewhere.
+// Resolves the saved path, or rejects with why; a half-written file is removed.
+async function saveImage($: EngineInterface, os: string, img: ImageRef): Promise<string> {
+  const id = img.id ?? ''
+  const ext = Object.hasOwn(IMAGE_EXTENSIONS, img.mime ?? '') ? IMAGE_EXTENSIONS[img.mime ?? ''] : undefined
+  if (!IMAGE_ID.test(id)) throw new Error('invalid image id')
+  if (!ext) throw new Error('unsupported image type')
+  // The proxy waits up to 20 s for Slack; a slow download (504) is asked for again, a few times.
+  let { status, json } = await bus($, 'GET', `/image?session=${encodeURIComponent(session)}&id=${id}`)
+  for (let retry = 0; status === 504 && retry < IMAGE_RETRIES; retry++) {
+    ;({ status, json } = await bus($, 'GET', `/image?session=${encodeURIComponent(session)}&id=${id}`))
+  }
+  if (status !== 200) throw new Error(`HTTP ${status} ${oneLine(String(json?.error ?? ''))}`.trim())
+  const data = typeof json?.base64 === 'string' ? json.base64 : ''
+  const size = Number(json?.size ?? 0)
+  if (!data || !(size > 0)) throw new Error('the proxy sent no image')
+  const path = await tempFile($, os, `agentbus-img-${id}.${ext}`)
+  try {
+    const run =
+      os === 'windows'
+        ? await $.process.run(
+            [WINDOWS_POWERSHELL, '-NoProfile', '-NonInteractive', '-Command', '[IO.File]::WriteAllBytes($env:AGENTBUS_OUT, [Convert]::FromBase64String([Console]::In.ReadToEnd()))'],
+            { env: { AGENTBUS_OUT: path }, stdin: data },
+          )
+        : await $.process.run(['sh', '-c', 'base64 -d > "$1"', 'sh', path], { stdin: data })
+    if (run.exitCode !== 0) throw new Error(`decoding failed (exit ${run.exitCode})`)
+    const stat = await $.fs.stat(path)
+    if (stat.kind !== 'file' || stat.size !== size) throw new Error('decoding failed (wrong size)')
+    return path
+  } catch (err) {
+    await removeFile($, os, path)
+    throw err
+  }
+}
+
+// Saves the images a Slack user's message carried and returns the lines that name them for the model,
+// or '' when it carried none. A failed image is named with why; it never holds up or drops the message.
+export async function attachImages($: EngineInterface, images: readonly ImageRef[]): Promise<string> {
+  const refs = images.filter(img => img && typeof img === 'object').slice(0, 10)
+  if (refs.length === 0) return ''
+  const name = (img: ImageRef) => defang(oneLine(img.name)).trim() || 'image'
+  const os = refs.some(img => img.id) ? await osKey($) : ''
+  const results = await Promise.all(
+    refs.map(async img => {
+      if (!img.id) return { img, error: `not relayed: ${oneLine(img.error) || 'unknown reason'}` }
+      try {
+        return { img, path: await saveImage($, os, img) }
+      } catch (err) {
+        return { img, error: errorText(err) }
+      }
+    }),
+  )
+  const saved = results.filter(r => r.path).map(r => `${r.path} (${name(r.img)}, ${oneLine(r.img.mime)})`)
+  const lines = saved.length > 0 ? [`Attached images (open each with the Read tool): ${saved.join(', ')}`] : []
+  for (const r of results) {
+    if (r.path) continue
+    lines.push(r.img.id ? `Attached image ${name(r.img)} could not be fetched: ${r.error}` : `Attached file ${name(r.img)} was ${r.error}`)
+  }
+  return lines.join('\n')
 }
 
 async function uploadImage($: EngineInterface, from: string, m: BusMessage, cmd: Command, path: string): Promise<Outcome> {
@@ -890,12 +982,21 @@ async function waitOnce($: EngineInterface) {
   const { status, json } = await bus($, 'GET', `/wait${query}`)
   if (status === 200) {
     for (const m of ((json?.messages as BusMessage[]) ?? [])) {
+      // Only attachImages sets attached, below.
+      delete m.attached
       if (m.command) {
         // Only the proxy's Slack bridge sets command, always with from_user, for an owner, never on
         // a guest's message. Any other command message is dropped: never run, and never shown to
         // the model as text.
         if (m.from_user === true && m.guest !== true) void runCommand($, m, m.command)
         continue
+      }
+      if (m.from_user === true && m.guest !== true && Array.isArray(m.images) && m.images.length > 0) {
+        try {
+          m.attached = await attachImages($, m.images)
+        } catch {
+          // Never holds up the message.
+        }
       }
       if (inTurn) holdForTurn($, m)
       else void submitMessage($, m)

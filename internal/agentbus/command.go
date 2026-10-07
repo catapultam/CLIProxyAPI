@@ -165,6 +165,9 @@ func (s *Store) ClaimForWait(id string, mod bool, waiterVersion string) []Messag
 	}
 	msgs := s.claimForWait(id, waiterVersion)
 	s.received(id, msgs, versionAtLeast(strings.TrimSpace(waiterVersion), MinAckModVersion))
+	if !versionAtLeast(strings.TrimSpace(waiterVersion), MinImageModVersion) {
+		noteImagesForOldWaiter(msgs)
+	}
 	return msgs
 }
 

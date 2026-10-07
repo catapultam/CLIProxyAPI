@@ -151,6 +151,10 @@ type Bridge struct {
 	// and Stop waits for them.
 	viewSlots chan struct{}
 	viewsWG   sync.WaitGroup
+	// downloadSlots bounds the image downloads in flight; downloadsWG
+	// tracks them, and Stop waits for them (see fetchImages).
+	downloadSlots chan struct{}
+	downloadsWG   sync.WaitGroup
 	// runCtx is the context of the running bridge (Start), for work started
 	// outside the job queue.
 	runCtx context.Context
@@ -174,24 +178,25 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 		log.Warnf("slack: load state (starting empty): %v", errLoad)
 	}
 	b := &Bridge{
-		cfg:         cfg,
-		home:        home,
-		bus:         bus,
-		api:         newAPI(cfg.APIBase),
-		dialer:      websocket.DefaultDialer,
-		state:       st,
-		cmdRegistry: newRegistry(cfg.CommandsDir),
-		jobs:        make(chan job, jobQueueSize),
-		commands:    make(chan job, commandQueueSize),
-		backoff:     defaultBackoff,
-		retryDelay:  2 * time.Second,
-		seen:        map[string]bool{},
-		cmdSeq:      map[string]uint64{},
-		opening:     map[string]*openGate{},
-		dmChannels:  map[string]string{},
-		guestNames:  map[string]string{},
-		guestQueued: map[string]int{},
-		viewSlots:   make(chan struct{}, maxViewOpens),
+		cfg:           cfg,
+		home:          home,
+		bus:           bus,
+		api:           newAPI(cfg.APIBase),
+		dialer:        websocket.DefaultDialer,
+		state:         st,
+		cmdRegistry:   newRegistry(cfg.CommandsDir),
+		jobs:          make(chan job, jobQueueSize),
+		commands:      make(chan job, commandQueueSize),
+		backoff:       defaultBackoff,
+		retryDelay:    2 * time.Second,
+		seen:          map[string]bool{},
+		cmdSeq:        map[string]uint64{},
+		opening:       map[string]*openGate{},
+		dmChannels:    map[string]string{},
+		guestNames:    map[string]string{},
+		guestQueued:   map[string]int{},
+		viewSlots:     make(chan struct{}, maxViewOpens),
+		downloadSlots: make(chan struct{}, maxDownloads),
 	}
 	b.refreshLinks()
 	return b, nil
@@ -847,6 +852,7 @@ func (b *Bridge) Stop() {
 		<-b.done
 		b.jobsWG.Wait()
 		b.viewsWG.Wait()
+		b.downloadsWG.Wait()
 		b.bus.SetBridge(nil)
 		b.cancel = nil
 	}

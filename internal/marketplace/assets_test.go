@@ -69,8 +69,8 @@ func TestAgentbusZipFilesReadBack(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"name": "agentbus"`)) {
 		t.Fatalf("plugin.json content unexpected: %s", data)
 	}
-	if asset.Version != "0.4.0" {
-		t.Fatalf("version = %q, want 0.4.0", asset.Version)
+	if asset.Version != "0.4.1" {
+		t.Fatalf("version = %q, want 0.4.1", asset.Version)
 	}
 	// The mod reports its own version to the proxy, which gates commands on
 	// it, so the constant in register.ts must match plugin.json.

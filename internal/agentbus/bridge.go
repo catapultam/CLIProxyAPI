@@ -233,6 +233,21 @@ func (s *Store) DeliverVia(target, body, slackUser, via string) (sessionID, msgI
 	})
 }
 
+// DeliverViaImages is DeliverVia for a message that carries files: the
+// message gets an ImageRef for each (Images), and each relayable image a
+// pending entry for session sessionID that GET /image serves once the
+// bridge calls FinishImage or FailImage with its ref's ID. body may be
+// empty when images isn't. Only the Slack bridge calls it, and it is the
+// only way a message gets Images.
+func (s *Store) DeliverViaImages(target, body, slackUser, via string, images []PendingImage) (sessionID, msgID string, refs []ImageRef, err error) {
+	sessionID, msgID, err = s.deliverFromSlackImages(target, body, via, images, func(m *Message) {
+		m.FromUser = true
+		m.SlackUser = slackUser
+		refs = m.Images
+	})
+	return sessionID, msgID, refs, err
+}
+
 // DeliverBroadcast is DeliverVia for an owner's broadcast to all agents
 // ("all: message"): the message is marked Broadcast, to lists the
 // broadcast's other recipients by bus address (BroadcastTo), and total is
@@ -307,10 +322,16 @@ func (s *Store) DeliverNotice(target, body string) (sessionID, msgID string, err
 // deliverFromSlack queues a message from SlackAddress for target (id, name
 // or address), with fill marking who it is from.
 func (s *Store) deliverFromSlack(target, body, via string, fill func(*Message)) (string, string, error) {
+	return s.deliverFromSlackImages(target, body, via, nil, fill)
+}
+
+// deliverFromSlackImages is deliverFromSlack with the files the message
+// carries (see DeliverViaImages); fill runs after Images is set.
+func (s *Store) deliverFromSlackImages(target, body, via string, images []PendingImage, fill func(*Message)) (string, string, error) {
 	if !validVia(via) {
 		return "", "", ErrInvalidVia
 	}
-	if strings.TrimSpace(body) == "" {
+	if strings.TrimSpace(body) == "" && len(images) == 0 {
 		return "", "", ErrEmptyBody
 	}
 	if len(body) > MaxBodyBytes {
@@ -323,6 +344,9 @@ func (s *Store) deliverFromSlack(target, body, via string, fill func(*Message)) 
 		return "", "", err
 	}
 	msg := Message{ID: newMessageID(), From: SlackAddress, To: s.addressLocked(sess), Body: body, Via: via, CreatedAt: s.now()}
+	// Registered before the message is queued, so a mod never gets a ref
+	// /image doesn't know yet.
+	msg.Images = s.registerImagesLocked(id, images)
 	fill(&msg)
 	s.enqueueLocked(sess, msg)
 	return id, msg.ID, nil

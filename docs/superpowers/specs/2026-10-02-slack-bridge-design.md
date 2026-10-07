@@ -81,6 +81,7 @@ oauth_config:
       - chat:write
       - commands
       - files:write
+      - files:read
       - channels:history
       - groups:history
       - im:history
@@ -1128,3 +1129,74 @@ the authoritative instruction. The instruction is omitted entirely for a
 sole recipient (`BroadcastTo` empty) — nobody to coordinate with. **Mod
 0.3.10.** `register.ts`'s `VERSION` and `.claude-plugin/plugin.json` both
 move to 0.3.10.
+
+### Images from Slack (mod 0.4.1)
+
+An allowed user can attach images to a message to an agent (a `file_share`
+message: drag an annotated screenshot into the DM, the channel or a
+thread). Before, only the text reached the session.
+
+- **Slack scope.** The bot downloads each file from its
+  `url_private_download` link with the bot token. This needs the
+  `files:read` scope; an app installed before it was added must be
+  reinstalled to grant it. Without it Slack answers 403 or its HTML login
+  page, and the agent sees "Slack refused the download: the Slack app needs
+  the files:read scope". The token goes only to `https://slack.com` or a
+  subdomain, or to the configured API base's own scheme and host (tests);
+  a redirect elsewhere is not followed. Go drops the token on a redirect to
+  another host, so Slack then refuses, and the error names the scope.
+- **What is relayed.** PNG, JPEG, GIF and WebP, at most 10 MiB each and 4
+  per message. Only an allowed user's message gets images, through
+  `deliver` (`DeliverViaImages`); guests, broadcasts, commands and
+  approvals do not, in this change. A message with files and no text is
+  delivered where a plain message would route without a name (a DM with a
+  last agent or a link, a thread, a linked conversation); a top-level
+  channel post without `name:` still gets the help reply. A message with
+  only non-image files is now delivered too (before, an empty body was
+  refused), with only the "not relayed" lines.
+- **Bus message.** `Message.Images` (`images`, set only by
+  `DeliverViaImages`, never through `/send`) lists one `ImageRef` per file
+  (at most 10): `{id, name, mime, size}` for a relayed image (`id` is 16
+  random bytes in hex), or `{name, size, error}` for a file not relayed and
+  why (type, size, count, no link). The refs are saved with the message in
+  the state file, but the images are not: after a proxy restart, a queued
+  message's refs get 404.
+- **Image store.** Memory only, never in the state file. `handleEvent`
+  only registers a pending entry per image (no network); a background
+  goroutine (`fetchImages`, at most 2 downloads at once, waited for by
+  `Stop`) downloads it, checks the response is `image/*` (or a generic
+  octet-stream) and at most 10 MiB, and hands it to `FinishImage`, which also checks that the bytes
+  sniff as the declared type. Images expire after 1 hour; all images
+  together are capped at 64 MiB, the oldest dropped first. An expired or
+  dropped image answers 410 until its record goes, 24 hours after it came.
+- **Route.** `GET /v1/agentbus/image?session=<sid>&id=<image id>`, with the
+  other agentbus routes (same auth). 200 `{name, mime, size, base64}` only
+  when the image was sent to `sid`, or to a session `sid` took over
+  (`HandOff`, as for its inbox); another session gets the same 404 as an
+  unknown id (no `session` is a 400). It waits up to 20 s for a download in progress (then 504),
+  answers 410 for an expired image, and 502 `{error}` when the download
+  failed.
+- **Mod.** Before it submits or holds a Slack user's message, `waitOnce`
+  gets each image (`saveImage`; on a 504 it asks again, up to 3 more
+  times), and saves it in the temp folder as
+  `agentbus-img-<id>.<ext>` (extension from the type). The id must be 32
+  hex characters before it goes into a URL or a path. The plugin API
+  writes only text and at most 4 MiB, so the OS decodes the base64 from
+  standard input: Windows PowerShell (by its absolute path, the file path
+  in `AGENTBUS_OUT`), else `sh -c 'base64 -d > "$1"' sh <path>`. A decoded
+  file of the wrong size is removed. After the framed message (outside the
+  quoted body) come the lines `Attached images (open each with the Read
+  tool): <path> (<name>, <mime>), ...`, `Attached image <name> could not be
+  fetched: <error>` and `Attached file <name> was not relayed: <why>`. A
+  failed image never holds up or drops the message. The saved files stay in
+  the temp folder, so the agent can read them later in the session.
+- **Older mods.** A `/wait` from a mod older than 0.4.1 (or a waiter
+  without a version) gets a line added to the body instead: "[N attached
+  file(s) that this agentbus plugin can't show; update it to 0.4.1 or
+  later.]" (`MinImageModVersion`).
+- **Without the mod.** When the proxy injects the message into a request
+  instead, the injected text names the images and how to get one with curl
+  from `/image`.
+
+**Mod 0.4.1.** `register.ts`'s `VERSION` and `.claude-plugin/plugin.json`
+both move to 0.4.1.

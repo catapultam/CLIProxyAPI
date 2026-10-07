@@ -62,6 +62,61 @@ type fakeSlack struct {
 	// is channel_not_found. memberPage > 0 pages the answer.
 	members    map[string][]string
 	memberPage int
+	// files answers GET /files/<name> (a url_private_download link);
+	// fileGets records each such request.
+	files    map[string]fakeFile
+	fileGets []fakeFileGet
+}
+
+// fakeFile is what GET /files/<name> answers: status ("" is 200), content
+// type and body.
+type fakeFile struct {
+	Status      int
+	ContentType string
+	Location    string
+	Body        []byte
+}
+
+// fakeFileGet is one GET of a shared file.
+type fakeFileGet struct{ Path, Auth string }
+
+// setFile makes GET /files/<name> answer file, and returns its link.
+func (f *fakeSlack) setFile(name string, file fakeFile) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.files == nil {
+		f.files = map[string]fakeFile{}
+	}
+	f.files[name] = file
+	return f.URL + "/files/" + name
+}
+
+func (f *fakeSlack) recordedFileGets() []fakeFileGet {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeFileGet(nil), f.fileGets...)
+}
+
+func (f *fakeSlack) handleFile(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/files/")
+	f.mu.Lock()
+	f.fileGets = append(f.fileGets, fakeFileGet{Path: r.URL.Path, Auth: r.Header.Get("Authorization")})
+	file, ok := f.files[name]
+	f.mu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if file.ContentType != "" {
+		w.Header().Set("Content-Type", file.ContentType)
+	}
+	if file.Location != "" {
+		w.Header().Set("Location", file.Location)
+	}
+	if file.Status != 0 {
+		w.WriteHeader(file.Status)
+	}
+	_, _ = w.Write(file.Body)
 }
 
 type reactionKey struct{ channel, ts, name string }
@@ -135,6 +190,7 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 	mux.HandleFunc("/api/", f.handleAPI)
 	mux.HandleFunc("/socket", f.handleSocket)
 	mux.HandleFunc("/upload/", f.handleUpload)
+	mux.HandleFunc("/files/", f.handleFile)
 	f.srv = httptest.NewServer(mux)
 	f.URL = f.srv.URL
 	t.Cleanup(f.srv.Close)
