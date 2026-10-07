@@ -467,9 +467,9 @@ func shouldLogRequest(path string) bool {
 	if strings.HasPrefix(path, "/plugins/") {
 		return false
 	}
-	// Agentbus image uploads carry up to 10 MiB of image bytes, which must
-	// never reach a log (catapultam fork).
-	if path == "/v1/agentbus/slack/upload" {
+	// Agentbus image uploads and downloads carry up to 10 MiB of image bytes
+	// (about 13 MiB as base64), which must never reach a log (catapultam fork).
+	if path == "/v1/agentbus/slack/upload" || path == "/v1/agentbus/image" {
 		return false
 	}
 

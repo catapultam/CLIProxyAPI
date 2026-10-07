@@ -55,10 +55,22 @@ type messageEvent struct {
 	// message it was added to.
 	Reaction string       `json:"reaction"`
 	Item     reactionItem `json:"item"`
+	// Files are the files shared with the message (subtype file_share).
+	Files []slackFile `json:"files"`
 	// via, when set, is where the bridge says the message came from instead
 	// of viaOf's reading of the conversation: the "Ask an agent" shortcut or
 	// /clanker. It never comes from Slack's JSON.
 	via string
+}
+
+// slackFile is a file shared with a message, as Slack's event gives it.
+type slackFile struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Mimetype string `json:"mimetype"`
+	Size     int64  `json:"size"`
+	// URLPrivateDownload needs the bot token and the files:read scope.
+	URLPrivateDownload string `json:"url_private_download"`
 }
 
 // reactionItem is what a reaction was added to.
@@ -612,7 +624,17 @@ func (b *Bridge) viaOf(ev messageEvent) string {
 // answer there; adopt is true for a top-level post. It returns the session
 // it delivered to and whether it did.
 func (b *Bridge) deliver(ev messageEvent, target, body string, user allowedUser, notFound string, adopt bool) (string, bool) {
-	sid, msgID, err := b.bus.DeliverVia(target, body, user.Label, b.viaOf(ev))
+	var sid, msgID string
+	var err error
+	if len(ev.Files) == 0 {
+		sid, msgID, err = b.bus.DeliverVia(target, body, user.Label, b.viaOf(ev))
+	} else {
+		var refs []agentbus.ImageRef
+		sid, msgID, refs, err = b.bus.DeliverViaImages(target, body, user.Label, b.viaOf(ev), pendingImages(ev.Files))
+		if err == nil {
+			b.fetchImages(refs, ev.Files)
+		}
+	}
 	switch {
 	case err == nil:
 		b.recordDelivery(ev, msgID, sid, adopt, reactionQueued, "")

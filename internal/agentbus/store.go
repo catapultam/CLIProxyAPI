@@ -135,6 +135,11 @@ type Message struct {
 	// Only DeliverCommand sets it; clients can never send it, and such a
 	// message leaves the store only through /wait, never by injection.
 	Command *Command `json:"command,omitempty"`
+	// Images lists the files an allowed Slack user's message carried: each
+	// relayed image's id for GET /image, and the files not relayed with why.
+	// Only DeliverViaImages sets it, always with FromUser; clients can never
+	// send it.
+	Images []ImageRef `json:"images,omitempty"`
 }
 
 // Command is a remote command for the session's agentbus mod. Kind picks the
@@ -226,6 +231,11 @@ type Store struct {
 	// notices are command notices queued under mu (by expireLocked) for
 	// postNotices to hand to the bridge once mu is released.
 	notices []commandNotice
+	// images holds the images relayed from Slack (memory only).
+	images imageStore
+	// imageWait bounds how long /image waits for a download
+	// (defaultImageWait when zero).
+	imageWait time.Duration
 }
 
 // NewStore returns an empty store persisted at path (empty disables saving).
@@ -932,7 +942,8 @@ func (s *Store) Load() error {
 // id, a broadcast mark on anything but a Slack user's message, BroadcastTo
 // and BroadcastCount on anything that isn't marked Broadcast (trimming
 // BroadcastTo to MaxBroadcastTo and clamping a negative BroadcastCount to
-// zero either way) and, on a message from a session, a sender name
+// zero either way), Images on anything but a Slack user's message (trimming
+// it to maxImageRefs either way) and, on a message from a session, a sender name
 // validName rejects (keeping the sender's address). It reports whether it
 // changed m.
 func cleanLoadedMessage(m *Message) bool {
@@ -969,6 +980,14 @@ func cleanLoadedMessage(m *Message) bool {
 	}
 	if m.BroadcastCount < 0 {
 		m.BroadcastCount = 0
+		changed = true
+	}
+	if len(m.Images) > 0 && (!m.FromUser || m.Guest) {
+		m.Images = nil
+		changed = true
+	}
+	if len(m.Images) > maxImageRefs {
+		m.Images = m.Images[:maxImageRefs]
 		changed = true
 	}
 	if m.FromUser || m.Guest {

@@ -285,6 +285,9 @@ func noteText(sid, self, name, base string, mod bool, peers []string, note bool,
 			head += " (in reply to " + inline(m.ReplyTo) + ")"
 		}
 		b.WriteString(head + ":\n" + quoteBody(m.Body) + "\n")
+		if line := injectedImages(sid, auth, m); line != "" {
+			b.WriteString(line + "\n")
+		}
 		// The coordination instruction rides on every delivery of a
 		// broadcast message (not just the one-time note above, which an
 		// already-noted session never gets resent).
@@ -361,6 +364,33 @@ func broadcastCoordination(m Message) string {
 	}
 	return "This is a broadcast: the other recipients got the same message. If it needs a single answer or a split of work, coordinate with them over the agentbus first (SendMessage to " +
 		strings.Join(targets, ", ") + ") and agree who replies on what. Reply to Slack only for your part, and don't duplicate another agent's answer. If it doesn't concern you, send `ignore`."
+}
+
+// injectedImages is the line that lists the images an allowed Slack user's
+// message carried (Message.Images), with how to get one from Bash, or empty.
+// The agentbus mod gets them itself when the message comes through /wait;
+// an injected message only names them. sid and auth are as noteText has
+// them (sid already through inline).
+func injectedImages(sid, auth string, m Message) string {
+	if !m.FromUser || m.Guest || len(m.Images) == 0 {
+		return ""
+	}
+	var got, skipped []string
+	for _, img := range m.Images {
+		if img.ID == "" || !validImageID.MatchString(img.ID) {
+			skipped = append(skipped, fmt.Sprintf("%s (%s)", inline(img.Name), inline(img.Error)))
+			continue
+		}
+		got = append(got, fmt.Sprintf("%s (%s, id %s)", inline(img.Name), inline(img.Mime), img.ID))
+	}
+	var parts []string
+	if len(got) > 0 {
+		parts = append(parts, fmt.Sprintf("Attached images: %s. To see one (for 1 hour), save it to a file and open that file with the Read tool; from Bash: curl -fsS -o <file> %s \"$ANTHROPIC_BASE_URL/v1/agentbus/image?session=%s&id=<id>&raw=1\" (choose <file> in a folder the Read tool can open, ending in the image type's extension).", strings.Join(got, "; "), auth, sid))
+	}
+	if len(skipped) > 0 {
+		parts = append(parts, "Files not relayed: "+strings.Join(skipped, "; ")+".")
+	}
+	return strings.Join(parts, " ")
 }
 
 // messageHead is the unquoted header line of an injected message, without

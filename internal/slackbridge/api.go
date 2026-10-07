@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -25,6 +26,19 @@ const (
 	// requests, not proxied upstream traffic (see the AGENTS.md exception).
 	apiCallTimeout = 30 * time.Second
 	maxAPIBody     = 4 << 20
+	// downloadTimeout bounds one file download from Slack (up to 10 MiB),
+	// control-plane traffic like the Web API calls.
+	downloadTimeout      = 60 * time.Second
+	maxDownloadRedirects = 3
+)
+
+var (
+	// errFilesScope is a download Slack refused, or answered with its login
+	// page: the bot token lacks the files:read scope.
+	errFilesScope = errors.New("Slack refused the download: the Slack app needs the files:read scope")
+	// errDownloadHost is a download link that isn't Slack's: the bot token
+	// is never sent there.
+	errDownloadHost = errors.New("the download link is not a Slack link")
 )
 
 // apiError is a Slack Web API "ok": false response.
@@ -38,13 +52,16 @@ type api struct {
 	// upload sends raw bytes to pre-signed upload URLs. It doesn't follow
 	// redirects, so a redirect's Location can't leak into an error.
 	upload *http.Client
+	// download gets files people shared (downloadFile). It follows a
+	// redirect only to a host downloadAllowed accepts.
+	download *http.Client
 }
 
 func newAPI(base string) *api {
 	if base == "" {
 		base = defaultAPIBase
 	}
-	return &api{
+	a := &api{
 		base: base,
 		hc:   &http.Client{Timeout: apiCallTimeout},
 		upload: &http.Client{
@@ -52,6 +69,16 @@ func newAPI(base string) *api {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
+	a.download = &http.Client{
+		Timeout: downloadTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxDownloadRedirects || !a.downloadAllowed(req.URL) {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+	return a
 }
 
 // call POSTs form params to a Web API method. A 429 is retried once after
@@ -294,6 +321,78 @@ func (a *api) completeUpload(ctx context.Context, token, fileID, title, channel,
 	}
 	_, err := a.call(ctx, token, "files.completeUploadExternal", params)
 	return err
+}
+
+// downloadAllowed reports whether u is a link the bot token may go to:
+// https on slack.com or a subdomain (files.slack.com serves shared files),
+// or the API base's own scheme and host (tests).
+func (a *api) downloadAllowed(u *url.URL) bool {
+	if u == nil || u.User != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if u.Scheme == "https" && (host == "slack.com" || strings.HasSuffix(host, ".slack.com")) {
+		return true
+	}
+	base, errBase := url.Parse(a.base)
+	return errBase == nil && base.Host != "" && u.Scheme == base.Scheme && strings.EqualFold(u.Host, base.Host)
+}
+
+// downloadFile gets a file people shared in Slack from its
+// url_private_download link, with the bot token, and returns at most
+// maxBytes of it. Only an image is accepted (a Content-Type of image/*, or
+// a generic octet-stream, since a forced download may come as one; the Store
+// sniffs the bytes against the declared type):
+// Slack answers 401/403, or 200 with its HTML login page, when the token
+// lacks the files:read scope (errFilesScope). Neither the link nor the
+// token ever goes into an error, which the agent sees.
+func (a *api) downloadFile(ctx context.Context, token, rawURL string, maxBytes int) ([]byte, error) {
+	u, errParse := url.Parse(rawURL)
+	if errParse != nil || !a.downloadAllowed(u) {
+		return nil, errDownloadHost
+	}
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if errReq != nil {
+		return nil, errDownloadHost
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, errDo := a.download.Do(req)
+	if errDo != nil {
+		// *url.Error quotes the URL; keep only what went wrong.
+		var urlErr *url.Error
+		if errors.As(errDo, &urlErr) {
+			errDo = urlErr.Err
+		}
+		return nil, fmt.Errorf("the download from Slack failed: %w", errDo)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debugf("slack file download: close body: %v", errClose)
+		}
+	}()
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return nil, errFilesScope
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, errors.New("Slack has no such file (it may have been deleted)")
+	case resp.StatusCode != http.StatusOK:
+		return nil, fmt.Errorf("the download from Slack failed: HTTP %d", resp.StatusCode)
+	}
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	switch {
+	case mediaType == "text/html":
+		return nil, errFilesScope
+	case !strings.HasPrefix(mediaType, "image/") && mediaType != "application/octet-stream" && mediaType != "binary/octet-stream":
+		return nil, errors.New("Slack did not send an image")
+	}
+	data, errRead := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)+1))
+	if errRead != nil {
+		return nil, errors.New("the download from Slack failed while reading")
+	}
+	if len(data) > maxBytes {
+		return nil, errors.New("the image is larger than 10 MiB")
+	}
+	return data, nil
 }
 
 func (a *api) openConnection(ctx context.Context, token string) (string, error) {

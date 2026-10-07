@@ -213,3 +213,55 @@ a few minutes, then exits 0.
 
 Broadcast and group messages, attachments, message history and search, an MCP
 server, a UI page in the Management Center.
+
+## Addendum 2026-10-06: mid-turn delivery (mod 0.4.0; images in 0.4.1)
+
+Problem: several Slack messages sent quickly reached a busy session one turn at a time, so it answered
+stale messages while newer ones waited. Cause: the mod long-polls `/wait` all the time, and `/wait`
+claims a session's messages at once, busy or not. The mod passed each one to `$.prompt.submit`, and a
+plugin's prompt runs only once the session is idle. The proxy's request injection rarely got a message
+first, because the open long-poll is woken at once. So every session with the mod had it, proxied or
+not.
+
+Fix, in the mod only (no proxy change for this part):
+- `turn.start` / `turn.complete` (main loop) mark a running turn.
+- During a turn, a message `/wait` hands over is held, not submitted.
+- The mod's outermost `tool.call` hook appends the held messages as ONE user row,
+  `$.session.append({ message: { type: 'user', content: [text] } })`, after the next main-loop tool
+  result the model asked for. The engine stores it with `isMeta`, door `note`, origin the plugin, and the
+  running turn's next request carries it. Never after a subagent's call, a call another plugin made
+  (`next.origin.plugin` is not `engine`), a refused call (`deny`) or an abandoned one
+  (`next.signal.aborted`): the messages then stay held.
+- The messages are taken from the held list before the append is awaited, so parallel tool results
+  (concurrency-safe tools run at once) can't deliver them twice; a refused or failed append puts them
+  back at the front (the 100-message cap is applied again after that).
+- A turn that ended while appends were in flight (`turn.start` counter changed, or no turn running): no
+  turn will read those rows, stored or not, so `turn.complete` runs every in-flight batch as prompts,
+  oldest first, before the held messages that came later (a stored row may repeat them). The hooks then
+  find their batches empty. A node model of these interleavings (two or three appends at once, one
+  refused, the next turn already started) is `sims/2026-10-06-agentbus-midturn-batches.mjs`
+  (`node <file>`; it asserts its results). Not ordered: an older batch whose append is refused while a
+  newer batch is still in flight goes back to the held list, so a turn that ends then runs the newer
+  batch first (nothing is lost or repeated).
+- Not unit-tested: the plugin test world has no `session.append` backend (a plugin's append rejects
+  there), so the tests cover only the refused path. The stored-row path was checked by reading and in a
+  live engine.
+- Why not the tool result's `context`: tested live (Claude Code 2.1.288, `claude -p`), the model read a
+  message there as a possible prompt injection ("didn't come from you") and ignored it. The user row was
+  acted on, also with three parallel Read calls (no API error, every row read).
+- The text is the framed text a prompt gets; tag-like text in the BODY is escaped (`<` before a tag
+  name or `/`, invisible characters included, becomes `&lt;`). The mod's own framing is not changed.
+- The person at the terminal does not see the row as a prompt. The terminal gets one log line per
+  message: who sent it (the Slack user for a Slack message) and the first 100 characters.
+- A turn that ends before another tool result: the held messages run as prompts after it, as before.
+- A turn that does not end with an answer (interrupted with Esc, refused, API error): the messages
+  delivered into it run again as prompts after it (a possible repeat beats a lost message), and that
+  turn does not acknowledge them; their own prompt's turn does.
+- More than 100 held messages: the oldest runs as a prompt after the turn; none is dropped.
+- Read receipts: a message delivered into a turn is acknowledged when that turn completes with an answer;
+  the ⏳ timer starts when messages are delivered and none runs. Commands are unchanged.
+- Messages from `/wait` are delivered through an ordered promise chain, so fetching a message's images
+  (0.4.1) never stops the long-poll (its lease would lapse and the session read as offline). Commands go
+  through the same chain, so a command never overtakes an earlier message that is still fetching its
+  images. Neither a submit nor a command is awaited in the chain, so one that never settles can't hold
+  up later messages; an unexpected error is logged to the terminal.
