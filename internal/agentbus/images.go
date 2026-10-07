@@ -286,7 +286,8 @@ func (s *Store) mayReadImageLocked(owner, sid string) bool {
 
 // handleImage hands session ?session= the image ?id= that a Slack message
 // to it (or to a session it took over) carried, as JSON with the bytes in
-// base64. Any other session gets the same 404 as an unknown id. It waits up
+// base64, or with &raw=1 as the bytes themselves (Content-Type the checked
+// image type, nosniff). Any other session gets the same 404 as an unknown id. It waits up
 // to 20 s for a download in progress (then 504), answers 410 once the image
 // expired and 502 with the reason when the download failed.
 func (s *Store) handleImage(c *gin.Context) {
@@ -341,6 +342,7 @@ func (s *Store) handleImage(c *gin.Context) {
 		// The bytes themselves, so a session without the mod can save one with a plain
 		// `curl -fsS -o <file>` (no jq or base64 tool needed, e.g. Git for Windows' bash).
 		c.Header("Content-Disposition", "attachment")
+		c.Header("X-Content-Type-Options", "nosniff")
 		c.Data(http.StatusOK, e.mime, data)
 	default:
 		c.JSON(http.StatusOK, gin.H{"name": e.name, "mime": e.mime, "size": len(data), "base64": base64.StdEncoding.EncodeToString(data)})

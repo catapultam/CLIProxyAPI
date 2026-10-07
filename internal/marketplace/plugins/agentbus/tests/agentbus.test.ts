@@ -1777,3 +1777,35 @@ test('two tool results at once with refused appends run each held message once, 
   expect(prompts.filter(p => p.includes('and merge')).length).toBe(1)
   expect(prompts.findIndex(p => p.includes('please rebase'))).toBeLessThan(prompts.findIndex(p => p.includes('and merge')))
 })
+
+test('a command after a message still fetching its images runs after that message', async ($, on) => {
+  const routes = { [`&id=${IMG1}`]: { status: 504, text: '{"error":"still"}' } }
+  const cmd = commandMessage('m_c9', { name: 'go', kind: 'prompt', text: 'CMDTEXT' } as never)
+  const { prompts } = await imagePrompts($, on, [{ ...IMAGE_MSG, images: [IMAGE_MSG.images[0]] }, cmd], { routes })
+  expect(prompts.map(p => (p.includes('CMDTEXT') ? 'cmd' : 'msg'))).toEqual(['msg', 'cmd'])
+})
+
+test('a submit that never settles does not hold up the next message', async ($, on) => {
+  const clock = mock.clock(on)
+  wire($, on, [{ status: 200, text: JSON.stringify({ messages: [SLACK_MSG, { ...SLACK_MSG, id: 'm_a2', body: 'and merge' }] }) }])
+  const seen: string[] = []
+  on('prompt.submit', (_$, e) => {
+    seen.push(e.text)
+    if (seen.length === 1) return new Promise(() => {}) as never
+    return { text: e.text }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  await clock.advance(1000)
+  await clock.settle()
+  expect(seen.length).toBe(2)
+})
+
+test('past the held-message cap none is lost and the order holds', async ($, on) => {
+  const many = Array.from({ length: 101 }, (_, i) => ({ ...SLACK_MSG, id: `m_b${(i + 16).toString(16)}`, body: `msg ${i}` }))
+  const { t, prompts, clock } = await midTurn($, on, many)
+  await $.tool.call(call('Bash'))
+  await t.complete('t1')
+  await clock.settle()
+  expect(prompts.length).toBe(101)
+  expect(prompts.map(p => Number(/msg (\d+)/.exec(p)?.[1]))).toEqual(Array.from({ length: 101 }, (_, i) => i))
+})

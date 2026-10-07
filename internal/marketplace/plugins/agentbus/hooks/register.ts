@@ -849,6 +849,9 @@ let inTurn = false
 // can tell.
 let turnSeq = 0
 const midTurn: BusMessage[] = []
+// The batch a tool.call hook is appending right now, if any. A turn that ends meanwhile runs it as prompts
+// before the held messages (which came later), and empties it, so the hook leaves it alone afterwards.
+let appending: BusMessage[] | undefined
 // The messages delivered into the running turn. A turn that does not end with an answer (interrupted,
 // refused, or an API error) may never have acted on them, so they run again as prompts after it.
 let deliveredThisTurn: BusMessage[] = []
@@ -1017,7 +1020,13 @@ async function waitOnce($: EngineInterface) {
         }
         continue
       }
-      deliveryChain = deliveryChain.then(() => deliverWaited($, m)).catch(err => $.ui.log(`agentbus: a message could not be delivered: ${oneLine(String(err)).slice(0, 200)}`))
+      deliveryChain = deliveryChain.then(() => deliverWaited($, m)).catch(err => {
+        try {
+          $.ui.log(`agentbus: a message could not be delivered: ${oneLine(String(err)).slice(0, 200)}`)
+        } catch {
+          // Nothing more to do; the chain must go on.
+        }
+      })
     }
   } else if (status !== 204) {
     // 409: another waiter for this session (the old wait.sh hook) holds the long poll.
@@ -1039,6 +1048,8 @@ export const register: Register = on => {
     // Taken before the append is awaited, so a parallel tool result (concurrency-safe tools run at once,
     // each result through this hook) can't deliver them again; put back at the front if it fails.
     const msgs = midTurn.splice(0)
+    const batch = msgs
+    appending = batch
     const seq = turnSeq
     const text = msgs.map(m => formatMessage({ ...m, body: defang(m.body) })).join('\n\n')
     let ok = false
@@ -1048,10 +1059,12 @@ export const register: Register = on => {
     } catch {
       ok = false
     }
+    if (appending === batch) appending = undefined
     if (!inTurn || seq !== turnSeq) {
       // The turn ended while the row was being appended: no turn will read it now, whether or not it was
-      // stored, so the messages run as prompts (a stored row may repeat them; a repeat beats a loss).
-      for (const m of msgs) void submitMessage($, m)
+      // stored. turn.complete already ran these messages as prompts, before the held ones that came
+      // later (batch emptied); a stored row may repeat them (a repeat beats a loss).
+      for (const m of batch.splice(0)) void submitMessage($, m)
       return answered
     }
     if (!ok) {
@@ -1189,7 +1202,10 @@ export const register: Register = on => {
       if (e.reason !== 'answer') for (const m of deliveredThisTurn) void submitMessage($, m)
       deliveredThisTurn = []
       if (e.reason !== 'error') void turnCompleted($)
-      // Messages held for a tool result that never came (the turn ended first) run as prompts now.
+      // A batch still being appended came before the held messages: it runs first (emptied here, so the
+      // hook doesn't run it again). Then the messages held for a tool result that never came.
+      if (appending) for (const m of appending.splice(0)) void submitMessage($, m)
+      appending = undefined
       for (const m of midTurn.splice(0)) void submitMessage($, m)
     }
     return next(e)
