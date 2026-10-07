@@ -419,7 +419,7 @@ test('session.end with clear says bye, then the next tick follows the session to
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
   // The old id goes along, so the bus hands the name, inbox and Slack routing to the new one.
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.3.10', previous: DEFAULT_SESSION_ID })
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.4.0', previous: DEFAULT_SESSION_ID })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
@@ -436,11 +436,11 @@ test('both hellos and every wait carry the mod version', async ($, on) => {
 
   const hellos = calls.filter(c => c.url.endsWith('/hello'))
   expect(hellos.length).toBe(2)
-  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.3.10' })
-  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.3.10' })
+  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.4.0' })
+  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.4.0' })
   const waits = calls.filter(c => c.url.includes('/wait?'))
   expect(waits.length).toBeGreaterThan(0)
-  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.3.10')
+  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.4.0')
 })
 
 test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {
@@ -1219,7 +1219,7 @@ test('session.end cancels the working timer', async ($, on) => {
   expect(workings(calls)).toEqual([])
 })
 
-test('a Slack message queued behind a running turn is acknowledged after its own turn', async ($, on) => {
+test('a Slack message held behind a running turn that makes no more tool calls runs as a prompt after it and is acknowledged after its own turn', async ($, on) => {
   const t = turns($, on)
   const clock = mock.clock(on)
   const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: [SLACK_MSG] }) }])
@@ -1229,13 +1229,15 @@ test('a Slack message queued behind a running turn is acknowledged after its own
     return { text: e.text }
   })
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
-  // The person's turn is running when the message arrives.
+  // The person's turn is running when the message arrives: it waits for a main-loop tool result.
   await t.start('fix the build', 't0')
   await clock.advance(1000)
   await clock.settle()
-  expect(prompts.length).toBe(1)
+  expect(prompts.length).toBe(0)
+  // The turn ends without another tool result, so the message runs as a prompt after it.
   await t.complete('t0')
   await clock.settle()
+  expect(prompts.length).toBe(1)
   expect(acks(calls)).toEqual([])
   await t.start(at(prompts, 0), 't1')
   await t.complete('t1')
@@ -1475,4 +1477,47 @@ test('a broadcast header shows a truncated count, and a legacy broadcast has non
   expect(at(prompts, 1)).toContain('agentbus message m_b7 from alex via Slack (broadcast to all agents), relayed')
   expect(at(prompts, 1)).not.toContain('also sent to')
   expect(at(prompts, 1)).not.toContain('coordinate with them')
+})
+
+// Mid-turn delivery (0.4.0): a message /wait hands over while a main-loop turn runs goes into that
+// turn with the next main-loop tool result, not into a prompt queued after the turn.
+
+async function midTurnSetup($: TestArgs[0], on: TestArgs[1], msgs: object[]) {
+  const clock = mock.clock(on)
+  const t = turns($, on)
+  const calls = wire($, on, [{ status: 200, text: JSON.stringify({ messages: msgs }) }])
+  on('tool.call', () => ({ result: { stdout: 'ok' } }))
+  const prompts: string[] = []
+  on('prompt.submit', (_$, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  await t.start('the owner\'s first message', 't1')
+  await clock.advance(1000)
+  await clock.settle()
+  return { t, calls, prompts, clock }
+}
+
+test('a message that arrives during a turn rides the next main-loop tool result', async ($, on) => {
+  const { t, calls, prompts, clock } = await midTurnSetup($, on, [SLACK_MSG])
+  expect(prompts).toEqual([])
+
+  // A subagent's tool result does not carry it.
+  const sub = await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'agent-7' } as Parameters<TestArgs[0]['tool']['call']>[0])
+  expect(sub.context ?? []).toEqual([])
+
+  const main = await $.tool.call({ tool: 'Bash', command: 'ls' } as Parameters<TestArgs[0]['tool']['call']>[0])
+  expect(main.context?.length).toBe(1)
+  expect(at(main.context ?? [], 0)).toContain('please rebase')
+
+  // Delivered once.
+  const again = await $.tool.call({ tool: 'Bash', command: 'ls' } as Parameters<TestArgs[0]['tool']['call']>[0])
+  expect(again.context ?? []).toEqual([])
+
+  // The turn that carried it acknowledges it, and no prompt is queued after the turn.
+  await t.complete('t1')
+  await clock.settle()
+  expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+  expect(prompts).toEqual([])
 })

@@ -213,3 +213,23 @@ a few minutes, then exits 0.
 
 Broadcast and group messages, attachments, message history and search, an MCP
 server, a UI page in the Management Center.
+
+## Addendum 2026-10-06: mid-turn delivery (mod 0.4.0)
+
+Problem: several Slack messages sent quickly reached a busy session one turn at a time, so it answered
+stale messages while newer ones waited. Cause: the mod long-polls `/wait` all the time, and `/wait`
+claims a session's messages at once, busy or not. The mod then passed each one to `$.prompt.submit`,
+and a plugin's prompt runs only once the session is idle. The proxy's request injection rarely got a
+message first, because the open long-poll is woken at once. So this hit proxied sessions too, not only
+sessions whose model calls bypass the proxy.
+
+Fix, in the mod only (no proxy change):
+- `turn.start` / `turn.complete` (main loop) mark a running turn.
+- During a turn, a message `/wait` hands over is held, not submitted.
+- Every main-loop tool result (`tool.call`, no `agentId`, not a refused call) carries the held messages
+  as `context`: the model reads them inside the running turn, right after that result. A subagent's
+  tool result never carries them. The terminal shows one log line per delivery.
+- A turn that ends before another tool result: the held messages run as prompts after it, as before.
+- Read receipts: a message delivered into a turn is acknowledged when that turn completes; one that runs
+  as a prompt, when its own turn completes. Commands are unchanged (run by the mod, never shown as text).
+- It works the same for sessions that bypass the proxy, because it needs only the plugin hooks.

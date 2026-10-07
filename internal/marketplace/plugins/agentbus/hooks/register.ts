@@ -4,7 +4,7 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.3.10'
+export const VERSION = '0.4.0'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
@@ -747,6 +747,35 @@ const WORKING_AFTER_MS = 15000
 // outstanding (see scheduleWorking).
 let workingTimer: { cancel: () => void } | undefined
 
+// True while a main-loop turn runs (turn.start to turn.complete). A message /wait hands over
+// meanwhile goes into that turn with the next main-loop tool result (midTurn), so the model reads it
+// at once. A prompt submitted mid-turn would only run after the turn ends, and the session would
+// answer older messages while newer ones wait.
+let inTurn = false
+const midTurn: BusMessage[] = []
+
+// Holds a message /wait handed over during a main-loop turn until the next main-loop tool result
+// carries it; a Slack user's or guest's message is tracked for its read receipt, as submitMessage does.
+function holdForTurn(m: BusMessage) {
+  if ((m.from_user === true || m.guest === true) && MESSAGE_ID.test(m.id)) {
+    pendingReads.delete(m.id)
+    pendingReads.set(m.id, { session, resolved: false, started: false })
+  }
+  midTurn.push(m)
+  while (midTurn.length > MAX_PENDING_READS) midTurn.shift()
+}
+
+// Takes the held messages for a main-loop tool result: they are in the running turn from now on, so
+// that turn's completion acknowledges them.
+function takeForTurn(): BusMessage[] {
+  const taken = midTurn.splice(0)
+  for (const m of taken) {
+    const pending = pendingReads.get(m.id)
+    if (pending) pending.started = true
+  }
+  return taken
+}
+
 // working tells the proxy a turn handling these messages, delivered to session sid, is still
 // running 15s after it started. Best effort.
 async function working($: EngineInterface, sid: string, ids: string[]) {
@@ -836,7 +865,8 @@ async function waitOnce($: EngineInterface) {
         if (m.from_user === true && m.guest !== true) void runCommand($, m, m.command)
         continue
       }
-      void submitMessage($, m)
+      if (inTurn) holdForTurn(m)
+      else void submitMessage($, m)
     }
   } else if (status !== 204) {
     // 409: another waiter for this session (the old wait.sh hook) holds the long poll.
@@ -945,6 +975,7 @@ export const register: Register = on => {
 
   // Only the main loop raises turn.start (a subagent's run doesn't).
   on('turn.start', async ($, e, next) => {
+    inTurn = true
     turnStarted(e.text)
     scheduleWorking($)
     return next(e)
@@ -957,9 +988,22 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (!e.agentId) {
       cancelWorking()
+      inTurn = false
       if (e.reason !== 'error') void turnCompleted($)
+      // Messages held for a tool result that never came (the turn ended first) run as prompts now.
+      for (const m of midTurn.splice(0)) void submitMessage($, m)
     }
     return next(e)
+  })
+
+  // Every main-loop tool result carries the messages held since the last one: the model reads them
+  // inside the running turn, after the result. A subagent's result never does, nor a refused call.
+  on('tool.call', async ($, e, next) => {
+    const answered = await next(e)
+    if (e.agentId || answered.deny !== undefined || midTurn.length === 0) return answered
+    const taken = takeForTurn()
+    $.ui.log(`agentbus: ${taken.length} message${taken.length === 1 ? '' : 's'} delivered into the running turn`)
+    return { ...answered, context: [...(answered.context ?? []), ...taken.map(m => formatMessage(m))] }
   })
 
   on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
