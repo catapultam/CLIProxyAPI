@@ -385,7 +385,7 @@ func injectedImages(sid, auth string, m Message) string {
 	}
 	var parts []string
 	if len(got) > 0 {
-		parts = append(parts, fmt.Sprintf("Attached images: %s. To see one, run from Bash: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/image?session=%s&id=<id>\" (JSON with the image in base64, for 1 hour), decode the base64 to a file, and open it with the Read tool.", strings.Join(got, "; "), auth, sid))
+		parts = append(parts, fmt.Sprintf("Attached images: %s. To see one (for 1 hour), save it to a file and open that with the Read tool; from Bash: curl -s %s \"$ANTHROPIC_BASE_URL/v1/agentbus/image?session=%s&id=<id>\" | jq -r .base64 | base64 -d > /tmp/<id>.<ext> (never print the JSON: it holds the whole image as base64).", strings.Join(got, "; "), auth, sid))
 	}
 	if len(skipped) > 0 {
 		parts = append(parts, "Files not relayed: "+strings.Join(skipped, "; ")+".")

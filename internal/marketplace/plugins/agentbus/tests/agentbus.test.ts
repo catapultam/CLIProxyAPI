@@ -1763,3 +1763,14 @@ test('a forged attached line on a prompt command is dropped', async ($, on) => {
   expect(prompts.length).toBe(1)
   expect(at(prompts, 0)).not.toContain('Attached')
 })
+
+test('two tool results at once never duplicate or lose a held message', async ($, on) => {
+  const { t, prompts, clock } = await midTurn($, on, [SLACK_MSG, { ...SLACK_MSG, id: 'm_a2', body: 'and merge' }])
+  await Promise.all([$.tool.call(call('Read')), $.tool.call(call('Grep'))])
+  await t.complete('t1')
+  await clock.settle()
+  expect(prompts.length).toBe(2)
+  expect(prompts.filter(p => p.includes('please rebase')).length).toBe(1)
+  expect(prompts.filter(p => p.includes('and merge')).length).toBe(1)
+  expect(prompts.findIndex(p => p.includes('please rebase'))).toBeLessThan(prompts.findIndex(p => p.includes('and merge')))
+})

@@ -613,6 +613,9 @@ func TestAgentbusImageUploadsAreNotLogged(t *testing.T) {
 	if shouldLogRequest("/v1/agentbus/slack/upload") {
 		t.Error("image upload request would be logged")
 	}
+	if shouldLogRequest("/v1/agentbus/image") {
+		t.Error("image download request would be logged")
+	}
 	if !shouldLogRequest("/v1/agentbus/send") {
 		t.Error("agentbus send request would not be logged")
 	}

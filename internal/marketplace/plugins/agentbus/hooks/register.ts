@@ -977,6 +977,24 @@ async function turnCompleted($: EngineInterface) {
   for (const [sid, ids] of bySession) await ack($, sid, ids)
 }
 
+// Messages from /wait go through this chain one at a time, in order: fetching a message's images can
+// take a while, and waitOnce must not wait for it (no /wait meanwhile would let the session's lease
+// lapse, and the session would read as offline).
+let deliveryChain: Promise<void> = Promise.resolve()
+
+// Fetches a message's images (never holding the message up on a failure), then submits or holds it.
+async function deliverWaited($: EngineInterface, m: BusMessage) {
+  if (m.from_user === true && m.guest !== true && Array.isArray(m.images) && m.images.length > 0) {
+    try {
+      m.attached = await attachImages($, m.images)
+    } catch {
+      // Never holds up the message.
+    }
+  }
+  if (inTurn) holdForTurn($, m)
+  else await submitMessage($, m)
+}
+
 async function waitOnce($: EngineInterface) {
   const query = `?session=${encodeURIComponent(session)}&machine=${encodeURIComponent(machine)}&mod=1&v=${VERSION}`
   const { status, json } = await bus($, 'GET', `/wait${query}`)
@@ -991,15 +1009,7 @@ async function waitOnce($: EngineInterface) {
         if (m.from_user === true && m.guest !== true) void runCommand($, m, m.command)
         continue
       }
-      if (m.from_user === true && m.guest !== true && Array.isArray(m.images) && m.images.length > 0) {
-        try {
-          m.attached = await attachImages($, m.images)
-        } catch {
-          // Never holds up the message.
-        }
-      }
-      if (inTurn) holdForTurn($, m)
-      else void submitMessage($, m)
+      deliveryChain = deliveryChain.then(() => deliverWaited($, m)).catch(() => undefined)
     }
   } else if (status !== 204) {
     // 409: another waiter for this session (the old wait.sh hook) holds the long poll.
@@ -1018,16 +1028,21 @@ export const register: Register = on => {
     // Whatever arrived while the tool ran counts too, so the check for held messages comes after it.
     const answered = await next(e)
     if (next.signal.aborted || answered.deny !== undefined || midTurn.length === 0) return answered
-    const msgs = [...midTurn]
+    // Taken before the append is awaited, so a parallel tool result (concurrency-safe tools run at once,
+    // each result through this hook) can't deliver them again; put back at the front if it fails.
+    const msgs = midTurn.splice(0)
     const text = msgs.map(m => formatMessage({ ...m, body: defang(m.body) })).join('\n\n')
+    let ok = false
     try {
       const appended = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
-      if (appended.deny !== undefined) return answered
+      ok = appended.deny === undefined
     } catch {
+      ok = false
+    }
+    if (!ok) {
+      midTurn.unshift(...msgs)
       return answered
     }
-    // Delivered: take exactly these (more may have arrived during the append; they wait for the next).
-    midTurn.splice(0, msgs.length)
     deliveredIntoTurn(msgs)
     for (const m of msgs) $.ui.log(previewLine(m))
     if (!workingTimer) scheduleWorking($)

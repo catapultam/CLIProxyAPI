@@ -214,34 +214,40 @@ a few minutes, then exits 0.
 Broadcast and group messages, attachments, message history and search, an MCP
 server, a UI page in the Management Center.
 
-## Addendum 2026-10-06: mid-turn delivery (mod 0.4.0)
+## Addendum 2026-10-06: mid-turn delivery (mod 0.4.0; images in 0.4.1)
 
 Problem: several Slack messages sent quickly reached a busy session one turn at a time, so it answered
 stale messages while newer ones waited. Cause: the mod long-polls `/wait` all the time, and `/wait`
-claims a session's messages at once, busy or not. The mod then passed each one to `$.prompt.submit`,
-and a plugin's prompt runs only once the session is idle. The proxy's request injection rarely got a
-message first, because the open long-poll is woken at once. So this hit proxied sessions too, not only
-sessions whose model calls bypass the proxy.
+claims a session's messages at once, busy or not. The mod passed each one to `$.prompt.submit`, and a
+plugin's prompt runs only once the session is idle. The proxy's request injection rarely got a message
+first, because the open long-poll is woken at once. So every session with the mod had it, proxied or
+not.
 
-Fix, in the mod only (no proxy change):
+Fix, in the mod only (no proxy change for this part):
 - `turn.start` / `turn.complete` (main loop) mark a running turn.
 - During a turn, a message `/wait` hands over is held, not submitted.
-- The mod's outermost `tool.call` hook (registered first, so it sees the result after the mod's own
-  ListAgents / SendMessage hooks) adds the held messages as `context` to the next main-loop tool result
-  the model asked for: the model reads them inside the running turn, right after that result. Never on
-  a subagent's call, a call another plugin made (`next.origin.plugin` is not `engine`), a refused call
-  (`deny`) or an abandoned one (`next.signal.aborted`): the messages then stay held.
-- The text is the same framed text a prompt gets, with tag-like text escaped (`<` before a tag name or
-  `/` becomes `&lt;`), so a body can't end the reminder that carries it.
-- The model reads the context; the person at the terminal does not see it. The terminal gets one log
-  line per message: who sent it and the first 100 characters.
+- The mod's outermost `tool.call` hook appends the held messages as ONE user row,
+  `$.session.append({ message: { type: 'user', content: [text] } })`, after the next main-loop tool
+  result the model asked for. The engine stores it with `isMeta`, door `note`, origin the plugin, and the
+  running turn's next request carries it. Never after a subagent's call, a call another plugin made
+  (`next.origin.plugin` is not `engine`), a refused call (`deny`) or an abandoned one
+  (`next.signal.aborted`): the messages then stay held.
+- The messages are taken from the held list before the append is awaited, so parallel tool results
+  (concurrency-safe tools run at once) can't deliver them twice; a refused or failed append puts them
+  back at the front.
+- Why not the tool result's `context`: tested live (Claude Code 2.1.288, `claude -p`), the model read a
+  message there as a possible prompt injection ("didn't come from you") and ignored it. The user row was
+  acted on, also with three parallel Read calls (no API error, every row read).
+- The text is the framed text a prompt gets; tag-like text in the BODY is escaped (`<` before a tag
+  name or `/`, invisible characters included, becomes `&lt;`). The mod's own framing is not changed.
+- The person at the terminal does not see the row as a prompt. The terminal gets one log line per
+  message: who sent it (the Slack user for a Slack message) and the first 100 characters.
 - A turn that ends before another tool result: the held messages run as prompts after it, as before.
-- A turn that does not end with an answer (interrupted, refused, API error): the messages delivered into
-  it run again as prompts after it (a possible repeat beats a lost message), and that turn does not
-  acknowledge them; their own prompt's turn does.
+- A turn that does not end with an answer (interrupted with Esc, refused, API error): the messages
+  delivered into it run again as prompts after it (a possible repeat beats a lost message), and that
+  turn does not acknowledge them; their own prompt's turn does.
 - More than 100 held messages: the oldest runs as a prompt after the turn; none is dropped.
-- Read receipts: a message delivered into a turn is acknowledged when that turn completes with an answer,
-  and the ⏳ timer restarts (15 s) when messages are delivered. Commands are unchanged (run by the mod,
-  never shown as text).
-- It works the same for sessions that bypass the proxy, because it needs only the plugin hooks.
-- Open for the owner: mid-turn messages are not shown in full in the terminal (only the preview line).
+- Read receipts: a message delivered into a turn is acknowledged when that turn completes with an answer;
+  the ⏳ timer starts when messages are delivered and none runs. Commands are unchanged.
+- Messages from `/wait` are delivered through an ordered promise chain, so fetching a message's images
+  (0.4.1) never stops the long-poll (its lease would lapse and the session read as offline).
