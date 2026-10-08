@@ -96,6 +96,48 @@ func (f *rebindFixture) setTokensPerPct(authID string, v float64) {
 
 func approxEqual(a, b float64) bool { return math.Abs(a-b) <= 1e-6*math.Max(1, math.Abs(b)) }
 
+func TestNextResetRebindMovesTowardSmallerAccountWithLaterActualReset(t *testing.T) {
+	// b (bound) is large (size 90) and resets sooner in real terms (10h); a
+	// is small (size 10) and resets later in real terms (30h). On actual
+	// reset times alone next-reset would never move toward a, since a's real
+	// reset is later than b's. With the size bias, a's effective reset
+	// (30h - 24h = 6h, a's size 10 being smaller than the pool's largest
+	// known size 90) beats b's real 10h, so the session moves even though
+	// a's actual reset is later.
+	f := newRebindFixture(t)
+	b := sized(claudeAuth("b", 20, 10*time.Hour), "90")
+	a := sized(claudeAuth("a", 20, 30*time.Hour), "10")
+	f.bind(b)
+	f.observe("b", 1000, time.Hour) // cold cache: the move is free
+	hook := setupNextResetLogHook(t)
+	if got := f.pick(f.opts(""), a, b); got.ID != "a" {
+		t.Fatalf("got %s, want a (smaller account with a later actual reset)", got.ID)
+	}
+	var line string
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "next-reset: moved session") {
+			line = e.Message
+		}
+	}
+	if line == "" {
+		t.Fatal("no move log line")
+	}
+	// The allowance must still be computed from a's real hours-until-reset
+	// (30h: remaining 80% / 30h ~= 2.667%), not its shifted effective reset
+	// (which would give 80% / 6h ~= 13.333%).
+	if !strings.Contains(line, "allowance=2.667%") {
+		t.Fatalf("allowance did not use the real reset time: %q", line)
+	}
+	// And the log's own a_reset is the real reset (30h out), not the
+	// effective one (6h out).
+	if !strings.Contains(line, "a_reset="+nrNow.Add(30*time.Hour).Local().Format(time.RFC3339)) {
+		t.Fatalf("a_reset is not the real reset: %q", line)
+	}
+	if strings.Contains(line, "a_reset="+nrNow.Add(6*time.Hour).Local().Format(time.RFC3339)) {
+		t.Fatalf("a_reset leaked the effective reset instead of the real one: %q", line)
+	}
+}
+
 func TestNextResetRebindNoMoveWhenTargetResetsLater(t *testing.T) {
 	f := newRebindFixture(t)
 	// b resets first but is near full, so next-reset's pick (a) resets later.

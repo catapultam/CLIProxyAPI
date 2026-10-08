@@ -376,6 +376,26 @@ func authPriority(auth *Auth) int {
 	return parsed
 }
 
+// authSize returns the credential's hand-set size and whether it is known.
+// It is read from file metadata the same way authPriority reads "priority"
+// (see ApplyAuthSizeMetadata). A missing, non-numeric, or non-positive value
+// reports unknown, which next-reset ranking and pooled usage treat as "no
+// bias" rather than as a size of zero.
+func authSize(auth *Auth) (float64, bool) {
+	if auth == nil || auth.Attributes == nil {
+		return 0, false
+	}
+	raw := strings.TrimSpace(auth.Attributes[AttributeSize])
+	if raw == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || parsed <= 0 {
+		return 0, false
+	}
+	return parsed, true
+}
+
 func authWeight(auth *Auth) int64 {
 	if auth == nil {
 		return credentialweight.Default

@@ -379,6 +379,92 @@ func TestFileTokenStoreListAppliesSourcePriorityToPluginAuths(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreListAppliesSourceSizeToPluginAuths(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		raw          string
+		want         string
+		wantMetadata any
+	}{
+		{name: "number", raw: `{"type":"plugin","size":5}`, want: "5", wantMetadata: float64(5)},
+		{name: "string", raw: `{"type":"plugin","size":"20"}`, want: "20", wantMetadata: "20"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			baseDir := t.TempDir()
+			path := filepath.Join(baseDir, "plugin.json")
+			if errWrite := os.WriteFile(path, []byte(testCase.raw), 0o600); errWrite != nil {
+				t.Fatalf("write auth file: %v", errWrite)
+			}
+			RegisterPluginAuthParser(fileStoreMultiAuthParserFunc(func(context.Context, pluginapi.AuthParseRequest) ([]*cliproxyauth.Auth, bool, error) {
+				return []*cliproxyauth.Auth{
+					{ID: "first", Provider: "plugin", Metadata: map[string]any{"project_id": "first"}},
+					{ID: "second", Provider: "plugin", Metadata: map[string]any{"project_id": "second"}},
+				}, true, nil
+			}))
+			t.Cleanup(func() { RegisterPluginAuthParser(nil) })
+
+			store := NewFileTokenStore()
+			store.SetBaseDir(baseDir)
+			auths, errList := store.List(context.Background())
+			if errList != nil {
+				t.Fatalf("List() error = %v", errList)
+			}
+			if len(auths) != 2 {
+				t.Fatalf("List() len = %d, want 2", len(auths))
+			}
+			for _, auth := range auths {
+				if got := auth.Attributes[cliproxyauth.AttributeSize]; got != testCase.want {
+					t.Errorf("auth %s size attribute = %q, want %q", auth.ID, got, testCase.want)
+				}
+				if got := auth.Attributes[cliproxyauth.AttributeFileSize]; got != "true" {
+					t.Errorf("auth %s file size marker = %q, want true", auth.ID, got)
+				}
+				if got := auth.Metadata["size"]; got != testCase.wantMetadata {
+					t.Errorf("auth %s size metadata = %v, want %v", auth.ID, got, testCase.wantMetadata)
+				}
+			}
+		})
+	}
+}
+
+func TestFileTokenStoreSaveRoundTripsSizeMetadata(t *testing.T) {
+	// The token-refresh path rewrites the auth file from auth.Metadata, which
+	// (for ordinary, non-plugin OAuth credentials) is the same map the whole
+	// file was originally unmarshalled into. An arbitrary top-level key like
+	// "size" that was never deleted from that map survives a save
+	// automatically, the same way "priority" does.
+	baseDir := t.TempDir()
+	fileName := "claude-size.json"
+	path := filepath.Join(baseDir, fileName)
+	existing := []byte(`{"type":"claude","access_token":"tok","size":20,"disabled":false}`)
+	if errWrite := os.WriteFile(path, existing, 0o600); errWrite != nil {
+		t.Fatalf("write existing auth file: %v", errWrite)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auth := &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Metadata: map[string]any{
+			"type":         "claude",
+			"access_token": "tok-refreshed",
+			"size":         float64(20),
+		},
+	}
+	if _, errSave := store.Save(context.Background(), auth); errSave != nil {
+		t.Fatalf("Save() error = %v", errSave)
+	}
+	persisted, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read saved auth file: %v", errRead)
+	}
+	expected := []byte(`{"type":"claude","access_token":"tok-refreshed","size":20,"disabled":false}`)
+	if !jsonEqual(persisted, expected) {
+		t.Errorf("saved auth file = %s, want JSON equal to %s", persisted, expected)
+	}
+}
+
 func TestFileTokenStoreListAppliesSourceDisabledToPluginMultiAuths(t *testing.T) {
 	baseDir := t.TempDir()
 	path := filepath.Join(baseDir, "geminicli.json")

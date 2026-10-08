@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,11 @@ const (
 	// keeps the selector from herding every request onto one account whose
 	// short window is about to run dry just because its weekly reset is close.
 	nextResetShortWindowNearFullPct = 90.0
+	// nextResetSizeBiasShift is how much earlier a smaller account's weekly
+	// reset is treated as happening, for ranking and rebind purposes only
+	// (see nextResetEffectiveReset). It is flat regardless of how much
+	// smaller the account is.
+	nextResetSizeBiasShift = 24 * time.Hour
 )
 
 type nextResetTier int
@@ -45,6 +51,14 @@ type nextResetAssessment struct {
 	weeklyUsedPct  float64
 	shortUsedPct   float64
 	blockedUntil   time.Time
+	// effectiveWeeklyResetsAt is weeklyResetsAt shifted 24h earlier when this
+	// credential's size is known and smaller than the largest known size
+	// among the Ready credentials ranked alongside it (see
+	// nextResetApplyEffectiveResets). It drives ranking step (b) and the
+	// rebind "which account resets first" comparison; real time-to-reset math
+	// (the move cost allowance) must keep using weeklyResetsAt. Populated by
+	// sortNextReset; zero until then.
+	effectiveWeeklyResetsAt time.Time
 }
 
 // NextResetSelector spends the quota that is closest to being lost first. For
@@ -147,9 +161,14 @@ func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, op
 					readyCount++
 				}
 			}
+			sizeLog := "unknown"
+			if size, ok := authSize(picked.auth); ok {
+				sizeLog = strconv.FormatFloat(size, 'g', -1, 64)
+			}
 			selectorLogEntry(ctx).Infof(
-				"next-reset: cold pick | auth=%s provider=%s weekly_used=%.1f%% weekly_reset=%s ready=%d",
+				"next-reset: cold pick | auth=%s provider=%s weekly_used=%.1f%% weekly_reset=%s ready=%d size=%s effective_reset=%s",
 				nextResetAuthIdentity(picked.auth), provider, picked.weeklyUsedPct, picked.weeklyResetsAt.Format(time.RFC3339), readyCount,
+				sizeLog, picked.effectiveWeeklyResetsAt.Format(time.RFC3339),
 			)
 		}
 		return picked.auth, nil
@@ -270,14 +289,68 @@ func nextResetExhausted(w nextResetWindow, now time.Time) bool {
 	return w.Rejected || w.UsedPct >= 100
 }
 
+// nextResetMaxReadySize returns the largest known auth size among the Ready
+// assessments in as, so callers can tell which credentials count as
+// "smaller" for the effective-reset shift. It is computed once per ranking
+// call, not once per comparison.
+func nextResetMaxReadySize(as []nextResetAssessment) (maxSize float64, known bool) {
+	for _, a := range as {
+		if a.tier != nextResetReady {
+			continue
+		}
+		if size, ok := authSize(a.auth); ok && (!known || size > maxSize) {
+			maxSize, known = size, true
+		}
+	}
+	return maxSize, known
+}
+
+// nextResetEffectiveReset biases smaller accounts to be spent first: it
+// shifts resetsAt nextResetSizeBiasShift earlier when auth's size is known
+// and strictly smaller than maxSize (the largest known size among the
+// credentials being ranked together), and leaves resetsAt unchanged
+// otherwise (unknown size, size equal to the largest, or no known size at
+// all in this ranking). Every smaller account gets the same flat shift
+// regardless of how much smaller it is.
+func nextResetEffectiveReset(auth *Auth, resetsAt time.Time, maxSize float64, maxKnown bool) time.Time {
+	if !maxKnown {
+		return resetsAt
+	}
+	size, ok := authSize(auth)
+	if !ok || size >= maxSize {
+		return resetsAt
+	}
+	return resetsAt.Add(-nextResetSizeBiasShift)
+}
+
+// nextResetApplyEffectiveResets fills in effectiveWeeklyResetsAt for every
+// Ready assessment in as, using one max-size pass shared by the whole slice
+// (see nextResetMaxReadySize). Non-Ready assessments are left with their
+// weekly reset unchanged since ranking never compares them on reset time.
+func nextResetApplyEffectiveResets(as []nextResetAssessment) {
+	maxSize, maxKnown := nextResetMaxReadySize(as)
+	for i := range as {
+		if as[i].tier != nextResetReady {
+			as[i].effectiveWeeklyResetsAt = as[i].weeklyResetsAt
+			continue
+		}
+		as[i].effectiveWeeklyResetsAt = nextResetEffectiveReset(as[i].auth, as[i].weeklyResetsAt, maxSize, maxKnown)
+	}
+}
+
 // sortNextReset orders by tier, then for Ready credentials by: (a) headroom,
 // credentials that are not near full (see nextResetIsNearFull) before those
 // that are, so a near-full account is used last rather than first; (b)
-// earlier weekly reset first, spending the quota closest to being lost
-// first; (c) lower weekly used percent first; and finally (d) auth ID, for a
-// deterministic order. Near-full credentials are only pushed to the back as
-// a group: their relative order still follows (b)-(d).
+// earlier *effective* weekly reset first, spending the quota closest to
+// being lost first, where the effective reset is 24h earlier than the real
+// one for a credential whose known size is smaller than the largest known
+// size among the Ready candidates (see nextResetEffectiveReset) -- this is
+// the smaller-accounts-first bias, layered on top of earliest-deadline-first
+// ranking; (c) lower weekly used percent first; and finally (d) auth ID, for
+// a deterministic order. Near-full credentials are only pushed to the back
+// as a group: their relative order still follows (b)-(d).
 func sortNextReset(as []nextResetAssessment) {
+	nextResetApplyEffectiveResets(as)
 	sort.SliceStable(as, func(i, j int) bool {
 		x, y := as[i], as[j]
 		if x.tier != y.tier {
@@ -289,8 +362,8 @@ func sortNextReset(as []nextResetAssessment) {
 			if xNearFull != yNearFull {
 				return !xNearFull
 			}
-			if !x.weeklyResetsAt.Equal(y.weeklyResetsAt) {
-				return x.weeklyResetsAt.Before(y.weeklyResetsAt)
+			if !x.effectiveWeeklyResetsAt.Equal(y.effectiveWeeklyResetsAt) {
+				return x.effectiveWeeklyResetsAt.Before(y.effectiveWeeklyResetsAt)
 			}
 			if x.weeklyUsedPct != y.weeklyUsedPct {
 				return x.weeklyUsedPct < y.weeklyUsedPct

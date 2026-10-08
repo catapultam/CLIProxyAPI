@@ -579,3 +579,125 @@ func TestSelectorUsesNextResetUnwrapsAffinity(t *testing.T) {
 		t.Fatal("round-robin misdetected")
 	}
 }
+
+// sized sets a's hand-set size attribute (see ApplyAuthSizeMetadata/authSize)
+// and returns a, for building next-reset ranking test fixtures.
+func sized(a *Auth, size string) *Auth {
+	if a.Attributes == nil {
+		a.Attributes = map[string]string{}
+	}
+	a.Attributes[AttributeSize] = size
+	return a
+}
+
+func TestNextResetSmallerAccountWithResetUpTo24hLaterBeatsLarger(t *testing.T) {
+	// a is the largest known size (90), so it never shifts. b is smaller
+	// (10) and resets only 10h after a, well inside the 24h flat shift, so
+	// b's effective reset (30h - 24h = 6h) beats a's real 20h.
+	a := sized(claudeAuth("a", 50, 20*time.Hour), "90")
+	b := sized(claudeAuth("b", 50, 30*time.Hour), "10")
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "b" {
+		t.Fatalf("got %s, want b (smaller account within the 24h window)", got.ID)
+	}
+}
+
+func TestNextResetSmallerAccountResettingMoreThan24hLaterLoses(t *testing.T) {
+	// Same sizes as above, but b now resets 30h after a (outside the 24h
+	// shift), so even after the 24h bias b's effective reset (50h - 24h =
+	// 26h) is still later than a's real 20h: a keeps winning.
+	a := sized(claudeAuth("a", 50, 20*time.Hour), "90")
+	b := sized(claudeAuth("b", 50, 50*time.Hour), "10")
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "a" {
+		t.Fatalf("got %s, want a (b's reset is more than 24h later even after the shift)", got.ID)
+	}
+}
+
+func TestNextResetUnknownSizeGetsNoShift(t *testing.T) {
+	// c holds the largest known size and resets soonest in real terms. a
+	// resets later than c but would, if its size were known and smaller,
+	// shift ahead of c (15h - 24h < 1h). With a's size known and smaller
+	// than c's, a wins; with a's size unknown, a gets no shift and c wins.
+	c := sized(claudeAuth("c", 50, time.Hour), "100")
+	t.Run("known smaller size shifts ahead", func(t *testing.T) {
+		a := sized(claudeAuth("a", 50, 15*time.Hour), "10")
+		if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, c); got.ID != "a" {
+			t.Fatalf("got %s, want a (known smaller size shifts its effective reset earlier)", got.ID)
+		}
+	})
+	t.Run("unknown size is not shifted", func(t *testing.T) {
+		a := claudeAuth("a", 50, 15*time.Hour) // no size attribute
+		if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, c); got.ID != "c" {
+			t.Fatalf("got %s, want c (unknown size must not shift a ahead)", got.ID)
+		}
+	})
+}
+
+func TestNextResetEqualKnownSizesOrderUnaffected(t *testing.T) {
+	// Equal sizes mean neither is "smaller than the largest known size", so
+	// neither shifts: ordering is exactly the earliest-reset baseline.
+	a := sized(claudeAuth("a", 60, 20*time.Hour), "50")
+	b := sized(claudeAuth("b", 10, 40*time.Hour), "50")
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", b, a); got.ID != "a" {
+		t.Fatalf("got %s, want a (equal sizes must not change earliest-reset ordering)", got.ID)
+	}
+}
+
+func TestNextResetNearFullGoesLastRegardlessOfSize(t *testing.T) {
+	// a is near full but tiny (size 10, well under b's 100), which would
+	// shift its effective reset 24h earlier if the near-full floor did not
+	// apply first. The near-full floor (step (a)) is still evaluated before
+	// the effective-reset comparison (step (b)), so b wins regardless.
+	a := sized(claudeAuth("a", 98.5, 10*time.Hour), "10")
+	b := sized(claudeAuth("b", 50, 100*time.Hour), "100")
+	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "b" {
+		t.Fatalf("got %s, want b (a is near full regardless of its smaller size)", got.ID)
+	}
+}
+
+func TestNextResetColdPickLogsSizeAndEffectiveReset(t *testing.T) {
+	hook := setupNextResetLogHook(t)
+	a := sized(claudeAuth("a", 50, 30*time.Hour), "10")
+	b := sized(claudeAuth("b", 50, 20*time.Hour), "90")
+	s := nrSelector()
+	got, err := s.Pick(withNextResetColdPick(context.Background()), "claude", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{a, b})
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if got.ID != "a" {
+		t.Fatalf("got %s, want a (effective reset 30h-24h=6h beats b's 20h)", got.ID)
+	}
+	var line string
+	for _, e := range hook.AllEntries() {
+		if e.Level == log.InfoLevel && strings.Contains(e.Message, "next-reset: cold pick") {
+			line = e.Message
+		}
+	}
+	if line == "" {
+		t.Fatalf("expected an Info log for the cold pick")
+	}
+	if !strings.Contains(line, "size=10") {
+		t.Fatalf("log line missing size: %q", line)
+	}
+	wantEffective := nrNow.Add(30 * time.Hour).Add(-nextResetSizeBiasShift).Local().Format(time.RFC3339)
+	if !strings.Contains(line, "effective_reset="+wantEffective) {
+		t.Fatalf("log line missing effective_reset=%s: %q", wantEffective, line)
+	}
+}
+
+func TestNextResetColdPickLogsSizeUnknown(t *testing.T) {
+	hook := setupNextResetLogHook(t)
+	a := claudeAuth("a", 20, 10*time.Hour) // no size attribute
+	s := nrSelector()
+	if _, err := s.Pick(withNextResetColdPick(context.Background()), "claude", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{a}); err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	var line string
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "next-reset: cold pick") {
+			line = e.Message
+		}
+	}
+	if !strings.Contains(line, "size=unknown") {
+		t.Fatalf("log line missing size=unknown: %q", line)
+	}
+}

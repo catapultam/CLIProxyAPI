@@ -594,7 +594,19 @@ func (s *SessionAffinitySelector) nextResetMove(ctx context.Context, provider, m
 		return nil
 	}
 	b := nr.assess(bound, model, now)
-	if b.tier != nextResetReady || !a.weeklyResetsAt.Before(b.weeklyResetsAt) {
+	if b.tier != nextResetReady {
+		return nil
+	}
+	// b (bound) was assessed on its own, outside the ranked slice (it may sit
+	// in a lower priority tier than candidates), so it carries no effective
+	// reset yet. Give it one from the same max-size basis ranked used, so "A
+	// resets first" is decided the same way a cold pick would decide it: by
+	// effective reset, which lets a session move toward a smaller account
+	// even when that account's real reset is later. The cost allowance below
+	// keeps using the real reset.
+	maxSize, maxKnown := nextResetMaxReadySize(ranked)
+	b.effectiveWeeklyResetsAt = nextResetEffectiveReset(b.auth, b.weeklyResetsAt, maxSize, maxKnown)
+	if !a.effectiveWeeklyResetsAt.Before(b.effectiveWeeklyResetsAt) {
 		return nil
 	}
 

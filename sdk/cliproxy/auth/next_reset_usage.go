@@ -60,11 +60,15 @@ func (m *Manager) PooledUsageReport(model string, now time.Time) PooledUsage {
 
 // PooledUsageForModel reports pooled 5h and weekly usage across the Claude and
 // Codex OAuth credentials that serve model. Each window's used_percentage is
-// the share of the pool's combined capacity that is used (the mean of each
-// credential's percent, counting a full or latched credential as 100), and
-// resets_at is the earliest reset among credentials with a known window. For
-// Fable models a credential's weekly figure is its Fable sub-limit when that
-// is higher. Credentials without data are counted in accounts but not known.
+// the share of the pool's combined capacity that is used: when every
+// credential counted in Accounts has a known size (see authSize) it is the
+// size-weighted mean of each credential's percent, so a larger account's
+// usage counts for more of the pool; otherwise it is the plain mean, as
+// before. Either way a full or latched credential counts as 100. resets_at
+// is the earliest reset among credentials with a known window, unaffected by
+// weighting. For Fable models a credential's weekly figure is its Fable
+// sub-limit when that is higher. Credentials without data are counted in
+// accounts but not known.
 func (m *Manager) PooledUsageForModel(model string, now time.Time) PooledUsage {
 	reg := registry.GetGlobalRegistry()
 	fable := strings.Contains(strings.ToLower(model), "fable")
@@ -100,6 +104,11 @@ func (m *Manager) pooledUsage(now time.Time, fable bool, include func(*Auth) boo
 		return out
 	}
 	var short, weekly pooledAccumulator
+	// sizesKnown tracks whether every credential counted in out.Accounts has
+	// a known size, including ones with no usage snapshot yet (they never
+	// reach add() below but still decide whether the pool as a whole may be
+	// weighted). It can only go from true to false as the pool is scanned.
+	sizesKnown := true
 	for _, auth := range m.List() {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !nextResetTracked(auth) {
 			continue
@@ -108,31 +117,45 @@ func (m *Manager) pooledUsage(now time.Time, fable bool, include func(*Auth) boo
 			continue
 		}
 		out.Accounts++
+		size, sizeOK := authSize(auth)
+		if !sizeOK {
+			sizesKnown = false
+		}
 		snap, ok := nextResetView(auth, nextResetPolled)
 		if !ok {
 			continue
 		}
 		out.Known++
 		latched := nextResetIsLatched(auth.ID)
-		short.add(snap.Short, latched, now)
+		short.add(snap.Short, latched, now, size)
 		w := snap.Weekly
 		if fable && snap.Fable.Known && snap.Fable.UsedPct > w.UsedPct {
 			w = snap.Fable
 		}
-		weekly.add(w, latched, now)
+		weekly.add(w, latched, now, size)
 	}
-	out.FiveHour = short.window()
-	out.SevenDay = weekly.window()
+	out.FiveHour = short.window(sizesKnown)
+	out.SevenDay = weekly.window(sizesKnown)
 	return out
 }
 
+// pooledAccumulator folds one window's reading from every pooled credential
+// into both a plain mean (sum/count) and a size-weighted mean
+// (weightedSum/sizeSum). window() picks between them: the weighted mean is
+// only meaningful when every credential add() saw had a known size, which
+// the caller (pooledUsage) tracks across the whole pool and passes in.
 type pooledAccumulator struct {
-	sum      float64
-	count    int
-	earliest time.Time
+	sum         float64
+	count       int
+	weightedSum float64
+	sizeSum     float64
+	earliest    time.Time
 }
 
-func (a *pooledAccumulator) add(w nextResetWindow, latched bool, now time.Time) {
+// add folds one credential's window into the accumulator. size is that
+// credential's hand-set size (0 when unknown); it only matters when window()
+// is later asked for the weighted mean.
+func (a *pooledAccumulator) add(w nextResetWindow, latched bool, now time.Time, size float64) {
 	if !w.Known {
 		return
 	}
@@ -157,16 +180,27 @@ func (a *pooledAccumulator) add(w nextResetWindow, latched bool, now time.Time) 
 	}
 	a.sum += used
 	a.count++
+	a.weightedSum += used * size
+	a.sizeSum += size
 	if w.ResetsAt.After(now) && (a.earliest.IsZero() || w.ResetsAt.Before(a.earliest)) {
 		a.earliest = w.ResetsAt
 	}
 }
 
-func (a *pooledAccumulator) window() *PooledUsageWindow {
+// window reports the pooled window, or nil when nothing was added. weighted
+// requests the size-weighted mean; it is only honored when sizeSum is
+// positive, i.e. at least one add() carried a known size (the caller only
+// passes true when every counted credential's size was known, so sizeSum is
+// then necessarily positive whenever count is).
+func (a *pooledAccumulator) window(weighted bool) *PooledUsageWindow {
 	if a.count == 0 {
 		return nil
 	}
-	w := &PooledUsageWindow{UsedPercentage: a.sum / float64(a.count)}
+	pct := a.sum / float64(a.count)
+	if weighted && a.sizeSum > 0 {
+		pct = a.weightedSum / a.sizeSum
+	}
+	w := &PooledUsageWindow{UsedPercentage: pct}
 	if !a.earliest.IsZero() {
 		w.ResetsAt = a.earliest.Unix()
 	}
