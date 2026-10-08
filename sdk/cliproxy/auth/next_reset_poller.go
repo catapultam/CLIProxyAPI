@@ -149,7 +149,7 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 		p.mu.Lock()
 		p.backoff[auth.ID] = now.Add(d)
 		p.mu.Unlock()
-		log.Debugf("next-reset: usage poll for %s backing off %s: %s", auth.ID, d, reason)
+		log.Debugf("next-reset: usage poll for %s backing off %s: %s", nextResetAuthIdentity(auth), d, reason)
 	}
 	p.mu.Lock()
 	p.lastPoll[auth.ID] = now
