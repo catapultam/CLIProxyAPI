@@ -66,6 +66,11 @@ type nextResetPoller struct {
 	do     NextResetHTTPDoer
 	store  *nextResetPolledStore
 	active func() bool
+	// releaseQuota clears a confirmed-cleared auth's quota-exhaustion
+	// cooldown (see Manager.ReleaseQuotaCooldown); nil in tests that do not
+	// exercise that release. Set by StartNextResetPoller to the owning
+	// Manager's method.
+	releaseQuota func(ctx context.Context, authID string) (bool, error)
 
 	mu       sync.Mutex
 	backoff  map[string]time.Time
@@ -206,6 +211,12 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 		p.store.set(auth.ID, snap)
 		// Re-evaluate now so a confirmed reset releases the latch at once.
 		nextResetBlocked(auth, now)
+		// A real usage_limit_reached 429 sets a credential_quota cooldown
+		// days away, and MarkResult's success path deliberately keeps it
+		// active even once traffic succeeds; only this poller, backed by
+		// the authoritative usage endpoint, can confirm the limit actually
+		// cleared ahead of that original reset.
+		p.releaseQuotaCooldownIfRoom(auth, snap, now)
 		// Codex's size comes straight from its stored plan_type
 		// (codexPlanSize); only Claude needs a second, independently
 		// scheduled request here, and only after this usage poll itself
@@ -226,6 +237,26 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 		setBackoff(d, "http 429")
 	default:
 		setBackoff(nextResetBackoffOther, fmt.Sprintf("http %d", resp.StatusCode))
+	}
+}
+
+// releaseQuotaCooldownIfRoom clears auth's quota-exhaustion cooldown (via
+// p.releaseQuota, i.e. Manager.ReleaseQuotaCooldown) when this fresh usage
+// snapshot shows room in every window that matters (see
+// nextResetSnapshotShowsRoom). It is a no-op when p.releaseQuota is unset
+// (tests that do not exercise this release) or the snapshot does not show
+// room, and logs one Info line per actual release.
+func (p *nextResetPoller) releaseQuotaCooldownIfRoom(auth *Auth, snap nextResetSnapshot, now time.Time) {
+	if p.releaseQuota == nil || !nextResetSnapshotShowsRoom(snap) {
+		return
+	}
+	released, errRelease := p.releaseQuota(context.Background(), auth.ID)
+	if errRelease != nil {
+		log.Warnf("next-reset: release quota cooldown for %s: %v", nextResetAuthIdentity(auth), errRelease)
+		return
+	}
+	if released {
+		log.Infof("next-reset: usage confirmed room, released quota cooldown | auth=%s provider=%s", nextResetAuthIdentity(auth), auth.Provider)
 	}
 }
 
@@ -329,12 +360,13 @@ func (m *Manager) StartNextResetPoller(ctx context.Context, do NextResetHTTPDoer
 	}
 	loadNextResetState(statePath, time.Now())
 	p := &nextResetPoller{
-		list:     m.List,
-		do:       do,
-		store:    nextResetPolled,
-		active:   func() bool { return selectorUsesNextReset(m.Selector()) },
-		backoff:  make(map[string]time.Time),
-		lastPoll: make(map[string]time.Time),
+		list:         m.List,
+		do:           do,
+		store:        nextResetPolled,
+		active:       func() bool { return selectorUsesNextReset(m.Selector()) },
+		releaseQuota: m.ReleaseQuotaCooldown,
+		backoff:      make(map[string]time.Time),
+		lastPoll:     make(map[string]time.Time),
 	}
 	save := func() {
 		// Drop any plan-size entry (in memory and on disk) for an auth ID
