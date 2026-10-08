@@ -327,7 +327,10 @@ func TestPostSessionPasskeyFinishHonorsRemember(t *testing.T) {
 		"name":        "Test Key",
 		"credential":  json.RawMessage(regJSON),
 	})
-	doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/finish", string(finishBody), authedHeaders)
+	regFinishRec := doRequest(engine, http.MethodPost, "/v8/management/account/passkeys/finish", string(finishBody), authedHeaders)
+	if regFinishRec.Code != http.StatusOK {
+		t.Fatalf("passkeys/finish (registration) status = %d, want 200; body=%s", regFinishRec.Code, regFinishRec.Body.String())
+	}
 
 	// Now log in via the passkey with remember=false.
 	loginBeginRec := doRequest(engine, http.MethodPost, "/v8/management/session/passkey/begin", "", nil)
@@ -360,5 +363,159 @@ func TestPostSessionPasskeyFinishHonorsRemember(t *testing.T) {
 	setCookie := passkeyLoginRec.Header().Get("Set-Cookie")
 	if strings.Contains(setCookie, "Max-Age") || strings.Contains(setCookie, "Expires") {
 		t.Fatalf("Set-Cookie = %q, expected no Max-Age/Expires for a passkey login with remember=false", setCookie)
+	}
+
+	expiresAt, err := time.Parse(time.RFC3339, resp.ExpiresAt)
+	if err != nil {
+		t.Fatalf("expires_at = %q is not RFC3339: %v", resp.ExpiresAt, err)
+	}
+	if want := clock.Now().Add(mgmtauth.BrowserSessionLifetime); !expiresAt.Equal(want) {
+		t.Fatalf("expires_at = %v, want %v (BrowserSessionLifetime)", expiresAt, want)
+	}
+
+	account := h.loginStore.Get()
+	secret, err := decodeLoginSecret(account.SessionSecret)
+	if err != nil {
+		t.Fatalf("decodeLoginSecret: %v", err)
+	}
+	claims, err := mgmtauth.VerifyToken(secret, resp.Token, clock.Now())
+	if err != nil {
+		t.Fatalf("VerifyToken: %v", err)
+	}
+	if claims.Remember {
+		t.Fatal("token claim must carry remember=false for a passkey login with remember=false")
+	}
+	if claims.Method != mgmtauth.MethodPasskey {
+		t.Fatalf("Method = %q, want %q", claims.Method, mgmtauth.MethodPasskey)
+	}
+}
+
+// TestPutAccountPreservesRememberFalseOverCookieSession covers the riskiest
+// persistence path flagged in review: a password change (PUT /account),
+// over a cookie-authenticated remember=false session, must issue a fresh
+// session that is STILL a browser session -- not silently upgraded to a
+// persistent 30-day one just because a write happened.
+func TestPutAccountPreservesRememberFalseOverCookieSession(t *testing.T) {
+	clock := newMockClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	h := newAccountHandler(t, clock)
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSONRemember("admin", testAccountPassword, false), nil)
+	cookieHeader, _ := sessionCookieFrom(loginRec)
+	headers := map[string]string{"Cookie": cookieHeader, "Sec-Fetch-Site": "same-origin"}
+
+	rec := doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("admin", "a-new-strong-password", testAccountPassword), headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	resp := decodeSessionResponse(t, rec)
+	if resp.Remember == nil || *resp.Remember {
+		t.Fatalf("remember = %v, want false", resp.Remember)
+	}
+	expiresAt, err := time.Parse(time.RFC3339, resp.ExpiresAt)
+	if err != nil {
+		t.Fatalf("expires_at = %q is not RFC3339: %v", resp.ExpiresAt, err)
+	}
+	if want := clock.Now().Add(mgmtauth.BrowserSessionLifetime); !expiresAt.Equal(want) {
+		t.Fatalf("expires_at = %v, want %v (BrowserSessionLifetime)", expiresAt, want)
+	}
+	setCookie := rec.Header().Get("Set-Cookie")
+	if strings.Contains(setCookie, "Max-Age") || strings.Contains(setCookie, "Expires") {
+		t.Fatalf("Set-Cookie = %q, expected no Max-Age/Expires for a remember=false PUT /account response", setCookie)
+	}
+
+	// The password change rotates session-secret; decode the NEW secret to
+	// verify the token claim.
+	account := h.loginStore.Get()
+	secret, err := decodeLoginSecret(account.SessionSecret)
+	if err != nil {
+		t.Fatalf("decodeLoginSecret: %v", err)
+	}
+	claims, err := mgmtauth.VerifyToken(secret, resp.Token, clock.Now())
+	if err != nil {
+		t.Fatalf("VerifyToken: %v", err)
+	}
+	if claims.Remember {
+		t.Fatal("token claim must carry remember=false after a password change over a remember=false cookie session")
+	}
+}
+
+// TestPutAccountPreservesRememberFalseOverBearerSession is the bearer-
+// authenticated counterpart of the cookie test above.
+func TestPutAccountPreservesRememberFalseOverBearerSession(t *testing.T) {
+	clock := newMockClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	h := newAccountHandler(t, clock)
+	engine := newTestEngine(h)
+
+	loginRec := doRequest(engine, http.MethodPost, "/v8/management/session/login", loginJSONRemember("admin", testAccountPassword, false), nil)
+	loginResp := decodeSessionResponse(t, loginRec)
+
+	rec := doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("admin", "a-new-strong-password", testAccountPassword), map[string]string{
+		"Authorization": "Bearer " + loginResp.Token,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	resp := decodeSessionResponse(t, rec)
+	if resp.Remember == nil || *resp.Remember {
+		t.Fatalf("remember = %v, want false", resp.Remember)
+	}
+	expiresAt, err := time.Parse(time.RFC3339, resp.ExpiresAt)
+	if err != nil {
+		t.Fatalf("expires_at = %q is not RFC3339: %v", resp.ExpiresAt, err)
+	}
+	if want := clock.Now().Add(mgmtauth.BrowserSessionLifetime); !expiresAt.Equal(want) {
+		t.Fatalf("expires_at = %v, want %v (BrowserSessionLifetime)", expiresAt, want)
+	}
+	setCookie := rec.Header().Get("Set-Cookie")
+	if strings.Contains(setCookie, "Max-Age") || strings.Contains(setCookie, "Expires") {
+		t.Fatalf("Set-Cookie = %q, expected no Max-Age/Expires for a remember=false PUT /account response", setCookie)
+	}
+
+	account := h.loginStore.Get()
+	secret, err := decodeLoginSecret(account.SessionSecret)
+	if err != nil {
+		t.Fatalf("decodeLoginSecret: %v", err)
+	}
+	claims, err := mgmtauth.VerifyToken(secret, resp.Token, clock.Now())
+	if err != nil {
+		t.Fatalf("VerifyToken: %v", err)
+	}
+	if claims.Remember {
+		t.Fatal("token claim must carry remember=false after a password change over a remember=false bearer session")
+	}
+}
+
+// TestPutAccountDefaultsRememberTrueOverKey covers the other side of
+// resolvedSessionRemember: a management-key-authenticated PUT /account has
+// no remember concept at all and must default to true (unchanged, 30-day
+// persistent behavior), regardless of what any prior session looked like.
+func TestPutAccountDefaultsRememberTrueOverKey(t *testing.T) {
+	clock := newMockClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	h := newAccountHandler(t, clock)
+	h.envSecret = "test-secret"
+	h.allowRemoteOverride = true
+	engine := newTestEngine(h)
+
+	rec := doRequest(engine, http.MethodPut, "/v8/management/account", putAccountBody("admin", "a-new-strong-password", ""), map[string]string{
+		"X-Management-Key": "test-secret",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	resp := decodeSessionResponse(t, rec)
+	if resp.Remember != nil && !*resp.Remember {
+		t.Fatalf("remember = %v, want true (or omitted)", *resp.Remember)
+	}
+	expiresAt, err := time.Parse(time.RFC3339, resp.ExpiresAt)
+	if err != nil {
+		t.Fatalf("expires_at = %q is not RFC3339: %v", resp.ExpiresAt, err)
+	}
+	if want := clock.Now().Add(mgmtauth.DefaultLifetime); !expiresAt.Equal(want) {
+		t.Fatalf("expires_at = %v, want %v (DefaultLifetime)", expiresAt, want)
+	}
+	setCookie := rec.Header().Get("Set-Cookie")
+	if !strings.Contains(setCookie, "Max-Age=") || strings.Contains(setCookie, "Max-Age=0") {
+		t.Fatalf("Set-Cookie = %q, expected a positive Max-Age for a key-authenticated PUT /account response", setCookie)
 	}
 }
