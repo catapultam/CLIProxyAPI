@@ -15,10 +15,12 @@ func withNextReset(t *testing.T) {
 	nextResetEnabled.Store(true)
 	nextResetLatches = &nextResetLatchStore{since: make(map[string]time.Time)}
 	nextResetPolled = newNextResetPolledStore()
+	nextResetPlanSizes = newNextResetPlanSizeStore()
 	t.Cleanup(func() {
 		nextResetEnabled.Store(false)
 		nextResetLatches = &nextResetLatchStore{since: make(map[string]time.Time)}
 		nextResetPolled = newNextResetPolledStore()
+		nextResetPlanSizes = newNextResetPlanSizeStore()
 	})
 }
 
@@ -113,7 +115,11 @@ func TestNextResetPollerPollsLatchedFirstThenEveryDueAccount(t *testing.T) {
 	d := &fakeUsageDoer{status: 200, body: `{"seven_day":{"utilization":4,"resets_at":"2026-10-09T00:00:00Z"}}`}
 	p := newTestPoller([]*Auth{fresh, full}, d)
 	p.runOnce(context.Background(), nrNow.Add(time.Minute))
-	if len(d.calls) != 2 || !strings.HasPrefix(d.calls[0], "z-full https://api.anthropic.com/api/oauth/usage") {
+	// Each Claude account now also makes a plan-size profile request right
+	// after its usage request (see maybeFetchClaudePlanSize), so z-full and
+	// a-fresh each produce two calls here; the usage call still comes first
+	// for each account and z-full (latched) still sorts ahead of a-fresh.
+	if len(d.calls) != 4 || !strings.HasPrefix(d.calls[0], "z-full https://api.anthropic.com/api/oauth/usage") {
 		t.Fatalf("calls = %v", d.calls)
 	}
 	if nextResetIsLatched("z-full") {
@@ -152,26 +158,32 @@ func TestNextResetPollerCadence(t *testing.T) {
 	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Utilization"] = "0.5"
 	d := &fakeUsageDoer{status: 500}
 	p := newTestPoller([]*Auth{a}, d)
+	// This Claude account also gets a plan-size profile request on every
+	// fetch here (see maybeFetchClaudePlanSize): the shared doer answers it
+	// with the same 500, which backs it off for only 5 minutes -- shorter
+	// than every gap below -- so each usage fetch below is paired with one
+	// profile fetch and every call count here is exactly double the
+	// pre-plan-size expectation.
 	p.runOnce(context.Background(), nrNow) // startup: never polled
-	if len(d.calls) != 1 {
+	if len(d.calls) != 2 {
 		t.Fatalf("startup calls = %v", d.calls)
 	}
 	p.backoff = map[string]time.Time{}
 	p.runOnce(context.Background(), nrNow.Add(time.Hour))
-	if len(d.calls) != 1 {
+	if len(d.calls) != 2 {
 		t.Fatalf("polled before anything was due: %v", d.calls)
 	}
 	p.runOnce(context.Background(), nrNow.Add(2*time.Hour+time.Minute)) // 5h reset passed
-	if len(d.calls) != 2 {
+	if len(d.calls) != 4 {
 		t.Fatalf("anticipated reset not polled: %v", d.calls)
 	}
 	p.backoff = map[string]time.Time{}
 	p.runOnce(context.Background(), nrNow.Add(4*time.Hour))
-	if len(d.calls) != 2 {
+	if len(d.calls) != 4 {
 		t.Fatalf("polled again inside the routine interval: %v", d.calls)
 	}
 	p.runOnce(context.Background(), nrNow.Add(5*time.Hour+2*time.Minute))
-	if len(d.calls) != 3 {
+	if len(d.calls) != 6 {
 		t.Fatalf("routine 3h poll missing: %v", d.calls)
 	}
 }
@@ -182,6 +194,7 @@ func TestNextResetStateRoundTrip(t *testing.T) {
 	nextResetPolled.set("a", nextResetSnapshot{Weekly: nextResetWindow{Known: true, UsedPct: 42, ResetsAt: nrNow.Add(time.Hour)}, ObservedAt: nrNow})
 	nextResetPolled.set("old", nextResetSnapshot{ObservedAt: nrNow.Add(-8 * 24 * time.Hour)})
 	nextResetLatches.set("b", nrNow)
+	nextResetPlanSizes.set("c", nextResetPlanSizeEntry{Size: 20, Known: true})
 	if err := saveNextResetState(path); err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +203,7 @@ func TestNextResetStateRoundTrip(t *testing.T) {
 	}
 	nextResetPolled = newNextResetPolledStore()
 	nextResetLatches = &nextResetLatchStore{since: make(map[string]time.Time)}
+	nextResetPlanSizes = newNextResetPlanSizeStore()
 	loadNextResetState(path, nrNow)
 	if snap, ok := nextResetPolled.get("a"); !ok || snap.Weekly.UsedPct != 42 || !snap.Weekly.ResetsAt.Equal(nrNow.Add(time.Hour)) {
 		t.Fatalf("restored a = %+v %v", snap, ok)
@@ -199,6 +213,9 @@ func TestNextResetStateRoundTrip(t *testing.T) {
 	}
 	if !nextResetIsLatched("b") {
 		t.Fatal("latch not restored")
+	}
+	if entry, ok := nextResetPlanSizes.get("c"); !ok || !entry.Known || entry.Size != 20 {
+		t.Fatalf("plan size not restored: %+v %v", entry, ok)
 	}
 	loadNextResetState(t.TempDir()+"/missing.json", nrNow) // must not panic
 }

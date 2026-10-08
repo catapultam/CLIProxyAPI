@@ -19,11 +19,18 @@ const (
 	claudeUsageUserAgent = "claude-cli/2.1.280 (external, cli)"
 	codexUsageURL        = "https://chatgpt.com/backend-api/wham/usage"
 	codexUsageUserAgent  = "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"
+	// claudeProfileURL reports the plan tier (rate_limit_tier,
+	// organization_type, has_claude_pro) that drives plan-derived size; see
+	// parseClaudeProfileSize in size_plan.go.
+	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
 
 	nextResetPollEvery = time.Minute
 	// nextResetPollRoutine refreshes every credential at least this often.
 	nextResetPollRoutine = 3 * time.Hour
 	nextResetPollTimeout = 30 * time.Second
+	// nextResetPlanSizeRefreshEvery is how often a Claude credential's plan
+	// tier is re-fetched once known; see nextResetPoller.maybeFetchClaudePlanSize.
+	nextResetPlanSizeRefreshEvery = 24 * time.Hour
 
 	nextResetBackoffAuth    = 30 * time.Minute
 	nextResetBackoffLimited = 15 * time.Minute
@@ -56,6 +63,11 @@ type nextResetPoller struct {
 	mu       sync.Mutex
 	backoff  map[string]time.Time
 	lastPoll map[string]time.Time
+	// planDue schedules the next Claude plan-size profile fetch per auth ID
+	// (see maybeFetchClaudePlanSize): zero/absent means "never fetched,
+	// fetch now." Lazily initialized on first write so callers that build a
+	// nextResetPoller literal (tests included) need not set it.
+	planDue map[string]time.Time
 }
 
 // due reports whether auth should be polled now, and its priority (lower
@@ -187,6 +199,95 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 		setBackoff(d, "http 429")
 	default:
 		setBackoff(nextResetBackoffOther, fmt.Sprintf("http %d", resp.StatusCode))
+	}
+	// Codex's size comes straight from its stored plan_type (codexPlanSize);
+	// only Claude needs a second, independently-scheduled request here.
+	if !codex {
+		p.maybeFetchClaudePlanSize(ctx, auth, now)
+	}
+}
+
+// claudePlanDue reports whether auth's plan tier should be (re-)fetched now:
+// never fetched before, or nextResetPlanSizeRefreshEvery has passed since
+// the schedule was last set (by a success or a failure; see
+// maybeFetchClaudePlanSize).
+func (p *nextResetPoller) claudePlanDue(auth *Auth, now time.Time) bool {
+	p.mu.Lock()
+	until, ok := p.planDue[auth.ID]
+	p.mu.Unlock()
+	return !ok || !now.Before(until)
+}
+
+func (p *nextResetPoller) setClaudePlanDue(authID string, until time.Time) {
+	p.mu.Lock()
+	if p.planDue == nil {
+		p.planDue = make(map[string]time.Time)
+	}
+	p.planDue[authID] = until
+	p.mu.Unlock()
+}
+
+// maybeFetchClaudePlanSize fetches auth's plan tier from the profile
+// endpoint when due (see claudePlanDue): on this poller's first cycle for
+// the account, since planDue starts empty, and then at most once per
+// nextResetPlanSizeRefreshEvery. It shares this poller's doer and Claude
+// usage-poll headers, and backs off like the usage poll (same thresholds,
+// a separate schedule) on any error, leaving whatever size was last derived
+// in place; see nextResetPlanSizes and planDerivedSize. The caller already
+// confirmed auth is a tracked Claude OAuth credential with an access token.
+func (p *nextResetPoller) maybeFetchClaudePlanSize(ctx context.Context, auth *Auth, now time.Time) {
+	if !p.claudePlanDue(auth, now) {
+		return
+	}
+	backoff := func(d time.Duration, reason string) {
+		p.setClaudePlanDue(auth.ID, now.Add(d))
+		log.Debugf("next-reset: plan-size poll for %s backing off %s: %s", nextResetAuthIdentity(auth), d, reason)
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, nextResetPollTimeout)
+	defer cancel()
+	req, errReq := http.NewRequestWithContext(reqCtx, http.MethodGet, claudeProfileURL, nil)
+	if errReq != nil {
+		backoff(nextResetBackoffOther, errReq.Error())
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+authAccessToken(auth))
+	req.Header.Set("User-Agent", claudeUsageUserAgent)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	resp, errDo := p.do(reqCtx, auth, req)
+	if errDo != nil {
+		backoff(nextResetBackoffOther, errDo.Error())
+		return
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debugf("next-reset: close plan-size response: %v", errClose)
+		}
+	}()
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		backoff(nextResetBackoffOther, errRead.Error())
+		return
+	}
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		size, known, errParse := parseClaudeProfileSize(body)
+		if errParse != nil {
+			backoff(nextResetBackoffOther, "parse: "+errParse.Error())
+			return
+		}
+		nextResetPlanSizes.set(auth.ID, nextResetPlanSizeEntry{Size: size, Known: known})
+		p.setClaudePlanDue(auth.ID, now.Add(nextResetPlanSizeRefreshEvery))
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		backoff(nextResetBackoffAuth, fmt.Sprintf("http %d", resp.StatusCode))
+	case resp.StatusCode == http.StatusTooManyRequests:
+		d := nextResetBackoffLimited
+		if secs, errAtoi := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); errAtoi == nil && time.Duration(secs)*time.Second > d {
+			d = time.Duration(secs) * time.Second
+		}
+		backoff(d, "http 429")
+	default:
+		backoff(nextResetBackoffOther, fmt.Sprintf("http %d", resp.StatusCode))
 	}
 }
 

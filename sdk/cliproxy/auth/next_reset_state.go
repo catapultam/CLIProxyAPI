@@ -21,6 +21,10 @@ type nextResetStateFile struct {
 	Version int                          `json:"version"`
 	Polled  map[string]nextResetSnapshot `json:"polled"`
 	Latches map[string]time.Time         `json:"latches"`
+	// PlanSizes is additive: an older build ignores the field it does not
+	// know about, and this build reads a file saved without it (the zero
+	// value, a nil map) fine, so this never breaks reading either direction.
+	PlanSizes map[string]nextResetPlanSizeEntry `json:"plan_sizes,omitempty"`
 }
 
 func (p *nextResetPolledStore) snapshot() map[string]nextResetSnapshot {
@@ -50,9 +54,10 @@ func saveNextResetState(path string) error {
 	}
 	nextResetStateDirty.Store(false)
 	data, errMarshal := json.Marshal(nextResetStateFile{
-		Version: 1,
-		Polled:  nextResetPolled.snapshot(),
-		Latches: nextResetLatches.snapshot(),
+		Version:   1,
+		Polled:    nextResetPolled.snapshot(),
+		Latches:   nextResetLatches.snapshot(),
+		PlanSizes: nextResetPlanSizes.snapshot(),
 	})
 	if errMarshal != nil {
 		nextResetStateDirty.Store(true)
@@ -103,5 +108,8 @@ func loadNextResetState(path string, now time.Time) {
 	for id, since := range state.Latches {
 		nextResetLatches.set(id, since)
 	}
-	log.Infof("next-reset: restored %d usage snapshots and %d latches from %s", restored, len(state.Latches), path)
+	for id, entry := range state.PlanSizes {
+		nextResetPlanSizes.set(id, entry)
+	}
+	log.Infof("next-reset: restored %d usage snapshots, %d latches, and %d plan sizes from %s", restored, len(state.Latches), len(state.PlanSizes), path)
 }

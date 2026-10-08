@@ -174,14 +174,15 @@ func (s *NextResetSelector) Pick(ctx context.Context, provider, model string, op
 					readyCount++
 				}
 			}
-			sizeLog := "unknown"
-			if size, ok := authSize(picked.auth); ok {
+			sizeLog, sizeSource := "unknown", "none"
+			if size, ok, source := authSizeWithSource(picked.auth); ok {
 				sizeLog = strconv.FormatFloat(size, 'g', -1, 64)
+				sizeSource = source
 			}
 			selectorLogEntry(ctx).Infof(
-				"next-reset: cold pick | auth=%s provider=%s weekly_used=%.1f%% weekly_reset=%s ready=%d size=%s effective_reset=%s",
+				"next-reset: cold pick | auth=%s provider=%s weekly_used=%.1f%% weekly_reset=%s ready=%d size=%s size_source=%s effective_reset=%s",
 				nextResetAuthIdentity(picked.auth), provider, picked.weeklyUsedPct, picked.weeklyResetsAt.Format(time.RFC3339), readyCount,
-				sizeLog, picked.effectiveWeeklyResetsAt.Format(time.RFC3339),
+				sizeLog, sizeSource, picked.effectiveWeeklyResetsAt.Format(time.RFC3339),
 			)
 		}
 		return picked.auth, nil
