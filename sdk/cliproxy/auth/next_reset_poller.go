@@ -337,6 +337,10 @@ func (m *Manager) StartNextResetPoller(ctx context.Context, do NextResetHTTPDoer
 		lastPoll: make(map[string]time.Time),
 	}
 	save := func() {
+		// Drop any plan-size entry (in memory and on disk) for an auth ID
+		// the manager no longer tracks, so a removed credential's derived
+		// plan size is not persisted indefinitely.
+		nextResetPlanSizes.prune(trackedAuthIDSet(m))
 		if !nextResetStateDirty.Load() {
 			return
 		}
@@ -367,6 +371,23 @@ func (m *Manager) StartNextResetPoller(ctx context.Context, do NextResetHTTPDoer
 			}
 		}
 	}()
+}
+
+// trackedAuthIDSet returns the set of auth IDs the manager currently tracks,
+// for pruning state (see nextResetPlanSizeStore.prune) keyed by auth ID that
+// has outlived the credential it described.
+func trackedAuthIDSet(m *Manager) map[string]bool {
+	if m == nil {
+		return nil
+	}
+	auths := m.List()
+	ids := make(map[string]bool, len(auths))
+	for _, a := range auths {
+		if a != nil && a.ID != "" {
+			ids[a.ID] = true
+		}
+	}
+	return ids
 }
 
 func selectorUsesNextReset(selector Selector) bool {

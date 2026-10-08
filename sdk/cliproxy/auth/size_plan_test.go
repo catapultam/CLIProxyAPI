@@ -102,3 +102,48 @@ func TestParseClaudeProfileSizeMalformedJSON(t *testing.T) {
 		t.Fatal("malformed body did not report an error")
 	}
 }
+
+// TestNextResetPlanSizeStorePrune covers Fix 5: pruning drops entries for
+// auth IDs outside keep, in memory, and leaves tracked IDs untouched.
+func TestNextResetPlanSizeStorePrune(t *testing.T) {
+	s := newNextResetPlanSizeStore()
+	s.set("kept", nextResetPlanSizeEntry{Size: 1, Known: true})
+	s.set("gone", nextResetPlanSizeEntry{Size: 5, Known: true})
+	nextResetStateDirty.Store(false)
+
+	s.prune(map[string]bool{"kept": true})
+
+	if _, ok := s.get("gone"); ok {
+		t.Fatal("prune left an untracked auth ID's plan size in memory")
+	}
+	if entry, ok := s.get("kept"); !ok || !entry.Known || entry.Size != 1 {
+		t.Fatalf("prune dropped a tracked auth ID's plan size: %+v %v", entry, ok)
+	}
+	if !nextResetStateDirty.Load() {
+		t.Fatal("prune did not mark state dirty so the pruned store persists")
+	}
+}
+
+// TestNextResetPlanSizeStorePruneNoopWhenNothingStale covers that pruning an
+// already-clean store leaves nextResetStateDirty untouched.
+func TestNextResetPlanSizeStorePruneNoopWhenNothingStale(t *testing.T) {
+	s := newNextResetPlanSizeStore()
+	s.set("kept", nextResetPlanSizeEntry{Size: 1, Known: true})
+	nextResetStateDirty.Store(false)
+
+	s.prune(map[string]bool{"kept": true})
+
+	if nextResetStateDirty.Load() {
+		t.Fatal("prune marked state dirty despite dropping nothing")
+	}
+}
+
+// TestTrackedAuthIDSet covers the manager-side half of Fix 5: the set
+// reflects exactly the manager's currently registered auth IDs.
+func TestTrackedAuthIDSet(t *testing.T) {
+	m := newQuotaSummaryTestManager(&Auth{ID: "a", Provider: "claude"}, &Auth{ID: "b", Provider: "codex"})
+	ids := trackedAuthIDSet(m)
+	if len(ids) != 2 || !ids["a"] || !ids["b"] {
+		t.Fatalf("trackedAuthIDSet = %v, want {a, b}", ids)
+	}
+}

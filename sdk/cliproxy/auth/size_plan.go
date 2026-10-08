@@ -125,6 +125,20 @@ func (s *nextResetPlanSizeStore) snapshot() map[string]nextResetPlanSizeEntry {
 	return out
 }
 
+// prune drops any entry whose auth ID is not in keep, in memory and (via
+// nextResetStateDirty) in the next persisted state file, so a credential no
+// longer tracked by the manager does not keep its derived plan size forever.
+func (s *nextResetPlanSizeStore) prune(keep map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.data {
+		if !keep[id] {
+			delete(s.data, id)
+			nextResetStateDirty.Store(true)
+		}
+	}
+}
+
 // nextResetPlanSizes is shared by every poller/selector so a config reload
 // that rebuilds the selector keeps derived sizes, mirroring nextResetPolled.
 var nextResetPlanSizes = newNextResetPlanSizeStore()
