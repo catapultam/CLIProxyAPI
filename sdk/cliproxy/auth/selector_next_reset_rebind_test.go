@@ -96,6 +96,122 @@ func (f *rebindFixture) setTokensPerPct(authID string, v float64) {
 
 func approxEqual(a, b float64) bool { return math.Abs(a-b) <= 1e-6*math.Max(1, math.Abs(b)) }
 
+func TestNextResetRebindMovesTowardSmallerAccountWithLaterActualReset(t *testing.T) {
+	// b (bound) is large (size 90) and resets sooner in real terms (10h); a
+	// is small (size 10) and resets later in real terms (30h). On actual
+	// reset times alone next-reset would never move toward a, since a's real
+	// reset is later than b's. With the size bias, a's effective reset
+	// (30h - 24h = 6h, a's size 10 being smaller than the pool's largest
+	// known size 90) beats b's real 10h, so the session moves even though
+	// a's actual reset is later.
+	f := newRebindFixture(t)
+	b := sized(claudeAuth("b", 20, 10*time.Hour), "90")
+	a := sized(claudeAuth("a", 20, 30*time.Hour), "10")
+	// The size bias' basis (largest known size among every tracked account
+	// of the provider; see nextResetSizeBasisByProvider) needs a manager that
+	// tracks both a and b -- f.nr otherwise has no manager reference.
+	m := NewManager(nil, f.nr, nil)
+	for _, auth := range []*Auth{a, b} {
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s): %v", auth.ID, errRegister)
+		}
+	}
+	f.bind(b)
+	f.observe("b", 1000, time.Hour) // cold cache: the move is free
+	hook := setupNextResetLogHook(t)
+	if got := f.pick(f.opts(""), a, b); got.ID != "a" {
+		t.Fatalf("got %s, want a (smaller account with a later actual reset)", got.ID)
+	}
+	var line string
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "next-reset: moved session") {
+			line = e.Message
+		}
+	}
+	if line == "" {
+		t.Fatal("no move log line")
+	}
+	// The allowance must still be computed from a's real hours-until-reset
+	// (30h: remaining 80% / 30h ~= 2.667%), not its shifted effective reset
+	// (which would give 80% / 6h ~= 13.333%).
+	if !strings.Contains(line, "allowance=2.667%") {
+		t.Fatalf("allowance did not use the real reset time: %q", line)
+	}
+	// And the log's own a_reset is the real reset (30h out), not the
+	// effective one (6h out).
+	if !strings.Contains(line, "a_reset="+nrNow.Add(30*time.Hour).Local().Format(time.RFC3339)) {
+		t.Fatalf("a_reset is not the real reset: %q", line)
+	}
+	if strings.Contains(line, "a_reset="+nrNow.Add(6*time.Hour).Local().Format(time.RFC3339)) {
+		t.Fatalf("a_reset leaked the effective reset instead of the real one: %q", line)
+	}
+}
+
+func TestNextResetRebindStableBasisAcrossProviderDoesNotPingPong(t *testing.T) {
+	// S (size 1, resets 30h), M (size 2, resets 20h), L (size 3, resets 5h).
+	// The basis is the largest known size among every tracked account of the
+	// provider (see nextResetSizeBasisByProvider), not just the Ready ones a
+	// single pick ranks, so it stays 3 whether or not L is currently Ready:
+	// M (2 < 3) and S (1 < 3) always shift 24h earlier, and M's shifted
+	// reset (20h-24h) always beats S's (30h-24h), so a session on M never
+	// has a reason to move.
+	//
+	// Before this fix the basis was the max size among Ready candidates in
+	// that ranking call alone. With L Ready the basis was 3 and M shifted
+	// ahead of S as above. Once L exhausted its weekly window (still
+	// tracked, just not Ready), the Ready-only basis dropped to max(1,2)=2,
+	// so M (2 == 2) stopped shifting while S (1 < 2) still did: S's
+	// effective reset (6h) then beat M's unshifted 20h, and the session
+	// moved M -> S. When L recovered, the basis went back to 3, M shifted
+	// again, and the session moved back S -> M. This test pins the session
+	// on M throughout and fails if it ever moves.
+	f := newRebindFixture(t)
+	s := sized(claudeAuth("s", 20, 30*time.Hour), "1")
+	m := sized(claudeAuth("m", 20, 20*time.Hour), "2")
+	l := sized(claudeAuth("l", 20, 5*time.Hour), "3")
+	mgr := NewManager(nil, f.nr, nil)
+	for _, auth := range []*Auth{s, m, l} {
+		if _, errRegister := mgr.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s): %v", auth.ID, errRegister)
+		}
+	}
+	hook := setupNextResetLogHook(t)
+
+	// Cold bind: with all three Ready, m's effective reset (20h-24h) beats
+	// s's (30h-24h); l is the largest known size, so it never shifts and
+	// its real 5h reset does not matter here. The session binds to m.
+	if got := f.pick(f.opts(""), s, m, l); got.ID != "m" {
+		t.Fatalf("initial pick = %s, want m", got.ID)
+	}
+	f.observe("m", 1000, time.Hour) // cold cache: any move would be free
+
+	// l exhausts its weekly window: nextResetExhausted makes it Unavailable
+	// for ranking, but it stays registered with the manager, so it still
+	// counts toward the basis. Advance the clock past the 5-minute prompt
+	// cache TTL between requests, or every request after the first reads as
+	// warm (no observed idle time) and the move guard that blocks warm moves
+	// without a tokens-per-% estimate masks what this test checks.
+	f.now = f.now.Add(10 * time.Minute)
+	l.Quota.Signals["Anthropic-Ratelimit-Unified-7d-Utilization"] = "1.0000"
+	if got := f.pick(f.opts(""), s, m, l); got.ID != "m" {
+		t.Fatalf("pick after l exhausts = %s, want m (no move)", got.ID)
+	}
+
+	// l recovers. The basis never changed, so there is nothing to move back
+	// from either.
+	f.now = f.now.Add(10 * time.Minute)
+	l.Quota.Signals["Anthropic-Ratelimit-Unified-7d-Utilization"] = "0.1000"
+	if got := f.pick(f.opts(""), s, m, l); got.ID != "m" {
+		t.Fatalf("pick after l recovers = %s, want m (no move)", got.ID)
+	}
+
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "next-reset: moved session") {
+			t.Fatalf("session moved when it should have stayed on m throughout: %q", e.Message)
+		}
+	}
+}
+
 func TestNextResetRebindNoMoveWhenTargetResetsLater(t *testing.T) {
 	f := newRebindFixture(t)
 	// b resets first but is near full, so next-reset's pick (a) resets later.

@@ -28,7 +28,7 @@ A move re-binds the session's affinity entry to A, so later requests stay on A b
 
 Credentials are identified by the same opaque SHA-256 prefix the cold-pick log uses. Never log an ID, file name, label or email.
 
-Moves only ever go toward the account that resets sooner. When that account becomes near full, the near-full rule makes the next one the target.
+Moves only ever go toward the account that resets sooner. When that account becomes near full, the near-full rule makes the next one the target. (The 2026-10-07 addendum below adds an exception: with the size bias, "resets sooner" is judged on an effective reset, so a move can go toward an account whose actual reset is later.)
 
 ## Cost of a move
 
@@ -50,7 +50,7 @@ Per credential, from responses the proxy already handles:
 
 ## Out of scope
 
-- Moves toward a later-resetting account.
+- Moves toward a later-resetting account. (Superseded in part by the 2026-10-07 addendum: a move can land on an account whose *actual* reset is later, when its *effective* reset, biased for size, is earlier.)
 - Codex-specific cache economics: Codex credentials use the same rule, but with no cache data they only move when the cost is 0.
 - Any change to cold bindings, failover or exhaustion handling.
 - An auto-reset quota option. Alex has parked it.
@@ -66,3 +66,13 @@ Use deterministic clocks; no sleeps. Cover:
 - the learning estimate becomes valid after 3 samples, follows the EWMA, and a utilization decrease resets the accumulator;
 - after a move, later requests stay on A by affinity;
 - the log line carries hashes only: the test credential has an email-bearing ID and label, and neither appears.
+
+## 2026-10-07 addendum: size bias moves toward a later-resetting account
+
+Credentials can carry an optional hand-set "size" (see `sdk/cliproxy/auth/size.go`, `authSize`). Where this doc says "A resets first" or "earliest weekly reset," both cold-pick ranking (`sortNextReset`) and this rebind's "A resets first" check (step 1 above) actually compare an *effective* weekly reset, not the real one:
+
+- A credential's effective reset is its real reset minus 24h when its size is known and strictly smaller than the largest known size among every tracked account of its provider (claude or codex OAuth accounts, not disabled -- the same set `PooledUsageForProvider` pools, not just the Ready candidates one pick ranks; see `nextResetSizeBasisByProvider`). Otherwise the effective reset equals the real one.
+- This means a move can land on an account whose *actual* reset is later than the bound account's, as long as its size makes its *effective* reset earlier. The "out of scope" and "moves only toward sooner" language above predates this and no longer holds in general.
+- The allowance (step 2 above) is unaffected: `allowance_pct` still uses A's real `hours_until(A.weekly_reset)`, not the effective one. A size bias changes which account gets picked, not how much of its quota a move may spend.
+- The move's log line (`a_reset=`, `b_reset=`) always prints the real resets, never the effective ones, so size-biased moves are not distinguishable from unbiased ones by that line alone.
+- The basis (the provider's largest known size) is computed over every tracked account regardless of tier, readiness, or priority bucket, specifically so it does not change just because the pool's largest account becomes temporarily exhausted or stale in one ranking call -- that would flip which smaller account counts as shifted and move a session back and forth as the larger account's readiness flaps.

@@ -376,6 +376,32 @@ func authPriority(auth *Auth) int {
 	return parsed
 }
 
+// authSize returns the credential's hand-set size and whether it is known.
+// The routing attribute (AttributeSize, read from file metadata the same way
+// authPriority reads "priority"; see ApplyAuthSizeMetadata) wins when
+// present: a valid value is known, an invalid one is unknown, period. A
+// missing or empty attribute falls back to auth.Metadata["size"], so a
+// management-panel PATCH -- which writes Metadata as json.Number without
+// touching Attributes -- or a plugin refresh that drops the attribute can
+// still bias next-reset. Both paths share parseSizeValue's validity rules
+// (finite, > 0); NaN and +/-Inf are rejected like any other invalid value.
+func authSize(auth *Auth) (float64, bool) {
+	if auth == nil {
+		return 0, false
+	}
+	if auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes[AttributeSize]); raw != "" {
+			return parseSizeValue(raw)
+		}
+	}
+	if auth.Metadata != nil {
+		if rawSize, ok := auth.Metadata[AttributeSize]; ok {
+			return parseSizeValue(rawSize)
+		}
+	}
+	return 0, false
+}
+
 func authWeight(auth *Auth) int64 {
 	if auth == nil {
 		return credentialweight.Default

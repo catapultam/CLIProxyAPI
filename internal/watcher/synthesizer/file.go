@@ -139,7 +139,10 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 					return nil, fmt.Errorf("invalid plugin auth weight in %s: %w", filepath.Base(fullPath), errWeight)
 				}
 				coreauth.ApplyAuthPriorityMetadata(auth, metadata)
-				if _, inherited := auth.Attributes[coreauth.AttributeFilePriority]; inherited {
+				coreauth.ApplyAuthSizeMetadata(auth, metadata)
+				_, inheritedPriority := auth.Attributes[coreauth.AttributeFilePriority]
+				_, inheritedSize := auth.Attributes[coreauth.AttributeFileSize]
+				if inheritedPriority || inheritedSize {
 					if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
 						setter.SetMetadata(auth.Metadata)
 					}
@@ -214,6 +217,8 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	}
 	// Read priority from auth file.
 	coreauth.ApplyAuthPriorityMetadata(a, metadata)
+	// Read size from auth file.
+	coreauth.ApplyAuthSizeMetadata(a, metadata)
 	if errWeight := coreauth.ApplyAuthWeightMetadata(a, metadata); errWeight != nil {
 		return nil, fmt.Errorf("invalid auth weight in %s: %w", filepath.Base(fullPath), errWeight)
 	}
