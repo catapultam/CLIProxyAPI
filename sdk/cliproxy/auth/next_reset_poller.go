@@ -28,6 +28,11 @@ const (
 	// nextResetPollRoutine refreshes every credential at least this often.
 	nextResetPollRoutine = 3 * time.Hour
 	nextResetPollTimeout = 30 * time.Second
+	// nextResetLatchedPoll re-checks a latched credential whose expected
+	// reset is still far off at least this often, well short of
+	// nextResetPollRoutine, so a limit cleared upstream ahead of schedule
+	// is not left blocked for hours (see due).
+	nextResetLatchedPoll = 15 * time.Minute
 	// nextResetPlanSizeRefreshEvery is how often a Claude credential's plan
 	// tier is re-fetched once known; see nextResetPoller.maybeFetchClaudePlanSize.
 	nextResetPlanSizeRefreshEvery = 24 * time.Hour
@@ -52,8 +57,10 @@ type NextResetHTTPDoer func(ctx context.Context, auth *Auth, req *http.Request) 
 // or without traffic: every credential at startup and every three hours, and
 // any credential as soon as one of its windows reaches its reset time. A
 // latched credential whose reset has passed is polled every two minutes until
-// the endpoint confirms room. The poller is read-only: it never refreshes or
-// writes credentials.
+// the endpoint confirms room; one whose expected reset is still far off is
+// still re-checked every nextResetLatchedPoll, well short of the routine
+// three hours, in case the limit was cleared upstream ahead of schedule. The
+// poller is read-only: it never refreshes or writes credentials.
 type nextResetPoller struct {
 	list   func() []*Auth
 	do     NextResetHTTPDoer
@@ -71,8 +78,9 @@ type nextResetPoller struct {
 }
 
 // due reports whether auth should be polled now, and its priority (lower
-// first): 0 for a latched credential past its reset, 1 for a credential with a
-// window that reset since the last poll, 2 for the routine refresh.
+// first): 0 for a latched credential past its reset, 1 for a latched
+// credential whose expected reset is still far off or for a credential with
+// a window that reset since the last poll, 2 for the routine refresh.
 func (p *nextResetPoller) due(auth *Auth, now time.Time) (int, bool) {
 	p.mu.Lock()
 	until, polled := p.backoff[auth.ID], p.lastPoll[auth.ID]
@@ -81,7 +89,8 @@ func (p *nextResetPoller) due(auth *Auth, now time.Time) (int, bool) {
 		return 0, false
 	}
 	since := now.Sub(polled)
-	if nextResetIsLatched(auth.ID) {
+	latched := nextResetIsLatched(auth.ID)
+	if latched {
 		if _, expected := nextResetBlocked(auth, now); !expected.After(now.Add(nextResetLatchRetry)) {
 			return 0, since >= nextResetLatchRetry
 		}
@@ -92,6 +101,14 @@ func (p *nextResetPoller) due(auth *Auth, now time.Time) (int, bool) {
 				return 1, true
 			}
 		}
+	}
+	if latched {
+		// The expected reset is still far off, but the owner may have
+		// already cleared the limit upstream (seen live: a manually reset
+		// Codex account stayed latched because it waited for the routine
+		// 3h poll). Re-check at nextResetLatchedPoll instead of leaving a
+		// latched credential blocked for up to nextResetPollRoutine.
+		return 1, since >= nextResetLatchedPoll
 	}
 	return 2, since >= nextResetPollRoutine
 }
