@@ -116,7 +116,7 @@ func TestBearerWinsOverCSRFBlockedCookie(t *testing.T) {
 func TestSessionRequiresAccount(t *testing.T) {
 	h := newTestHandlerBase(t, mgmtauth.SystemClock{})
 	engine := newTestEngine(h)
-	tok, _, err := mgmtauth.IssueToken([]byte("some-secret"), mgmtauth.MethodPassword, time.Now(), time.Hour)
+	tok, _, err := mgmtauth.IssueToken([]byte("some-secret"), mgmtauth.MethodPassword, time.Now(), time.Hour, true)
 	if err != nil {
 		t.Fatal(err)
 	}

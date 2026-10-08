@@ -33,6 +33,15 @@ const AuthMethodContextKey = "management.auth-method"
 // AuthMethodContextKey when AuthMethodSession applies.
 const LoginMethodContextKey = "management.login-method"
 
+// SessionRememberContextKey records the mgmtauth.Claims.Remember value of
+// the session that authenticated the current request, set alongside
+// AuthMethodContextKey when AuthMethodSession applies. A handler that
+// issues a fresh session in response to an authenticated action (e.g. a
+// password change) must read this back via resolvedSessionRemember so a
+// browser-session (remember=false) caller does not get silently upgraded
+// to a persistent 30-day session.
+const SessionRememberContextKey = "management.session-remember"
+
 // Values stored under AuthMethodContextKey.
 const (
 	AuthMethodSession = "session"
@@ -119,10 +128,16 @@ func (h *Handler) tryAuthenticateSession(c *gin.Context) sessionAuthStatus {
 		}
 
 		c.Set(LoginMethodContextKey, string(claims.Method))
-		if mgmtauth.ShouldRefresh(claims, now, mgmtauth.DefaultLifetime) {
-			if refreshed, expiresAt, errIssue := mgmtauth.IssueToken(secret, claims.Method, now, mgmtauth.DefaultLifetime); errIssue == nil {
+		c.Set(SessionRememberContextKey, claims.Remember)
+		lifetime := mgmtauth.LifetimeFor(claims.Remember)
+		if mgmtauth.ShouldRefresh(claims, now, lifetime) {
+			// Preserve the original remember claim and its own lifetime on
+			// refresh: a browser-session token must keep sliding at its 12h
+			// lifetime (refreshing under half, i.e. <6h remaining) and never
+			// turn into a persistent 30-day session.
+			if refreshed, expiresAt, errIssue := mgmtauth.IssueToken(secret, claims.Method, now, lifetime, claims.Remember); errIssue == nil {
 				if cand.viaCookie {
-					h.setSessionCookie(c, refreshed, expiresAt, origins)
+					h.setSessionCookie(c, refreshed, expiresAt, origins, claims.Remember)
 				} else {
 					c.Header("X-CPA-Session-Refresh", refreshed)
 				}
@@ -237,13 +252,22 @@ func isHTTPSRequest(c *gin.Context, allowedOrigins []string) bool {
 	return false
 }
 
-// setSessionCookie sets the HttpOnly session cookie with Max-Age matching
-// the token's remaining lifetime, computed from h.now() rather than wall
-// time so it is testable with a mock clock.
-func (h *Handler) setSessionCookie(c *gin.Context, token string, expiresAt time.Time, allowedOrigins []string) {
-	maxAge := int(expiresAt.Sub(h.now()).Seconds())
-	if maxAge < 0 {
-		maxAge = 0
+// setSessionCookie sets the HttpOnly session cookie. When remember is true
+// it carries a Max-Age matching the token's remaining lifetime, computed
+// from h.now() rather than wall time so it is testable with a mock clock
+// (the historical, unchanged behavior). When remember is false, maxAge is
+// left at the Go/gin sentinel 0, which omits the Max-Age (and Expires)
+// cookie attribute entirely, making it a "browser session" cookie that the
+// browser drops when it closes -- this must NOT be confused with the
+// "clear the cookie now" meaning of a negative maxAge used by
+// clearSessionCookie below.
+func (h *Handler) setSessionCookie(c *gin.Context, token string, expiresAt time.Time, allowedOrigins []string, remember bool) {
+	maxAge := 0
+	if remember {
+		maxAge = int(expiresAt.Sub(h.now()).Seconds())
+		if maxAge < 0 {
+			maxAge = 0
+		}
 	}
 	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie(SessionCookieName, token, maxAge, sessionCookiePath, "", isHTTPSRequest(c, allowedOrigins), true)
@@ -395,21 +419,24 @@ func ceilSecondsAtLeastOne(d time.Duration) int {
 
 // issueSessionResponse issues a fresh session token, sets the cookie, and
 // writes the standard "session response" body described by the management
-// login design: {"token": "cpas_...", "expires_at": "<RFC3339>"}. It always
-// clears any X-CPA-Session-Refresh header a prior Middleware() step may
-// have set (signed with a secret that could be stale, e.g. just before a
-// password change rotates it): the body/cookie issued here are always the
-// authoritative, freshest credential, so a leftover refresh header must not
-// also be sent.
-func (h *Handler) issueSessionResponse(c *gin.Context, status int, secret []byte, method mgmtauth.Method, passkeyOrigins []string) {
-	token, expiresAt, err := mgmtauth.IssueToken(secret, method, h.now(), mgmtauth.DefaultLifetime)
+// login design: {"token": "cpas_...", "expires_at": "<RFC3339>", "remember":
+// bool}. remember picks the token's lifetime (mgmtauth.DefaultLifetime when
+// true, mgmtauth.BrowserSessionLifetime when false) and whether the cookie
+// carries a Max-Age at all. It always clears any X-CPA-Session-Refresh
+// header a prior Middleware() step may have set (signed with a secret that
+// could be stale, e.g. just before a password change rotates it): the
+// body/cookie issued here are always the authoritative, freshest
+// credential, so a leftover refresh header must not also be sent.
+func (h *Handler) issueSessionResponse(c *gin.Context, status int, secret []byte, method mgmtauth.Method, passkeyOrigins []string, remember bool) {
+	lifetime := mgmtauth.LifetimeFor(remember)
+	token, expiresAt, err := mgmtauth.IssueToken(secret, method, h.now(), lifetime, remember)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to issue session: " + err.Error()})
 		return
 	}
 	c.Header("X-CPA-Session-Refresh", "")
-	h.setSessionCookie(c, token, expiresAt, passkeyOrigins)
-	c.JSON(status, gin.H{"token": token, "expires_at": expiresAt.UTC().Format(time.RFC3339)})
+	h.setSessionCookie(c, token, expiresAt, passkeyOrigins, remember)
+	c.JSON(status, gin.H{"token": token, "expires_at": expiresAt.UTC().Format(time.RFC3339), "remember": remember})
 }
 
 // GetSessionStatus reports the caller's authentication state without
@@ -524,12 +551,18 @@ func (h *Handler) PostSessionLogin(c *gin.Context) {
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		// Remember is a *bool so an absent field can be distinguished from
+		// an explicit false: absent means "remember=true", matching exactly
+		// today's behavior for old panels and any deploy ordering where the
+		// panel is updated before the proxy (or vice versa).
+		Remember *bool `json:"remember"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
 	username := strings.TrimSpace(body.Username)
+	remember := body.Remember == nil || *body.Remember
 
 	account := h.loginStore.Get()
 	if !mgmtauth.HasAccount(account) {
@@ -560,7 +593,7 @@ func (h *Handler) PostSessionLogin(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "session secret is not configured"})
 		return
 	}
-	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPassword, effectivePasskeyOrigins(account))
+	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPassword, effectivePasskeyOrigins(account), remember)
 }
 
 // PostSessionPasskeyBegin starts a discoverable passkey login ceremony.
@@ -607,11 +640,14 @@ func (h *Handler) PostSessionPasskeyFinish(c *gin.Context) {
 	var body struct {
 		CeremonyID string          `json:"ceremony_id"`
 		Credential json.RawMessage `json:"credential"`
+		// Remember mirrors PostSessionLogin's field: absent means true.
+		Remember *bool `json:"remember"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	remember := body.Remember == nil || *body.Remember
 
 	session, ok := h.loginCeremonies.Take(body.CeremonyID)
 	if !ok {
@@ -651,7 +687,7 @@ func (h *Handler) PostSessionPasskeyFinish(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "session secret is not configured"})
 		return
 	}
-	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPasskey, effectivePasskeyOrigins(account))
+	h.issueSessionResponse(c, http.StatusOK, secret, mgmtauth.MethodPasskey, effectivePasskeyOrigins(account), remember)
 }
 
 // PostSessionLogout clears the session cookie.

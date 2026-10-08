@@ -33,7 +33,7 @@ Replace the "paste the management key" prompt in the management panel with a nor
    - A "Sign in with passkey" button when the origin supports it. It uses discoverable credentials, so there is no username typing.
    - A small "Use management key instead" link.
    - The API-base field stays, collapsed under "Advanced", for pointing the panel at another server.
-4. **Staying logged in.** A session lasts 30 days and slides forward on every use, so a device that opens the panel at least monthly never sees the login screen again. It survives proxy restarts and redeploys.
+4. **Staying logged in.** A session lasts 30 days and slides forward on every use, so a device that opens the panel at least monthly never sees the login screen again. It survives proxy restarts and redeploys. A "Remember me" checkbox on the login form (checked by default) controls this: unchecking it asks for a short-lived "browser session" instead (see Sessions below).
 
 ## Backend design (CLIProxyAPI)
 
@@ -86,11 +86,16 @@ With the sidecar, only the `/account` API reads or writes the account. Config en
   - The payload holds the issued-at time, the expiry, and the login method (password, passkey or key).
   - The HMAC key is `session-secret`.
   - Because the token is stateless, no server-side store is needed and restarts don't log anyone out.
-- **Lifetime:** 30 days, sliding. When less than half the lifetime remains, the middleware reissues the token: it sets a fresh cookie, or returns the new value in the `X-CPA-Session-Refresh` header for bearer clients.
+- **Lifetime:** 30 days, sliding, when the caller is remembered (see "Remember me" below). When less than half the lifetime remains, the middleware reissues the token: it sets a fresh cookie, or returns the new value in the `X-CPA-Session-Refresh` header for bearer clients.
+- **"Remember me":** `POST login` and `POST passkey/finish` accept an optional JSON boolean `remember` in the request body.
+  - Absent => `true`, i.e. exactly today's behavior. This matters for compatibility: an old panel build that never sends the field, and any deploy ordering where the proxy ships before the panel (or vice versa), must keep working unchanged.
+  - Explicit `false` => a "browser session": the token's lifetime is `BrowserSessionLifetime` (12 hours, named constant in `internal/mgmtauth/token.go`) instead of the 30-day `DefaultLifetime`, it still slides (refresh below half its own lifetime, i.e. under 6h remaining), and its cookie carries no `Max-Age`/`Expires` attribute at all, so the browser drops it when it closes.
+  - The choice is carried inside the signed token claims (not re-derived per request), so sliding refresh preserves it automatically: refreshing a `remember=false` token re-issues another `remember=false`, 12-hour token with no Max-Age, and a token without the claim at all -- every token minted before this field existed -- decodes as `remember=true` and refreshes as a normal 30-day session. The session response (see Routes below) may additionally echo `"remember": <bool>` for the caller's own convenience; it is informational only, the claim inside the token is authoritative.
+  - An authenticated action that issues a fresh session in response to something other than a login (today, only a password change via `PUT /account`) carries over the remember flag of the session that authorized it; a management-key-authenticated request (which has no remember concept) defaults to `true`, unchanged from before this field existed.
 - **Cookie:**
   - Name `cpa_mgmt_session`, attributes `HttpOnly`, `SameSite=Strict`, `Path=/v8/management`. The panel only calls v8, and the narrower path keeps the cookie off ordinary proxy requests and out of their request logs. `Cookie`/`Set-Cookie` are also masked in request logging.
   - `Secure` is set when the request is HTTPS: direct TLS, `X-Forwarded-Proto: https` from a trusted proxy, or an `Origin` header with the `https` scheme. The last case matters on cakebox, where `tailscale serve` terminates TLS in front of an nginx that forwards `X-Forwarded-Proto: http`.
-  - Max-Age matches the token expiry.
+  - Max-Age matches the token expiry when remembered; omitted entirely (a session cookie) when not.
 - **Bearer fallback:** login returns the same token in the response body. The panel uses it as `Authorization: Bearer cpas_...` when its API base is cross-origin. Same-origin panels ignore the body value and rely on the cookie.
 - **CSRF guard:** applies only to cookie-authenticated requests whose method is not GET, HEAD or OPTIONS.
   - The request must carry `Sec-Fetch-Site: same-origin`.
@@ -108,16 +113,16 @@ Session auth obeys the same remote predicate as key auth (`local || allow-remote
 
 ### Routes
 
-This is the exact contract the panel codes against. All bodies are JSON. Errors are `{"error": "<message>"}` with a meaningful status. A "session response" means: set the `cpa_mgmt_session` cookie and return `{"token": "cpas_...", "expires_at": "<RFC3339>"}`.
+This is the exact contract the panel codes against. All bodies are JSON. Errors are `{"error": "<message>"}` with a meaningful status. A "session response" means: set the `cpa_mgmt_session` cookie (with a Max-Age when remembered, without one otherwise) and return `{"token": "cpas_...", "expires_at": "<RFC3339>", "remember": bool}`. `remember` in the response body is additive/informational; `expires_at` already reflects it (30 days out vs. 12 hours out).
 
 Public, under `/v8/management/session/`. No key is required, but they still return 404 when management is unavailable (same availability rule as the rest of `/v8/management`):
 
 | Route | Request | Response |
 |---|---|---|
 | `GET status` | none | `200 {"account": bool, "authenticated": bool, "method": "password"\|"passkey"\|"key"\|"", "passkeys_available": bool, "passkey_origins": [..]}`. `account` = a username and password hash exist. `authenticated` = a valid session cookie/bearer token, or a valid management key, came with the request. `passkeys_available` = rp-id set and at least one passkey registered. |
-| `POST login` | `{"username", "password"}` | `200` session response. `401` wrong credentials, `409` no account, `429 {"error", "retry_after": seconds}` when throttled |
+| `POST login` | `{"username", "password", "remember"?}` | `200` session response. `401` wrong credentials, `409` no account, `429 {"error", "retry_after": seconds}` when throttled. `remember` absent => `true` (today's behavior); `false` mints a 12h browser-session token/cookie instead of the 30-day default |
 | `POST passkey/begin` | none | `200 {"ceremony_id": "...", "options": <go-webauthn protocol.CredentialAssertion JSON, i.e. {"publicKey": {...}}>}`. Discoverable login: no allowCredentials. `409` when passkeys are unavailable |
-| `POST passkey/finish` | `{"ceremony_id", "credential": <PublicKeyCredential JSON as produced by credential.toJSON()>}` | `200` session response, `401` on failure. The ceremony is single-use either way |
+| `POST passkey/finish` | `{"ceremony_id", "credential": <PublicKeyCredential JSON as produced by credential.toJSON()>, "remember"?}` | `200` session response, `401` on failure. The ceremony is single-use either way. `remember` has the same absent=true/false=browser-session semantics as `POST login` |
 | `POST logout` | none | `204`; clears the cookie (Max-Age=0) |
 
 Authenticated (key or session), under `/v8/management/account`:
@@ -207,11 +212,13 @@ Panel cookie vs bearer mode: the panel uses cookie mode when its API base has th
 - **`mgmtauth` unit tests:**
   - Password hash and verify round-trip.
   - Token sign/verify, expiry, sliding refresh and secret rotation, all with a mock clock and no `time.Sleep`.
+  - `remember`: a token issued with `remember=false` decodes with `Claims.Remember == false` and `LifetimeFor(false) == BrowserSessionLifetime`; a hand-crafted legacy payload with no `eph` field decodes as `Remember == true`, proving the decode path (not just a round-trip through `IssueToken`, which can't distinguish "never had the field" from "had it and it was false").
   - Throttle delays.
   - Challenge single-use and TTL.
 - **Handler tests:**
   - Login success and failure.
   - Cookie attributes (Secure only on HTTPS).
+  - `remember`: absent => 30-day expiry and a cookie with a Max-Age; explicit `false` => 12h expiry and a cookie with no Max-Age/Expires; the sliding refresh of a `remember=false` session (cookie and bearer) keeps it at 12h with no Max-Age; a hand-crafted legacy cookie token (no claim) refreshes as remembered; `POST passkey/finish` honors `remember` the same way `POST login` does.
   - The CSRF guard rejects a cross-site POST that carries a valid cookie.
   - A bearer token works cross-origin.
   - Key auth is unchanged.

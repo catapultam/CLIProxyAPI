@@ -1,6 +1,8 @@
 package mgmtauth
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -9,7 +11,7 @@ func TestIssueAndVerifyToken(t *testing.T) {
 	secret := []byte("super-secret-session-key")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
-	token, expiresAt, err := IssueToken(secret, MethodPassword, now, DefaultLifetime)
+	token, expiresAt, err := IssueToken(secret, MethodPassword, now, DefaultLifetime, true)
 	if err != nil {
 		t.Fatalf("IssueToken: %v", err)
 	}
@@ -24,6 +26,9 @@ func TestIssueAndVerifyToken(t *testing.T) {
 	if claims.Method != MethodPassword {
 		t.Fatalf("Method = %q, want %q", claims.Method, MethodPassword)
 	}
+	if !claims.Remember {
+		t.Fatal("expected Remember to be true for a token issued with remember=true")
+	}
 	if !claims.IssuedAt.Equal(now) {
 		t.Fatalf("IssuedAt = %v, want %v", claims.IssuedAt, now)
 	}
@@ -32,9 +37,80 @@ func TestIssueAndVerifyToken(t *testing.T) {
 	}
 }
 
+// TestIssueAndVerifyTokenNotRemembered exercises the remember=false path:
+// the claim round-trips, and LifetimeFor picks BrowserSessionLifetime.
+func TestIssueAndVerifyTokenNotRemembered(t *testing.T) {
+	secret := []byte("super-secret-session-key")
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	token, expiresAt, err := IssueToken(secret, MethodPassword, now, LifetimeFor(false), false)
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
+	if expiresAt != now.Add(BrowserSessionLifetime) {
+		t.Fatalf("expiresAt = %v, want %v", expiresAt, now.Add(BrowserSessionLifetime))
+	}
+
+	claims, err := VerifyToken(secret, token, now)
+	if err != nil {
+		t.Fatalf("VerifyToken: %v", err)
+	}
+	if claims.Remember {
+		t.Fatal("expected Remember to be false for a token issued with remember=false")
+	}
+}
+
+// TestLegacyTokenWithoutEphemeralFieldIsRemembered hand-crafts a token with
+// the pre-"remember me" payload shape (no "eph" field at all) and asserts
+// it decodes as remembered. This is the compatibility guarantee: every
+// token minted before this feature existed must keep behaving as a 30-day
+// remembered session, and a round-trip through IssueToken(..., true) would
+// produce a byte-identical payload to a token issued with remember=false in
+// the degenerate case of the field being omitted either way -- so this test
+// deliberately bypasses IssueToken and constructs the legacy JSON shape by
+// hand to prove the decode path, not just the encode path.
+func TestLegacyTokenWithoutEphemeralFieldIsRemembered(t *testing.T) {
+	secret := []byte("super-secret-session-key")
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(DefaultLifetime)
+
+	legacyPayload := struct {
+		IssuedAt  int64  `json:"iat"`
+		ExpiresAt int64  `json:"exp"`
+		Method    Method `json:"m"`
+	}{IssuedAt: now.Unix(), ExpiresAt: expiresAt.Unix(), Method: MethodPassword}
+	raw, err := json.Marshal(legacyPayload)
+	if err != nil {
+		t.Fatalf("marshal legacy payload: %v", err)
+	}
+	payloadB64 := base64.RawURLEncoding.EncodeToString(raw)
+	sig := signPayload(secret, payloadB64)
+	token := TokenPrefix + payloadB64 + "." + base64.RawURLEncoding.EncodeToString(sig)
+
+	claims, err := VerifyToken(secret, token, now)
+	if err != nil {
+		t.Fatalf("VerifyToken: %v", err)
+	}
+	if !claims.Remember {
+		t.Fatal("expected a legacy token without the ephemeral field to decode as remembered")
+	}
+	if claims.Method != MethodPassword {
+		t.Fatalf("Method = %q, want %q", claims.Method, MethodPassword)
+	}
+}
+
+func TestLifetimeFor(t *testing.T) {
+	if got := LifetimeFor(true); got != DefaultLifetime {
+		t.Fatalf("LifetimeFor(true) = %v, want %v", got, DefaultLifetime)
+	}
+	if got := LifetimeFor(false); got != BrowserSessionLifetime {
+		t.Fatalf("LifetimeFor(false) = %v, want %v", got, BrowserSessionLifetime)
+	}
+}
+
 func TestVerifyTokenWrongSecret(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	token, _, err := IssueToken([]byte("secret-a"), MethodPassword, now, DefaultLifetime)
+	token, _, err := IssueToken([]byte("secret-a"), MethodPassword, now, DefaultLifetime, true)
 	if err != nil {
 		t.Fatalf("IssueToken: %v", err)
 	}
@@ -46,7 +122,7 @@ func TestVerifyTokenWrongSecret(t *testing.T) {
 func TestVerifyTokenExpired(t *testing.T) {
 	secret := []byte("super-secret-session-key")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	token, expiresAt, err := IssueToken(secret, MethodPasskey, now, time.Hour)
+	token, expiresAt, err := IssueToken(secret, MethodPasskey, now, time.Hour, true)
 	if err != nil {
 		t.Fatalf("IssueToken: %v", err)
 	}
@@ -79,7 +155,7 @@ func TestShouldRefresh(t *testing.T) {
 	secret := []byte("super-secret-session-key")
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	lifetime := 30 * 24 * time.Hour
-	token, _, err := IssueToken(secret, MethodPassword, now, lifetime)
+	token, _, err := IssueToken(secret, MethodPassword, now, lifetime, true)
 	if err != nil {
 		t.Fatalf("IssueToken: %v", err)
 	}
@@ -106,7 +182,7 @@ func TestSessionSecretRotationInvalidatesOldTokens(t *testing.T) {
 	oldSecret := []byte("old-secret")
 	newSecret := []byte("new-secret")
 
-	oldToken, _, err := IssueToken(oldSecret, MethodPassword, now, DefaultLifetime)
+	oldToken, _, err := IssueToken(oldSecret, MethodPassword, now, DefaultLifetime, true)
 	if err != nil {
 		t.Fatalf("IssueToken: %v", err)
 	}
@@ -118,7 +194,7 @@ func TestSessionSecretRotationInvalidatesOldTokens(t *testing.T) {
 		t.Fatalf("expected old token to be rejected after rotation, got %v", err)
 	}
 
-	newToken, _, err := IssueToken(newSecret, MethodPassword, now, DefaultLifetime)
+	newToken, _, err := IssueToken(newSecret, MethodPassword, now, DefaultLifetime, true)
 	if err != nil {
 		t.Fatalf("IssueToken: %v", err)
 	}

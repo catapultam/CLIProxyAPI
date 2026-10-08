@@ -79,6 +79,26 @@ func resolvedSessionMethod(c *gin.Context) mgmtauth.Method {
 	return mgmtauth.MethodPassword
 }
 
+// resolvedSessionRemember picks the remember flag a freshly issued session
+// (in response to an authenticated account action, e.g. a password change)
+// should carry: the authenticating session's own remember claim when the
+// request was session-authenticated, or true -- the only sensible default,
+// and the historical behavior -- for a management-key-authenticated
+// request, which has no remember concept at all. Without this, a
+// remember=false (browser-session) caller who changes their password would
+// be silently upgraded to a persistent 30-day session.
+func resolvedSessionRemember(c *gin.Context) bool {
+	if c.GetString(AuthMethodContextKey) != AuthMethodSession {
+		return true
+	}
+	if v, ok := c.Get(SessionRememberContextKey); ok {
+		if remember, ok := v.(bool); ok {
+			return remember
+		}
+	}
+	return true
+}
+
 // bindOptionalJSON decodes body's JSON into dst, tolerating a completely
 // empty request body (treated as leaving dst at its zero value): callers
 // authenticated via the management key legitimately send no body at all to
@@ -240,7 +260,7 @@ func (h *Handler) PutAccount(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "session secret is not configured"})
 		return
 	}
-	h.issueSessionResponse(c, http.StatusOK, secret, resolvedSessionMethod(c), effectivePasskeyOrigins(next))
+	h.issueSessionResponse(c, http.StatusOK, secret, resolvedSessionMethod(c), effectivePasskeyOrigins(next), resolvedSessionRemember(c))
 }
 
 // PutAccountPasskeySettings updates the WebAuthn relying party id/origins.
