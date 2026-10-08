@@ -108,7 +108,7 @@ func TestNextResetRebindMovesTowardSmallerAccountWithLaterActualReset(t *testing
 	b := sized(claudeAuth("b", 20, 10*time.Hour), "90")
 	a := sized(claudeAuth("a", 20, 30*time.Hour), "10")
 	// The size bias' basis (largest known size among every tracked account
-	// of the provider; see nextResetProviderMaxSize) needs a manager that
+	// of the provider; see nextResetSizeBasisByProvider) needs a manager that
 	// tracks both a and b -- f.nr otherwise has no manager reference.
 	m := NewManager(nil, f.nr, nil)
 	for _, auth := range []*Auth{a, b} {
@@ -150,7 +150,7 @@ func TestNextResetRebindMovesTowardSmallerAccountWithLaterActualReset(t *testing
 func TestNextResetRebindStableBasisAcrossProviderDoesNotPingPong(t *testing.T) {
 	// S (size 1, resets 30h), M (size 2, resets 20h), L (size 3, resets 5h).
 	// The basis is the largest known size among every tracked account of the
-	// provider (see nextResetProviderMaxSize), not just the Ready ones a
+	// provider (see nextResetSizeBasisByProvider), not just the Ready ones a
 	// single pick ranks, so it stays 3 whether or not L is currently Ready:
 	// M (2 < 3) and S (1 < 3) always shift 24h earlier, and M's shifted
 	// reset (20h-24h) always beats S's (30h-24h), so a session on M never

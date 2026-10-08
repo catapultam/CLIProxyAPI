@@ -55,7 +55,7 @@ type nextResetAssessment struct {
 	// effectiveWeeklyResetsAt is weeklyResetsAt shifted 24h earlier when this
 	// credential's size is known and smaller than the largest known size
 	// among every tracked account of its provider, not just the ones this
-	// pick ranks (see nextResetProviderMaxSize and
+	// pick ranks (see nextResetSizeBasisByProvider and
 	// nextResetApplyEffectiveResets). It drives ranking step (b) and the
 	// rebind "which account resets first" comparison; real time-to-reset math
 	// (the move cost allowance) must keep using weeklyResetsAt. Populated by
@@ -87,14 +87,15 @@ type NextResetSelector struct {
 	// moves (see selector_next_reset_rebind.go).
 	rebind *nextResetRebindTracker
 	// manager is a handle back to the Manager whose selector this is, so
-	// providerMaxSize can read every tracked account of a provider (see
-	// nextResetProviderMaxSize), not just the ones a single Pick call ranks.
-	// The selector is otherwise built with no manager reference (see
+	// sizeBasis can read every tracked account of every provider (see
+	// nextResetSizeBasisByProvider), not just the ones a single Pick call
+	// ranks. The selector is otherwise built with no manager reference (see
 	// newRoutingSelector in sdk/cliproxy/service_config.go); NewManager and
 	// SetSelector wire it in via wireNextResetSelectorManager. It is nil in
 	// unit tests that construct a NextResetSelector directly, in which case
-	// providerMaxSize reports unknown. atomic.Pointer makes a concurrent
-	// SetSelector (config reload) race-free against in-flight Pick calls.
+	// sizeBasis reports an empty map (every lookup unknown). atomic.Pointer
+	// makes a concurrent SetSelector (config reload) race-free against
+	// in-flight Pick calls.
 	manager atomic.Pointer[Manager]
 }
 
@@ -216,8 +217,13 @@ func (s *NextResetSelector) rank(ctx context.Context, provider, model string, au
 	for _, auth := range available {
 		ranked = append(ranked, s.assess(auth, model, now))
 	}
-	maxSize, maxKnown := s.providerMaxSize(provider)
-	sortNextReset(ranked, maxSize, maxKnown)
+	// The basis is keyed by each credential's own provider (see
+	// nextResetSizeBasisByProvider), not by the provider argument above:
+	// "mixed"-provider routing (pickNextMixedLegacy) can rank claude and
+	// codex credentials together under one Pick call with provider="mixed",
+	// and every credential must still be judged against its own provider's
+	// largest known size, not against a basis that never matches "mixed".
+	sortNextReset(ranked, s.sizeBasis())
 	return ranked, nil
 }
 
@@ -302,46 +308,74 @@ func nextResetExhausted(w nextResetWindow, now time.Time) bool {
 	return w.Rejected || w.UsedPct >= 100
 }
 
-// nextResetProviderMaxSize returns the largest known size among every
-// tracked, non-disabled credential of provider that m knows about --
-// claude or codex OAuth accounts per nextResetTracked, filtered by provider
-// the same way PooledUsageForProvider is, mirroring the Disabled/Status/
-// nextResetTracked filter pooledUsage uses for its Accounts count. This is
-// deliberately broader than a single rank() call's candidates: it covers
-// every tracked account regardless of tier, readiness, or priority bucket,
-// so the basis does not shift just because the pool's largest account
-// becomes exhausted or stale in one ranking call (see nextResetEffectiveReset
-// and docs/superpowers/specs/2026-10-03-next-reset-rebind-design.md). m may
-// be nil -- a NextResetSelector built without one, as unit tests do -- in
-// which case this reports unknown, same as "no accounts have a known size".
-// m.List() takes its own lock and clones each entry, so this is race-free
-// and adds no locking of its own; a pool is well under 20 accounts, so a
-// full scan per pick is cheap.
-func nextResetProviderMaxSize(m *Manager, provider string) (maxSize float64, known bool) {
+// nextResetSizeBasis is the largest known size among every tracked,
+// non-disabled account of one provider (see nextResetSizeBasisByProvider).
+type nextResetSizeBasis struct {
+	maxSize float64
+	known   bool
+}
+
+// nextResetSizeBasisByProvider returns, for every provider among m's
+// tracked accounts, the largest known size among them: claude or codex
+// OAuth accounts per nextResetTracked, not disabled, mirroring the
+// Disabled/Status/nextResetTracked filter pooledUsage uses for its Accounts
+// count -- regardless of tier, readiness, or priority bucket, so the basis
+// does not shift just because the pool's largest account becomes exhausted
+// or stale in one ranking call (see nextResetEffectiveReset and
+// docs/superpowers/specs/2026-10-03-next-reset-rebind-design.md).
+//
+// It is keyed by each account's own provider rather than taking a single
+// provider argument, because next-reset's own Pick/rank calls can be made
+// under a single "mixed" provider label (pickNextMixedLegacy, multi-provider
+// routing) that ranks claude and codex credentials together; a credential's
+// shift must still be judged against its own provider's accounts, not
+// against a basis that would never match "mixed".
+//
+// m may be nil -- a NextResetSelector built without one, as unit tests do
+// -- in which case the map is empty and every lookup (see
+// nextResetSizeBasisFor) reports unknown. m.List() takes its own lock and
+// clones each entry, so this is race-free and adds no locking of its own;
+// a pool is well under 20 accounts, so a full scan per pick is cheap.
+func nextResetSizeBasisByProvider(m *Manager) map[string]nextResetSizeBasis {
+	basis := make(map[string]nextResetSizeBasis)
 	if m == nil {
-		return 0, false
+		return basis
 	}
 	for _, auth := range m.List() {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !nextResetTracked(auth) {
 			continue
 		}
-		if !strings.EqualFold(auth.Provider, provider) {
+		size, ok := authSize(auth)
+		if !ok {
 			continue
 		}
-		if size, ok := authSize(auth); ok && (!known || size > maxSize) {
-			maxSize, known = size, true
+		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if b := basis[provider]; !b.known || size > b.maxSize {
+			basis[provider] = nextResetSizeBasis{maxSize: size, known: true}
 		}
 	}
-	return maxSize, known
+	return basis
 }
 
-// providerMaxSize is nextResetProviderMaxSize scoped to this selector's
-// manager (see the manager field), or unknown when none is wired.
-func (s *NextResetSelector) providerMaxSize(provider string) (float64, bool) {
-	if s == nil {
+// nextResetSizeBasisFor looks up provider's basis in basis (as returned by
+// nextResetSizeBasisByProvider), reporting unknown when the provider has no
+// entry (no tracked account of that provider had a known size, or basis is
+// nil/empty).
+func nextResetSizeBasisFor(basis map[string]nextResetSizeBasis, provider string) (float64, bool) {
+	b, ok := basis[strings.ToLower(strings.TrimSpace(provider))]
+	if !ok {
 		return 0, false
 	}
-	return nextResetProviderMaxSize(s.manager.Load(), provider)
+	return b.maxSize, b.known
+}
+
+// sizeBasis is nextResetSizeBasisByProvider scoped to this selector's
+// manager (see the manager field), or an empty map when none is wired.
+func (s *NextResetSelector) sizeBasis() map[string]nextResetSizeBasis {
+	if s == nil {
+		return nil
+	}
+	return nextResetSizeBasisByProvider(s.manager.Load())
 }
 
 // nextResetSelectorFor unwraps selector to the *NextResetSelector it holds,
@@ -375,8 +409,8 @@ func wireNextResetSelectorManager(selector Selector, m *Manager) {
 // nextResetEffectiveReset biases smaller accounts to be spent first: it
 // shifts resetsAt nextResetSizeBiasShift earlier when auth's size is known
 // and strictly smaller than maxSize (the largest known size among every
-// tracked account of auth's provider; see nextResetProviderMaxSize), and
-// leaves resetsAt unchanged otherwise (unknown size, size equal to the
+// tracked account of auth's own provider; see nextResetSizeBasisByProvider),
+// and leaves resetsAt unchanged otherwise (unknown size, size equal to the
 // largest, or no known size at all for the provider). Every smaller account
 // gets the same flat shift regardless of how much smaller it is.
 func nextResetEffectiveReset(auth *Auth, resetsAt time.Time, maxSize float64, maxKnown bool) time.Time {
@@ -391,16 +425,19 @@ func nextResetEffectiveReset(auth *Auth, resetsAt time.Time, maxSize float64, ma
 }
 
 // nextResetApplyEffectiveResets fills in effectiveWeeklyResetsAt for every
-// Ready assessment in as, from the maxSize/maxKnown basis the caller
-// computed once (see nextResetProviderMaxSize). Non-Ready assessments are
-// left with their weekly reset unchanged since ranking never compares them
-// on reset time.
-func nextResetApplyEffectiveResets(as []nextResetAssessment, maxSize float64, maxKnown bool) {
+// Ready assessment in as. basis (see nextResetSizeBasisByProvider) is
+// computed once per rank/move call; each assessment looks up its own
+// auth's provider in it (see nextResetSizeBasisFor), since as can mix
+// providers under "mixed"-provider routing. Non-Ready assessments are left
+// with their weekly reset unchanged since ranking never compares them on
+// reset time.
+func nextResetApplyEffectiveResets(as []nextResetAssessment, basis map[string]nextResetSizeBasis) {
 	for i := range as {
 		if as[i].tier != nextResetReady {
 			as[i].effectiveWeeklyResetsAt = as[i].weeklyResetsAt
 			continue
 		}
+		maxSize, maxKnown := nextResetSizeBasisFor(basis, as[i].auth.Provider)
 		as[i].effectiveWeeklyResetsAt = nextResetEffectiveReset(as[i].auth, as[i].weeklyResetsAt, maxSize, maxKnown)
 	}
 }
@@ -411,14 +448,14 @@ func nextResetApplyEffectiveResets(as []nextResetAssessment, maxSize float64, ma
 // earlier *effective* weekly reset first, spending the quota closest to
 // being lost first, where the effective reset is 24h earlier than the real
 // one for a credential whose known size is smaller than maxSize, the largest
-// known size among every tracked account of the provider (see
-// nextResetEffectiveReset and nextResetProviderMaxSize) -- this is the
-// smaller-accounts-first bias, layered on top of earliest-deadline-first
+// known size among every tracked account of that credential's own provider
+// (see nextResetEffectiveReset and nextResetSizeBasisByProvider) -- this is
+// the smaller-accounts-first bias, layered on top of earliest-deadline-first
 // ranking; (c) lower weekly used percent first; and finally (d) auth ID, for
 // a deterministic order. Near-full credentials are only pushed to the back
 // as a group: their relative order still follows (b)-(d).
-func sortNextReset(as []nextResetAssessment, maxSize float64, maxKnown bool) {
-	nextResetApplyEffectiveResets(as, maxSize, maxKnown)
+func sortNextReset(as []nextResetAssessment, basis map[string]nextResetSizeBasis) {
+	nextResetApplyEffectiveResets(as, basis)
 	sort.SliceStable(as, func(i, j int) bool {
 		x, y := as[i], as[j]
 		if x.tier != y.tier {

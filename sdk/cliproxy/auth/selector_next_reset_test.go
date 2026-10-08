@@ -71,15 +71,11 @@ func codexAuth(id string, weeklyUsed float64, weeklyResetIn time.Duration) *Auth
 
 func nrPick(t *testing.T, s *NextResetSelector, model string, auths ...*Auth) *Auth {
 	t.Helper()
-	// The provider argument is otherwise only used for error/log labeling and
-	// (see nextResetProviderMaxSize) the size-bias basis, so inferring it
-	// from the first candidate is enough for these single-provider fixtures;
-	// no test here mixes claude and codex auths in one call.
-	provider := ""
-	if len(auths) > 0 && auths[0] != nil {
-		provider = auths[0].Provider
-	}
-	got, err := s.Pick(context.Background(), provider, model, cliproxyexecutor.Options{}, auths)
+	// The size-bias basis (see nextResetSizeBasisByProvider) is keyed by
+	// each candidate's own auth.Provider, not by this provider argument
+	// (which can be "mixed" under multi-provider routing in production), so
+	// "" is fine here: it is otherwise only used for error/log labeling.
+	got, err := s.Pick(context.Background(), "", model, cliproxyexecutor.Options{}, auths)
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
@@ -89,7 +85,7 @@ func nrPick(t *testing.T, s *NextResetSelector, model string, auths ...*Auth) *A
 // nrSelectorTrackingAll returns a next-reset selector wired to a Manager that
 // tracks every one of auths, so the size bias' basis -- the largest known
 // size among every tracked account of the provider, not just the ones a
-// single Pick call ranks (see nextResetProviderMaxSize) -- is known even
+// single Pick call ranks (see nextResetSizeBasisByProvider) -- is known even
 // though these tests call Pick directly instead of going through a Manager.
 func nrSelectorTrackingAll(t *testing.T, auths ...*Auth) *NextResetSelector {
 	t.Helper()
@@ -620,12 +616,33 @@ func TestNextResetSmallerAccountWithResetUpTo24hLaterBeatsLarger(t *testing.T) {
 	// (10) and resets only 10h after a, well inside the 24h flat shift, so
 	// b's effective reset (30h - 24h = 6h) beats a's real 20h. The basis
 	// (largest known size among every tracked account of the provider; see
-	// nextResetProviderMaxSize) needs a manager that tracks both a and b --
+	// nextResetSizeBasisByProvider) needs a manager that tracks both a and b --
 	// a selector with no manager never knows a size is the largest.
 	a := sized(claudeAuth("a", 50, 20*time.Hour), "90")
 	b := sized(claudeAuth("b", 50, 30*time.Hour), "10")
 	if got := nrPick(t, nrSelectorTrackingAll(t, a, b), "claude-sonnet-5-5", a, b); got.ID != "b" {
 		t.Fatalf("got %s, want b (smaller account within the 24h window)", got.ID)
+	}
+}
+
+func TestNextResetMixedProviderPickStillAppliesSizeBias(t *testing.T) {
+	// Production routes some requests through pickNextMixedLegacy, which
+	// calls Pick with provider="mixed" (session-affinity logs show this for
+	// ordinary single-provider claude requests, e.g. "provider=mixed
+	// model=claude-opus-5-5"). The size-bias basis must be keyed by each
+	// credential's own provider (see nextResetSizeBasisByProvider), not by
+	// this provider argument -- otherwise a basis keyed on "mixed" would
+	// never match any account's actual "claude"/"codex" provider and the
+	// shift would silently never apply in production.
+	a := sized(claudeAuth("a", 50, 20*time.Hour), "90")
+	b := sized(claudeAuth("b", 50, 30*time.Hour), "10")
+	s := nrSelectorTrackingAll(t, a, b)
+	got, err := s.Pick(context.Background(), "mixed", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{a, b})
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	if got.ID != "b" {
+		t.Fatalf(`got %s, want b (smaller account within the 24h window, even under provider="mixed")`, got.ID)
 	}
 }
 
