@@ -15,10 +15,12 @@ func withNextReset(t *testing.T) {
 	nextResetEnabled.Store(true)
 	nextResetLatches = &nextResetLatchStore{since: make(map[string]time.Time)}
 	nextResetPolled = newNextResetPolledStore()
+	nextResetPlanSizes = newNextResetPlanSizeStore()
 	t.Cleanup(func() {
 		nextResetEnabled.Store(false)
 		nextResetLatches = &nextResetLatchStore{since: make(map[string]time.Time)}
 		nextResetPolled = newNextResetPolledStore()
+		nextResetPlanSizes = newNextResetPlanSizeStore()
 	})
 }
 
@@ -113,7 +115,11 @@ func TestNextResetPollerPollsLatchedFirstThenEveryDueAccount(t *testing.T) {
 	d := &fakeUsageDoer{status: 200, body: `{"seven_day":{"utilization":4,"resets_at":"2026-10-09T00:00:00Z"}}`}
 	p := newTestPoller([]*Auth{fresh, full}, d)
 	p.runOnce(context.Background(), nrNow.Add(time.Minute))
-	if len(d.calls) != 2 || !strings.HasPrefix(d.calls[0], "z-full https://api.anthropic.com/api/oauth/usage") {
+	// Each Claude account now also makes a plan-size profile request right
+	// after its usage request (see maybeFetchClaudePlanSize), so z-full and
+	// a-fresh each produce two calls here; the usage call still comes first
+	// for each account and z-full (latched) still sorts ahead of a-fresh.
+	if len(d.calls) != 4 || !strings.HasPrefix(d.calls[0], "z-full https://api.anthropic.com/api/oauth/usage") {
 		t.Fatalf("calls = %v", d.calls)
 	}
 	if nextResetIsLatched("z-full") {
@@ -152,6 +158,10 @@ func TestNextResetPollerCadence(t *testing.T) {
 	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Utilization"] = "0.5"
 	d := &fakeUsageDoer{status: 500}
 	p := newTestPoller([]*Auth{a}, d)
+	// fakeUsageDoer answers every URL with the same status, and the usage
+	// poll here always returns 500: maybeFetchClaudePlanSize is now called
+	// only after a 200 from the usage poll (see fetch), so it is never
+	// invoked in this test and every call count below is usage-poll-only.
 	p.runOnce(context.Background(), nrNow) // startup: never polled
 	if len(d.calls) != 1 {
 		t.Fatalf("startup calls = %v", d.calls)
@@ -182,6 +192,7 @@ func TestNextResetStateRoundTrip(t *testing.T) {
 	nextResetPolled.set("a", nextResetSnapshot{Weekly: nextResetWindow{Known: true, UsedPct: 42, ResetsAt: nrNow.Add(time.Hour)}, ObservedAt: nrNow})
 	nextResetPolled.set("old", nextResetSnapshot{ObservedAt: nrNow.Add(-8 * 24 * time.Hour)})
 	nextResetLatches.set("b", nrNow)
+	nextResetPlanSizes.set("c", nextResetPlanSizeEntry{Size: 20, Known: true})
 	if err := saveNextResetState(path); err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +201,7 @@ func TestNextResetStateRoundTrip(t *testing.T) {
 	}
 	nextResetPolled = newNextResetPolledStore()
 	nextResetLatches = &nextResetLatchStore{since: make(map[string]time.Time)}
+	nextResetPlanSizes = newNextResetPlanSizeStore()
 	loadNextResetState(path, nrNow)
 	if snap, ok := nextResetPolled.get("a"); !ok || snap.Weekly.UsedPct != 42 || !snap.Weekly.ResetsAt.Equal(nrNow.Add(time.Hour)) {
 		t.Fatalf("restored a = %+v %v", snap, ok)
@@ -199,6 +211,9 @@ func TestNextResetStateRoundTrip(t *testing.T) {
 	}
 	if !nextResetIsLatched("b") {
 		t.Fatal("latch not restored")
+	}
+	if entry, ok := nextResetPlanSizes.get("c"); !ok || !entry.Known || entry.Size != 20 {
+		t.Fatalf("plan size not restored: %+v %v", entry, ok)
 	}
 	loadNextResetState(t.TempDir()+"/missing.json", nrNow) // must not panic
 }

@@ -376,30 +376,60 @@ func authPriority(auth *Auth) int {
 	return parsed
 }
 
-// authSize returns the credential's hand-set size and whether it is known.
+// authSize returns the credential's effective size and whether it is known.
+// It is authSizeWithSource with the source discarded; see that function for
+// the full precedence.
+func authSize(auth *Auth) (float64, bool) {
+	size, ok, _ := authSizeWithSource(auth)
+	return size, ok
+}
+
+// authSizeWithSource is authSize plus where the value came from, for the
+// next-reset cold-pick log line: "hand" for a hand-set value, "plan" for one
+// derived from the credential's plan, or "" when the size is unknown.
+//
 // The routing attribute (AttributeSize, read from file metadata the same way
 // authPriority reads "priority"; see ApplyAuthSizeMetadata) wins when
-// present: a valid value is known, an invalid one is unknown, period. A
-// missing or empty attribute falls back to auth.Metadata["size"], so a
-// management-panel PATCH -- which writes Metadata as json.Number without
-// touching Attributes -- or a plugin refresh that drops the attribute can
-// still bias next-reset. Both paths share parseSizeValue's validity rules
-// (finite, > 0); NaN and +/-Inf are rejected like any other invalid value.
-func authSize(auth *Auth) (float64, bool) {
+// present: a valid value is known ("hand"), an invalid one is unknown,
+// period -- neither falls through further. A missing or empty attribute
+// falls back to auth.Metadata["size"], so a management-panel PATCH -- which
+// writes Metadata as json.Number without touching Attributes -- or a plugin
+// refresh that drops the attribute can still bias next-reset; it is subject
+// to the same all-or-nothing rule. Both hand-set paths share
+// parseSizeValue's validity rules (finite, > 0); NaN and +/-Inf are rejected
+// like any other invalid value.
+//
+// Only when neither Attributes nor Metadata carries a "size" key at all does
+// the size fall through to planDerivedSize ("plan"): Codex's stored
+// plan_type, or the Claude tier the usage poller last fetched from the
+// profile endpoint (see size_plan.go). The empty string comes back
+// alongside a false ok, since there is then no size to attribute.
+func authSizeWithSource(auth *Auth) (float64, bool, string) {
 	if auth == nil {
-		return 0, false
+		return 0, false, ""
 	}
 	if auth.Attributes != nil {
 		if raw := strings.TrimSpace(auth.Attributes[AttributeSize]); raw != "" {
-			return parseSizeValue(raw)
+			size, ok := parseSizeValue(raw)
+			if !ok {
+				return 0, false, ""
+			}
+			return size, true, "hand"
 		}
 	}
 	if auth.Metadata != nil {
 		if rawSize, ok := auth.Metadata[AttributeSize]; ok {
-			return parseSizeValue(rawSize)
+			size, valid := parseSizeValue(rawSize)
+			if !valid {
+				return 0, false, ""
+			}
+			return size, true, "hand"
 		}
 	}
-	return 0, false
+	if size, ok := planDerivedSize(auth); ok {
+		return size, true, "plan"
+	}
+	return 0, false, ""
 }
 
 func authWeight(auth *Auth) int64 {
