@@ -158,32 +158,30 @@ func TestNextResetPollerCadence(t *testing.T) {
 	a.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Utilization"] = "0.5"
 	d := &fakeUsageDoer{status: 500}
 	p := newTestPoller([]*Auth{a}, d)
-	// This Claude account also gets a plan-size profile request on every
-	// fetch here (see maybeFetchClaudePlanSize): the shared doer answers it
-	// with the same 500, which backs it off for only 5 minutes -- shorter
-	// than every gap below -- so each usage fetch below is paired with one
-	// profile fetch and every call count here is exactly double the
-	// pre-plan-size expectation.
+	// fakeUsageDoer answers every URL with the same status, and the usage
+	// poll here always returns 500: maybeFetchClaudePlanSize is now called
+	// only after a 200 from the usage poll (see fetch), so it is never
+	// invoked in this test and every call count below is usage-poll-only.
 	p.runOnce(context.Background(), nrNow) // startup: never polled
-	if len(d.calls) != 2 {
+	if len(d.calls) != 1 {
 		t.Fatalf("startup calls = %v", d.calls)
 	}
 	p.backoff = map[string]time.Time{}
 	p.runOnce(context.Background(), nrNow.Add(time.Hour))
-	if len(d.calls) != 2 {
+	if len(d.calls) != 1 {
 		t.Fatalf("polled before anything was due: %v", d.calls)
 	}
 	p.runOnce(context.Background(), nrNow.Add(2*time.Hour+time.Minute)) // 5h reset passed
-	if len(d.calls) != 4 {
+	if len(d.calls) != 2 {
 		t.Fatalf("anticipated reset not polled: %v", d.calls)
 	}
 	p.backoff = map[string]time.Time{}
 	p.runOnce(context.Background(), nrNow.Add(4*time.Hour))
-	if len(d.calls) != 4 {
+	if len(d.calls) != 2 {
 		t.Fatalf("polled again inside the routine interval: %v", d.calls)
 	}
 	p.runOnce(context.Background(), nrNow.Add(5*time.Hour+2*time.Minute))
-	if len(d.calls) != 6 {
+	if len(d.calls) != 3 {
 		t.Fatalf("routine 3h poll missing: %v", d.calls)
 	}
 }

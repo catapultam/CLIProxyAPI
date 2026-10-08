@@ -206,6 +206,16 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 		p.store.set(auth.ID, snap)
 		// Re-evaluate now so a confirmed reset releases the latch at once.
 		nextResetBlocked(auth, now)
+		// Codex's size comes straight from its stored plan_type
+		// (codexPlanSize); only Claude needs a second, independently
+		// scheduled request here, and only after this usage poll itself
+		// confirmed the credential is reachable (a 200): a 401/403/429 from
+		// the usage endpoint says nothing about whether the profile request
+		// would succeed, and firing it anyway just burns another request
+		// against a credential already known to be failing.
+		if !codex {
+			p.maybeFetchClaudePlanSize(ctx, auth, now)
+		}
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		setBackoff(nextResetBackoffAuth, fmt.Sprintf("http %d", resp.StatusCode))
 	case resp.StatusCode == http.StatusTooManyRequests:
@@ -216,11 +226,6 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 		setBackoff(d, "http 429")
 	default:
 		setBackoff(nextResetBackoffOther, fmt.Sprintf("http %d", resp.StatusCode))
-	}
-	// Codex's size comes straight from its stored plan_type (codexPlanSize);
-	// only Claude needs a second, independently-scheduled request here.
-	if !codex {
-		p.maybeFetchClaudePlanSize(ctx, auth, now)
 	}
 }
 
@@ -295,14 +300,19 @@ func (p *nextResetPoller) maybeFetchClaudePlanSize(ctx context.Context, auth *Au
 		}
 		nextResetPlanSizes.set(auth.ID, nextResetPlanSizeEntry{Size: size, Known: known})
 		p.setClaudePlanDue(auth.ID, now.Add(nextResetPlanSizeRefreshEvery))
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		backoff(nextResetBackoffAuth, fmt.Sprintf("http %d", resp.StatusCode))
 	case resp.StatusCode == http.StatusTooManyRequests:
 		d := nextResetBackoffLimited
 		if secs, errAtoi := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); errAtoi == nil && time.Duration(secs)*time.Second > d {
 			d = time.Duration(secs) * time.Second
 		}
 		backoff(d, "http 429")
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		// A persistent 4xx other than 429 (401, 403, 404, ...) from the
+		// profile endpoint will not resolve itself on a short retry the way
+		// a transient 429 or 5xx might; recheck on the same cadence as a
+		// routine plan-size refresh instead of hammering it every few
+		// minutes.
+		backoff(nextResetPlanSizeRefreshEvery, fmt.Sprintf("http %d", resp.StatusCode))
 	default:
 		backoff(nextResetBackoffOther, fmt.Sprintf("http %d", resp.StatusCode))
 	}

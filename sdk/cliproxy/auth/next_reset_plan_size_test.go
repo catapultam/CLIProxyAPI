@@ -141,6 +141,80 @@ func TestNextResetPollerFailedPlanSizeFetchKeepsLastKnownValue(t *testing.T) {
 	}
 }
 
+// TestNextResetPollerPlanSizeFetch4xxBacksOff24h covers Fix 4: a persistent
+// 4xx other than 429 from the profile endpoint (404 here) backs the next
+// attempt off by a full nextResetPlanSizeRefreshEvery (24h), the same cadence
+// as a routine refresh, rather than the short nextResetBackoffOther tier a
+// transient failure gets.
+func TestNextResetPollerPlanSizeFetch4xxBacksOff24h(t *testing.T) {
+	withNextReset(t)
+	withPlanSizeStore(t)
+	a := tokenAuth(claudeAuth("plan-404", 10, 100*time.Hour))
+	d := &fakeDualDoer{
+		usageStatus:   200,
+		usageBody:     `{"seven_day":{"utilization":4,"resets_at":"2026-10-09T00:00:00Z"}}`,
+		profileStatus: 404,
+	}
+	p := newPlanSizeTestPoller([]*Auth{a}, d)
+	p.fetch(context.Background(), a, nrNow)
+	if n := profileCalls(d.calls); n != 1 {
+		t.Fatalf("profile fetch did not happen: %v", d.calls)
+	}
+	if p.claudePlanDue(a, nrNow.Add(23*time.Hour)) {
+		t.Fatal("a 404 did not back off the plan-size fetch")
+	}
+	p.fetch(context.Background(), a, nrNow.Add(23*time.Hour))
+	if n := profileCalls(d.calls); n != 1 {
+		t.Fatalf("re-fetched profile inside the 24h 4xx backoff: %v", d.calls)
+	}
+	p.fetch(context.Background(), a, nrNow.Add(24*time.Hour+time.Minute))
+	if n := profileCalls(d.calls); n != 2 {
+		t.Fatalf("did not re-fetch profile after the 24h 4xx backoff: %v", d.calls)
+	}
+}
+
+// TestNextResetPollerPlanSizeFetch5xxBacksOffShort covers Fix 4's other half:
+// a 5xx keeps the short nextResetBackoffOther tier (well under 24h), unlike
+// the 4xx case above.
+func TestNextResetPollerPlanSizeFetch5xxBacksOffShort(t *testing.T) {
+	withNextReset(t)
+	withPlanSizeStore(t)
+	a := tokenAuth(claudeAuth("plan-500", 10, 100*time.Hour))
+	d := &fakeDualDoer{
+		usageStatus:   200,
+		usageBody:     `{"seven_day":{"utilization":4,"resets_at":"2026-10-09T00:00:00Z"}}`,
+		profileStatus: 500,
+	}
+	p := newPlanSizeTestPoller([]*Auth{a}, d)
+	p.fetch(context.Background(), a, nrNow)
+	if n := profileCalls(d.calls); n != 1 {
+		t.Fatalf("profile fetch did not happen: %v", d.calls)
+	}
+	// nextResetBackoffOther is 5 minutes; a 10-minute gap must be due again.
+	p.fetch(context.Background(), a, nrNow.Add(10*time.Minute))
+	if n := profileCalls(d.calls); n != 2 {
+		t.Fatalf("5xx held the long 24h backoff instead of the short tier: %v", d.calls)
+	}
+}
+
+// TestNextResetPollerPlanSizeFetchSkippedWithoutUsage200 covers Fix 3: the
+// profile request is made only after a 200 from the usage poll in the same
+// cycle, never after a 401/403/429 there.
+func TestNextResetPollerPlanSizeFetchSkippedWithoutUsage200(t *testing.T) {
+	withNextReset(t)
+	withPlanSizeStore(t)
+	a := tokenAuth(claudeAuth("plan-no-usage", 10, 100*time.Hour))
+	d := &fakeDualDoer{
+		usageStatus:   http.StatusUnauthorized,
+		profileStatus: 200, profileBody: claudeProfileFixture(false, "claude_team", "default"),
+	}
+	p := newPlanSizeTestPoller([]*Auth{a}, d)
+	p.fetch(context.Background(), a, nrNow)
+	if n := profileCalls(d.calls); n != 0 {
+		t.Fatalf("profile fetched despite a non-200 usage response: %v", d.calls)
+	}
+}
+
 // TestNextResetPollerPlanSizeRequestUsesClaudeHeaders covers "the same
 // Claude headers the usage poll uses": Bearer token, anthropic-beta, and the
 // claude-cli User-Agent, on the profile request specifically.
