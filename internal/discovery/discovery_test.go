@@ -450,6 +450,7 @@ func TestFilterInterfaces_RealMachine(t *testing.T) {
 }
 
 func TestAdvertiser_IdempotenceAndShutdown(t *testing.T) {
+	requireLiveMulticast(t)
 	adv := NewZeroconfAdvertiser()
 
 	// Stopping an unstarted advertiser should be safe
@@ -494,6 +495,7 @@ func TestAdvertiser_IdempotenceAndShutdown(t *testing.T) {
 }
 
 func TestAdvertiserAndBrowser_Integration(t *testing.T) {
+	requireLiveMulticast(t)
 	ifaces, _ := FilterInterfaces(nil, nil)
 	spec := ServiceSpec{
 		InstanceName: "CPA-LiveTest-42",
@@ -541,5 +543,18 @@ func TestAdvertiserAndBrowser_Integration(t *testing.T) {
 
 	if !found {
 		t.Fatalf("advertised instance CPA-LiveTest-42 was not discovered")
+	}
+}
+
+// liveMulticastEnv opts in to the tests that advertise and browse on the real
+// LAN interfaces. They are off by default because on Windows the firewall
+// asks for admin approval of every new test binary that listens on the
+// network, and go test builds discovery.test.exe in a fresh temp path each run.
+const liveMulticastEnv = "CPA_DISCOVERY_LIVE_TESTS"
+
+func requireLiveMulticast(t *testing.T) {
+	t.Helper()
+	if os.Getenv(liveMulticastEnv) != "1" {
+		t.Skipf("live multicast test; set %s=1 to run", liveMulticastEnv)
 	}
 }
