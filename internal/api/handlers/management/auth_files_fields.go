@@ -623,6 +623,9 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots[coreauth.AttributeWeight]; ok {
 		syncAuthFileWeightAttribute(auth)
 	}
+	if _, ok := touchedRoots[coreauth.AttributeSize]; ok {
+		syncAuthFileSizeAttribute(auth)
+	}
 	if _, ok := touchedRoots["note"]; ok {
 		syncAuthFileNoteAttribute(auth)
 	}
@@ -706,6 +709,16 @@ func syncAuthFilePriorityAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes["priority"] = strconv.Itoa(priority)
+}
+
+// syncAuthFileSizeAttribute applies a patched size at once; a removed or
+// invalid size clears the routing attribute.
+func syncAuthFileSizeAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	delete(auth.Attributes, coreauth.AttributeSize)
+	coreauth.ApplyAuthSizeMetadata(auth, auth.Metadata)
 }
 
 func syncAuthFileWeightAttribute(auth *coreauth.Auth) {

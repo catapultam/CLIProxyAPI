@@ -791,3 +791,24 @@ func TestPatchAuthFileFields_IDTokenMissingPlanTypeDefaultsToFree(t *testing.T) 
 		t.Fatalf("auth plan_type attribute = %q, want free", got)
 	}
 }
+
+func TestSyncAuthFileSizeAttributeAppliesAndClears(t *testing.T) {
+	auth := &coreauth.Auth{
+		Attributes: map[string]string{coreauth.AttributeSize: "10"},
+		Metadata:   map[string]any{"size": json.Number("50")},
+	}
+	syncAuthFileMetadataFields(auth, map[string]struct{}{coreauth.AttributeSize: {}})
+	if got := auth.Attributes[coreauth.AttributeSize]; got != "50" {
+		t.Fatalf("patched size attribute = %q, want 50", got)
+	}
+	delete(auth.Metadata, "size")
+	syncAuthFileMetadataFields(auth, map[string]struct{}{coreauth.AttributeSize: {}})
+	if got, ok := auth.Attributes[coreauth.AttributeSize]; ok {
+		t.Fatalf("removed size still set as attribute %q", got)
+	}
+	auth.Metadata["size"] = "NaN"
+	syncAuthFileMetadataFields(auth, map[string]struct{}{coreauth.AttributeSize: {}})
+	if got, ok := auth.Attributes[coreauth.AttributeSize]; ok {
+		t.Fatalf("invalid size set as attribute %q", got)
+	}
+}

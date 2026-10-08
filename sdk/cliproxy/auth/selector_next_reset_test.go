@@ -746,3 +746,17 @@ func TestNextResetColdPickLogsSizeUnknown(t *testing.T) {
 		t.Fatalf("log line missing size=unknown: %q", line)
 	}
 }
+
+func TestNextResetSelectorWiredThroughSessionAffinity(t *testing.T) {
+	nr := nrSelector()
+	m := NewManager(nil, NewSessionAffinitySelector(nr), nil)
+	if got := nr.manager.Load(); got != m {
+		t.Fatalf("NewManager: wrapped next-reset selector manager = %p, want %p", got, m)
+	}
+
+	swapped := nrSelector()
+	m.SetSelector(NewSessionAffinitySelector(swapped))
+	if got := swapped.manager.Load(); got != m {
+		t.Fatalf("SetSelector: wrapped next-reset selector manager = %p, want %p", got, m)
+	}
+}

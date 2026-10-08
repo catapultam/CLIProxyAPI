@@ -422,6 +422,9 @@ func (m *Manager) SetSelector(selector Selector) {
 	m.selectorMu.Lock()
 	defer m.selectorMu.Unlock()
 
+	// Wire before publishing so no Pick sees the new selector without its manager.
+	wireNextResetSelectorManager(selector, m)
+
 	m.mu.Lock()
 	oldSelector := m.selector
 	if isSameSelector(oldSelector, selector) {
@@ -430,8 +433,6 @@ func (m *Manager) SetSelector(selector Selector) {
 	}
 	m.selector = selector
 	m.mu.Unlock()
-
-	wireNextResetSelectorManager(selector, m)
 
 	if oldSelector != nil {
 		if stoppable, ok := oldSelector.(StoppableSelector); ok {
