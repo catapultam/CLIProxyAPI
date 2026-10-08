@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"strconv"
 	"testing"
 	"time"
 )
@@ -127,5 +128,74 @@ func TestSummarizeModelQuotaUnavailability_NoCandidatesNotApplicable(t *testing.
 	summary := m.SummarizeModelQuotaUnavailability("claude", "claude-opus-5-5", time.Now())
 	if summary.Applicable {
 		t.Fatalf("summary = %+v, want Applicable=false with no candidates", summary)
+	}
+}
+
+func TestSummarizeModelQuotaUnavailability_CodexWindowMinutesFromPrimarySignal(t *testing.T) {
+	now := time.Now()
+	resetAt := now.Add(90 * time.Minute)
+	codexAuth := &Auth{ID: "a", Provider: "codex", Quota: QuotaState{
+		Exceeded: true, Reason: "credential_quota", NextRecoverAt: resetAt,
+		ObservedAt: now,
+		Signals: map[string]string{
+			"X-Codex-Primary-Window-Minutes": "300",
+			"X-Codex-Primary-Reset-At":       strconv.FormatInt(resetAt.Unix(), 10),
+		},
+	}}
+	m := newQuotaSummaryTestManager(codexAuth)
+
+	summary := m.SummarizeModelQuotaUnavailability("codex", "gpt-5-codex", now)
+	if !summary.Applicable || !summary.AllQuotaCooldown {
+		t.Fatalf("summary = %+v, want Applicable and AllQuotaCooldown", summary)
+	}
+	if summary.WindowMinutes != 300 {
+		t.Fatalf("WindowMinutes = %d, want 300 (matched via Primary-Reset-At)", summary.WindowMinutes)
+	}
+}
+
+func TestSummarizeModelQuotaUnavailability_CodexWindowMinutesFromSecondaryResetAfterSeconds(t *testing.T) {
+	now := time.Now()
+	resetAt := now.Add(6 * 24 * time.Hour)
+	codexAuth := &Auth{ID: "a", Provider: "codex", Quota: QuotaState{
+		Exceeded: true, Reason: "credential_quota", NextRecoverAt: resetAt,
+		ObservedAt: now,
+		Signals: map[string]string{
+			"X-Codex-Primary-Window-Minutes":        "300",
+			"X-Codex-Primary-Reset-After-Seconds":   "60",
+			"X-Codex-Secondary-Window-Minutes":      "10080",
+			"X-Codex-Secondary-Reset-After-Seconds": strconv.FormatInt(int64(resetAt.Sub(now).Seconds()), 10),
+		},
+	}}
+	m := newQuotaSummaryTestManager(codexAuth)
+
+	summary := m.SummarizeModelQuotaUnavailability("codex", "gpt-5-codex", now)
+	if !summary.AllQuotaCooldown {
+		t.Fatalf("summary = %+v, want AllQuotaCooldown", summary)
+	}
+	if summary.WindowMinutes != 10080 {
+		t.Fatalf("WindowMinutes = %d, want 10080 (matched via Secondary-Reset-After-Seconds)", summary.WindowMinutes)
+	}
+}
+
+func TestSummarizeModelQuotaUnavailability_CodexWindowMinutesUnknownWhenSignalsDoNotMatch(t *testing.T) {
+	now := time.Now()
+	codexAuth := &Auth{ID: "a", Provider: "codex", Quota: QuotaState{
+		Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(2 * time.Hour),
+		ObservedAt: now,
+		Signals: map[string]string{
+			// Stale signal: window-minutes is known but its own reset time is far
+			// from NextRecoverAt, so it must not be attributed to this cooldown.
+			"X-Codex-Primary-Window-Minutes": "300",
+			"X-Codex-Primary-Reset-At":       strconv.FormatInt(now.Add(5*time.Minute).Unix(), 10),
+		},
+	}}
+	m := newQuotaSummaryTestManager(codexAuth)
+
+	summary := m.SummarizeModelQuotaUnavailability("codex", "gpt-5-codex", now)
+	if !summary.AllQuotaCooldown {
+		t.Fatalf("summary = %+v, want AllQuotaCooldown", summary)
+	}
+	if summary.WindowMinutes != 0 {
+		t.Fatalf("WindowMinutes = %d, want 0 (no signal window matches the cooldown reset)", summary.WindowMinutes)
 	}
 }

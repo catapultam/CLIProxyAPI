@@ -645,6 +645,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "responses/compact")
 	stopKeepAlive()
 	if errMsg != nil {
+		errMsg = h.rewriteQuotaExhaustedError(modelName, errMsg)
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -671,6 +672,7 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	stopKeepAlive()
 	if errMsg != nil {
+		errMsg = h.rewriteQuotaExhaustedError(modelName, errMsg)
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -731,6 +733,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				errChan = nil
 				continue
 			}
+			errMsg = h.rewriteQuotaExhaustedError(modelName, errMsg)
 			framer.Flush(&initialOutput)
 			safeErrMsg := sanitizeResponsesStreamErrorMessage(errMsg)
 			if framer.dataFrames == 0 {
@@ -767,6 +770,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 					}
 					errMsg = &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("%s", message)}
 				}
+				errMsg = h.rewriteQuotaExhaustedError(modelName, errMsg)
 				if framer.dataFrames > 0 {
 					errMsg = sanitizeResponsesStreamErrorMessage(errMsg)
 				} else {
