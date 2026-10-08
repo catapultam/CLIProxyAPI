@@ -431,6 +431,8 @@ func (m *Manager) SetSelector(selector Selector) {
 	m.selector = selector
 	m.mu.Unlock()
 
+	wireNextResetSelectorManager(selector, m)
+
 	if oldSelector != nil {
 		if stoppable, ok := oldSelector.(StoppableSelector); ok {
 			stoppable.Stop()

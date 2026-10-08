@@ -71,11 +71,36 @@ func codexAuth(id string, weeklyUsed float64, weeklyResetIn time.Duration) *Auth
 
 func nrPick(t *testing.T, s *NextResetSelector, model string, auths ...*Auth) *Auth {
 	t.Helper()
-	got, err := s.Pick(context.Background(), "", model, cliproxyexecutor.Options{}, auths)
+	// The provider argument is otherwise only used for error/log labeling and
+	// (see nextResetProviderMaxSize) the size-bias basis, so inferring it
+	// from the first candidate is enough for these single-provider fixtures;
+	// no test here mixes claude and codex auths in one call.
+	provider := ""
+	if len(auths) > 0 && auths[0] != nil {
+		provider = auths[0].Provider
+	}
+	got, err := s.Pick(context.Background(), provider, model, cliproxyexecutor.Options{}, auths)
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
 	}
 	return got
+}
+
+// nrSelectorTrackingAll returns a next-reset selector wired to a Manager that
+// tracks every one of auths, so the size bias' basis -- the largest known
+// size among every tracked account of the provider, not just the ones a
+// single Pick call ranks (see nextResetProviderMaxSize) -- is known even
+// though these tests call Pick directly instead of going through a Manager.
+func nrSelectorTrackingAll(t *testing.T, auths ...*Auth) *NextResetSelector {
+	t.Helper()
+	s := nrSelector()
+	m := NewManager(nil, s, nil)
+	for _, a := range auths {
+		if _, err := m.Register(context.Background(), a); err != nil {
+			t.Fatalf("Register(%s): %v", a.ID, err)
+		}
+	}
+	return s
 }
 
 func TestNextResetPrefersQuotaAboutToBeLost(t *testing.T) {
@@ -593,10 +618,13 @@ func sized(a *Auth, size string) *Auth {
 func TestNextResetSmallerAccountWithResetUpTo24hLaterBeatsLarger(t *testing.T) {
 	// a is the largest known size (90), so it never shifts. b is smaller
 	// (10) and resets only 10h after a, well inside the 24h flat shift, so
-	// b's effective reset (30h - 24h = 6h) beats a's real 20h.
+	// b's effective reset (30h - 24h = 6h) beats a's real 20h. The basis
+	// (largest known size among every tracked account of the provider; see
+	// nextResetProviderMaxSize) needs a manager that tracks both a and b --
+	// a selector with no manager never knows a size is the largest.
 	a := sized(claudeAuth("a", 50, 20*time.Hour), "90")
 	b := sized(claudeAuth("b", 50, 30*time.Hour), "10")
-	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "b" {
+	if got := nrPick(t, nrSelectorTrackingAll(t, a, b), "claude-sonnet-5-5", a, b); got.ID != "b" {
 		t.Fatalf("got %s, want b (smaller account within the 24h window)", got.ID)
 	}
 }
@@ -607,7 +635,7 @@ func TestNextResetSmallerAccountResettingMoreThan24hLaterLoses(t *testing.T) {
 	// 26h) is still later than a's real 20h: a keeps winning.
 	a := sized(claudeAuth("a", 50, 20*time.Hour), "90")
 	b := sized(claudeAuth("b", 50, 50*time.Hour), "10")
-	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "a" {
+	if got := nrPick(t, nrSelectorTrackingAll(t, a, b), "claude-sonnet-5-5", a, b); got.ID != "a" {
 		t.Fatalf("got %s, want a (b's reset is more than 24h later even after the shift)", got.ID)
 	}
 }
@@ -620,13 +648,13 @@ func TestNextResetUnknownSizeGetsNoShift(t *testing.T) {
 	c := sized(claudeAuth("c", 50, time.Hour), "100")
 	t.Run("known smaller size shifts ahead", func(t *testing.T) {
 		a := sized(claudeAuth("a", 50, 15*time.Hour), "10")
-		if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, c); got.ID != "a" {
+		if got := nrPick(t, nrSelectorTrackingAll(t, a, c), "claude-sonnet-5-5", a, c); got.ID != "a" {
 			t.Fatalf("got %s, want a (known smaller size shifts its effective reset earlier)", got.ID)
 		}
 	})
 	t.Run("unknown size is not shifted", func(t *testing.T) {
 		a := claudeAuth("a", 50, 15*time.Hour) // no size attribute
-		if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, c); got.ID != "c" {
+		if got := nrPick(t, nrSelectorTrackingAll(t, a, c), "claude-sonnet-5-5", a, c); got.ID != "c" {
 			t.Fatalf("got %s, want c (unknown size must not shift a ahead)", got.ID)
 		}
 	})
@@ -637,7 +665,7 @@ func TestNextResetEqualKnownSizesOrderUnaffected(t *testing.T) {
 	// neither shifts: ordering is exactly the earliest-reset baseline.
 	a := sized(claudeAuth("a", 60, 20*time.Hour), "50")
 	b := sized(claudeAuth("b", 10, 40*time.Hour), "50")
-	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", b, a); got.ID != "a" {
+	if got := nrPick(t, nrSelectorTrackingAll(t, a, b), "claude-sonnet-5-5", b, a); got.ID != "a" {
 		t.Fatalf("got %s, want a (equal sizes must not change earliest-reset ordering)", got.ID)
 	}
 }
@@ -649,7 +677,7 @@ func TestNextResetNearFullGoesLastRegardlessOfSize(t *testing.T) {
 	// the effective-reset comparison (step (b)), so b wins regardless.
 	a := sized(claudeAuth("a", 98.5, 10*time.Hour), "10")
 	b := sized(claudeAuth("b", 50, 100*time.Hour), "100")
-	if got := nrPick(t, nrSelector(), "claude-sonnet-5-5", a, b); got.ID != "b" {
+	if got := nrPick(t, nrSelectorTrackingAll(t, a, b), "claude-sonnet-5-5", a, b); got.ID != "b" {
 		t.Fatalf("got %s, want b (a is near full regardless of its smaller size)", got.ID)
 	}
 }
@@ -658,7 +686,7 @@ func TestNextResetColdPickLogsSizeAndEffectiveReset(t *testing.T) {
 	hook := setupNextResetLogHook(t)
 	a := sized(claudeAuth("a", 50, 30*time.Hour), "10")
 	b := sized(claudeAuth("b", 50, 20*time.Hour), "90")
-	s := nrSelector()
+	s := nrSelectorTrackingAll(t, a, b)
 	got, err := s.Pick(withNextResetColdPick(context.Background()), "claude", "claude-sonnet-5-5", cliproxyexecutor.Options{}, []*Auth{a, b})
 	if err != nil {
 		t.Fatalf("Pick: %v", err)
