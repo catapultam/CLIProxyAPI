@@ -177,6 +177,70 @@ func TestSummarizeModelQuotaUnavailability_CodexWindowMinutesFromSecondaryResetA
 	}
 }
 
+// TestSummarizeModelQuotaUnavailability_TransientBackoffIsNotUsageExhausted
+// reproduces the reviewer's repro for the Codex usage_limit_reached rewrite
+// (Fix 1, BLOCKER): a per-model transient backoff (e.g. the 1s/2s/4s cooldown
+// MarkResult applies for "Model is at capacity") sets Quota.Exceeded with
+// Reason "quota" at the model level, not "credential_quota" -- it must count
+// as AllQuotaCooldown (existing, Claude-consumed behavior, unchanged) but NOT
+// as AllUsageExhausted, since it is not a real credential-wide usage limit.
+func TestSummarizeModelQuotaUnavailability_TransientBackoffIsNotUsageExhausted(t *testing.T) {
+	now := time.Now()
+	authA := &Auth{ID: "a", Provider: "codex", ModelStates: map[string]*ModelState{
+		"gpt-5-codex": {Quota: QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(time.Second)}},
+	}}
+	authB := &Auth{ID: "b", Provider: "codex", ModelStates: map[string]*ModelState{
+		"gpt-5-codex": {Quota: QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(2 * time.Second)}},
+	}}
+	m := newQuotaSummaryTestManager(authA, authB)
+
+	summary := m.SummarizeModelQuotaUnavailability("codex", "gpt-5-codex", now)
+	if !summary.Applicable || !summary.AllQuotaCooldown {
+		t.Fatalf("summary = %+v, want AllQuotaCooldown true (existing Claude-consumed behavior unchanged)", summary)
+	}
+	if summary.AllUsageExhausted {
+		t.Fatalf("summary = %+v, want AllUsageExhausted false for a transient per-model backoff", summary)
+	}
+}
+
+// TestSummarizeModelQuotaUnavailability_CredentialQuotaIsUsageExhausted covers
+// the real usage_limit_reached case: a credential_quota cooldown on every
+// candidate qualifies as AllUsageExhausted.
+func TestSummarizeModelQuotaUnavailability_CredentialQuotaIsUsageExhausted(t *testing.T) {
+	now := time.Now()
+	authA := &Auth{ID: "a", Provider: "codex", Quota: QuotaState{
+		Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(2 * time.Hour),
+	}}
+	authB := &Auth{ID: "b", Provider: "codex", Quota: QuotaState{
+		Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(time.Hour),
+	}}
+	m := newQuotaSummaryTestManager(authA, authB)
+
+	summary := m.SummarizeModelQuotaUnavailability("codex", "gpt-5-codex", now)
+	if !summary.AllUsageExhausted {
+		t.Fatalf("summary = %+v, want AllUsageExhausted true for a real credential_quota cooldown", summary)
+	}
+}
+
+// TestSummarizeModelQuotaUnavailability_LatchedIsUsageExhausted covers a
+// next-reset-latched candidate: even without a conductor-level
+// credential_quota cooldown, a latched account is a confirmed-full
+// credential and must count as usage-exhausted.
+func TestSummarizeModelQuotaUnavailability_LatchedIsUsageExhausted(t *testing.T) {
+	withNextReset(t)
+	full := codexAuth("latched-a", 100, time.Hour)
+	nextResetBlocked(full, nrNow) // latch it
+
+	m := newQuotaSummaryTestManager(full)
+	summary := m.SummarizeModelQuotaUnavailability("codex", "gpt-5-codex", nrNow)
+	if !summary.Applicable || !summary.AllQuotaCooldown {
+		t.Fatalf("summary = %+v, want AllQuotaCooldown for a latched candidate", summary)
+	}
+	if !summary.AllUsageExhausted {
+		t.Fatalf("summary = %+v, want AllUsageExhausted for a latched candidate", summary)
+	}
+}
+
 func TestSummarizeModelQuotaUnavailability_CodexWindowMinutesUnknownWhenSignalsDoNotMatch(t *testing.T) {
 	now := time.Now()
 	codexAuth := &Auth{ID: "a", Provider: "codex", Quota: QuotaState{

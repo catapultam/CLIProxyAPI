@@ -33,6 +33,21 @@ type QuotaUnavailabilitySummary struct {
 	// quota signals. Zero when unknown or not applicable, e.g. for Claude,
 	// whose signals never carry Codex window-minutes keys.
 	WindowMinutes int
+	// AllUsageExhausted is a stricter version of AllQuotaCooldown, for the
+	// Codex usage_limit_reached rewrite only: true when every quota-cooled
+	// candidate's cooldown is not merely Quota.Exceeded, but one of (a)
+	// credential-scoped usage exhaustion (QuotaState.Reason ==
+	// "credential_quota", at the auth or the matching per-model level --
+	// what a real upstream usage_limit_reached 429 produces), (b) a
+	// next-reset latch, or (c) a cooldown reset time matched to a real
+	// rate-limit window via signals (WindowMinutes > 0). This excludes a
+	// transient quota/rate-limit backoff (e.g. the 1s/2s/4s backoff
+	// MarkResult applies for "Model is at capacity") that happens to also
+	// set Quota.Exceeded with Reason "quota" but is not actually a
+	// credential-wide usage limit. AllQuotaCooldown itself is left
+	// unchanged -- and still consumed as-is by the Claude /v1/messages
+	// rewrite -- so this field is purely additive.
+	AllUsageExhausted bool
 }
 
 // SummarizeModelQuotaUnavailability inspects the manager's current auths for
@@ -52,12 +67,13 @@ func (m *Manager) SummarizeModelQuotaUnavailability(provider, routeModel string,
 	}
 
 	var (
-		total               int
-		quotaBlocked        int
-		otherBlocked        int
-		earliest            time.Time
-		representativeClaim string
-		windowMinutes       int
+		total                 int
+		quotaBlocked          int
+		usageExhaustedBlocked int
+		otherBlocked          int
+		earliest              time.Time
+		representativeClaim   string
+		windowMinutes         int
 	)
 	for _, candidate := range m.List() {
 		if candidate == nil || strings.ToLower(strings.TrimSpace(candidate.Provider)) != targetProvider {
@@ -72,6 +88,9 @@ func (m *Manager) SummarizeModelQuotaUnavailability(provider, routeModel string,
 
 		if quotaExceeded, nextRecoverAt, claim, minutes := directQuotaCooldown(candidate, checkModel, now); quotaExceeded {
 			quotaBlocked++
+			if isUsageExhaustedCooldown(candidate, checkModel, minutes, now) {
+				usageExhaustedBlocked++
+			}
 			if earliest.IsZero() || nextRecoverAt.Before(earliest) {
 				earliest = nextRecoverAt
 				representativeClaim = claim
@@ -88,10 +107,13 @@ func (m *Manager) SummarizeModelQuotaUnavailability(provider, routeModel string,
 		}
 		if reason == blockReasonCooldown && next.After(now) {
 			quotaBlocked++
+			minutes, _ := codexWindowMinutesFromSignals(candidate.Quota, next)
+			if isUsageExhaustedCooldown(candidate, checkModel, minutes, now) {
+				usageExhaustedBlocked++
+			}
 			if earliest.IsZero() || next.Before(earliest) {
 				earliest = next
 				representativeClaim = representativeClaimFromSignals(candidate.Quota.Signals)
-				minutes, _ := codexWindowMinutesFromSignals(candidate.Quota, next)
 				windowMinutes = minutes
 			}
 			continue
@@ -105,10 +127,42 @@ func (m *Manager) SummarizeModelQuotaUnavailability(provider, routeModel string,
 	return QuotaUnavailabilitySummary{
 		Applicable:          true,
 		AllQuotaCooldown:    quotaBlocked == total,
+		AllUsageExhausted:   usageExhaustedBlocked == total,
 		EarliestReset:       earliest,
 		RepresentativeClaim: representativeClaim,
 		WindowMinutes:       windowMinutes,
 	}
+}
+
+// isUsageExhaustedCooldown reports whether candidate's current quota cooldown
+// for checkModel represents genuine credential-scoped usage-limit exhaustion
+// -- what the Codex usage_limit_reached rewrite requires -- rather than a
+// transient quota/rate-limit backoff that also sets Quota.Exceeded (see
+// AllUsageExhausted). windowMinutes is whatever this candidate's cooldown
+// already resolved for WindowMinutes, so the signal-matching check is not
+// redone here.
+func isUsageExhaustedCooldown(candidate *Auth, checkModel string, windowMinutes int, now time.Time) bool {
+	if candidate == nil {
+		return false
+	}
+	if candidate.Quota.Exceeded && candidate.Quota.Reason == "credential_quota" && candidate.Quota.NextRecoverAt.After(now) {
+		return true
+	}
+	if modelKey := canonicalModelKey(checkModel); modelKey != "" {
+		for stateModel, state := range candidate.ModelStates {
+			if state == nil || canonicalModelKey(stateModel) != modelKey {
+				continue
+			}
+			if state.Quota.Exceeded && state.Quota.Reason == "credential_quota" && state.Quota.NextRecoverAt.After(now) {
+				return true
+			}
+			break
+		}
+	}
+	if nextResetIsLatched(candidate.ID) {
+		return true
+	}
+	return windowMinutes > 0
 }
 
 // directQuotaCooldown reports an active quota cooldown for auth/model, checking

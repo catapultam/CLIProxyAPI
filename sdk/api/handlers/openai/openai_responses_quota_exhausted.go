@@ -16,26 +16,42 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
+// codexUsageLimitMinResetHorizon backstops the rewrite: even when every
+// candidate's cooldown qualifies as genuine usage exhaustion (see
+// AllUsageExhausted), a reset less than this far away is presented
+// unchanged. A real Codex usage limit resets hours to days out; a reset
+// this close is a signal the classification above still let a short-lived
+// condition through, and a sub-5-minute "usage_limit_reached" would mislead
+// the Codex CLI's retry/backoff handling more than the generic error would.
+const codexUsageLimitMinResetHorizon = 5 * time.Minute
+
 // rewriteQuotaExhaustedError inspects an auth-selection failure for the
 // Responses route and, only when modelName resolves to the Codex provider
 // alone and every candidate Codex auth for it is currently blocked
-// exclusively by quota/rate-limit cooldown, replaces it with an
-// OpenAI/Codex-shaped 429 "usage_limit_reached" response, the same shape the
-// official Codex CLI gets from OpenAI itself when a single account's usage
-// limit is hit. This lets the Codex CLI show its native "you've hit your
-// usage limit, try again at <time>" message and backoff instead of a generic
-// retry-then-give-up error. Any other "no auth available" shape (a disabled
-// auth, a missing auth, a mix of quota and non-quota cooldowns, a model that
-// can also route to a non-Codex provider, or any other error) is returned
-// unchanged. This never changes cooldown or selection behavior; it only
-// changes how an already-decided failure is presented.
+// exclusively by genuine, credential-scoped usage exhaustion (not merely a
+// quota/rate-limit cooldown; see QuotaUnavailabilitySummary.AllUsageExhausted)
+// with an earliest reset at least codexUsageLimitMinResetHorizon away,
+// replaces it with an OpenAI/Codex-shaped 429 "usage_limit_reached" response,
+// the same shape the official Codex CLI gets from OpenAI itself when a
+// single account's usage limit is hit. This lets the Codex CLI show its
+// native "you've hit your usage limit, try again at <time>" message and
+// backoff instead of a generic retry-then-give-up error. Any other "no auth
+// available" shape (a disabled auth, a missing auth, a mix of quota and
+// non-quota cooldowns, a transient quota/rate-limit backoff that is not
+// actually a usage limit, a reset too soon to trust, a model that can also
+// route to a non-Codex provider, or any other error) is returned unchanged.
+// This never changes cooldown or selection behavior; it only changes how an
+// already-decided failure is presented.
 func (h *OpenAIResponsesAPIHandler) rewriteQuotaExhaustedError(modelName string, errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
 	if errMsg == nil || h == nil || h.AuthManager == nil || !isNoCodexAuthAvailableError(errMsg) || !codexIsSoleProviderForModel(modelName) {
 		return errMsg
 	}
 	now := time.Now()
 	summary := h.AuthManager.SummarizeModelQuotaUnavailability("codex", modelName, now)
-	if !summary.Applicable || !summary.AllQuotaCooldown || summary.EarliestReset.IsZero() {
+	if !summary.Applicable || !summary.AllUsageExhausted || summary.EarliestReset.IsZero() {
+		return errMsg
+	}
+	if summary.EarliestReset.Sub(now) < codexUsageLimitMinResetHorizon {
 		return errMsg
 	}
 	return codexUsageLimitErrorMessage(modelName, summary, now, errMsg.Error)

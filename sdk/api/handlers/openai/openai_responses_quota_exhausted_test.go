@@ -109,6 +109,63 @@ func TestRewriteQuotaExhaustedError_AllCodexQuotaCooldownReturns429(t *testing.T
 	}
 }
 
+// TestRewriteQuotaExhaustedError_TransientCapacityBackoffKeepsOriginal is the
+// reviewer's reproduction for Fix 1 (BLOCKER): two Codex auths each given a
+// transient "Model is at capacity" 429 for the same model -- the 1s/2s/4s
+// backoff MarkResult applies -- set Quota.Exceeded with Reason "quota" at the
+// model level, not "credential_quota". This must never be rewritten into a
+// terminal usage_limit_reached; the Codex CLI would treat that 429 as
+// non-retryable and abort the turn over what is actually a few-second retry.
+func TestRewriteQuotaExhaustedError_TransientCapacityBackoffKeepsOriginal(t *testing.T) {
+	const model = "gpt-5-codex-quota-test-transient"
+	registerCodexOnlyTestModel(t, model)
+
+	now := time.Now()
+	authA := &coreauth.Auth{ID: "auth-a", Provider: "codex", ModelStates: map[string]*coreauth.ModelState{
+		model: {Quota: coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(time.Second)}},
+	}}
+	authB := &coreauth.Auth{ID: "auth-b", Provider: "codex", ModelStates: map[string]*coreauth.ModelState{
+		model: {Quota: coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(2 * time.Second)}},
+	}}
+	manager := newQuotaExhaustedTestManager(t, authA, authB)
+	handler := &OpenAIResponsesAPIHandler{BaseAPIHandler: &handlers.BaseAPIHandler{AuthManager: manager}}
+
+	errMsg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      &coreauth.Error{Code: "auth_unavailable", Message: "no auth available", HTTPStatus: http.StatusServiceUnavailable},
+	}
+
+	got := handler.rewriteQuotaExhaustedError(model, errMsg)
+	if got != errMsg {
+		t.Fatalf("rewriteQuotaExhaustedError() = %+v, want the original response unchanged for a transient capacity backoff", got)
+	}
+}
+
+// TestRewriteQuotaExhaustedError_ResetTooSoonKeepsOriginal covers the
+// backstop: even a genuine credential_quota cooldown on every candidate is
+// left unchanged when the earliest reset is less than 5 minutes away.
+func TestRewriteQuotaExhaustedError_ResetTooSoonKeepsOriginal(t *testing.T) {
+	const model = "gpt-5-codex-quota-test-too-soon"
+	registerCodexOnlyTestModel(t, model)
+
+	now := time.Now()
+	authA := &coreauth.Auth{ID: "auth-a", Provider: "codex", Quota: coreauth.QuotaState{
+		Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(2 * time.Minute),
+	}}
+	manager := newQuotaExhaustedTestManager(t, authA)
+	handler := &OpenAIResponsesAPIHandler{BaseAPIHandler: &handlers.BaseAPIHandler{AuthManager: manager}}
+
+	errMsg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      &coreauth.Error{Code: "auth_unavailable", Message: "no auth available", HTTPStatus: http.StatusServiceUnavailable},
+	}
+
+	got := handler.rewriteQuotaExhaustedError(model, errMsg)
+	if got != errMsg {
+		t.Fatalf("rewriteQuotaExhaustedError() = %+v, want the original response unchanged when the earliest reset is under 5 minutes away", got)
+	}
+}
+
 func TestRewriteQuotaExhaustedError_MixedReasonKeepsOriginal(t *testing.T) {
 	const model = "gpt-5-codex-quota-test-mixed"
 	registerCodexOnlyTestModel(t, model)
