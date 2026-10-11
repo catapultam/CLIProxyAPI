@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { SHELL_CASES } from './shell-cases'
-import { defang, previewLine, stripTrailingDone } from '../hooks/register'
+import { callKey, decisionFor, defang, mapAnswers, previewLine, promptKey, redact, stableJSON, stripTrailingDone, waitAnswer } from '../hooks/register'
 
 const ENV = {
   ANTHROPIC_BASE_URL: 'http://bus.test:8317/',
@@ -21,7 +21,14 @@ type Call = { url: string; method: string; body: unknown; auth: string | undefin
 const DEFAULT_SESSION_ID = '3a9e9c5c-0000-0000-0000-000000000000'
 
 // env adds variables to ENV; routes answers a URL ending in its key.
-type WireOptions = { env?: Record<string, string>; routes?: Record<string, { status: number; text: string }>; logs?: string[] }
+type FetchAnswer = { status: number; text: string }
+// fetch answers a request before wire()'s own routes do (undefined: not mine); it may return a promise.
+type WireOptions = {
+  env?: Record<string, string>
+  routes?: Record<string, FetchAnswer>
+  logs?: string[]
+  fetch?: (url: string, method: string, body: unknown) => FetchAnswer | Promise<FetchAnswer> | undefined
+}
 
 // session is a mutable box so a test can change what $.session.id() answers
 // mid-test (simulating /clear, /resume, or /branch), the way wire()'s other
@@ -46,6 +53,10 @@ function wire(
   on('http.fetch', (_$, e) => {
     const method = e.init?.method ?? 'GET'
     calls.push({ url: e.url, method, body: e.init?.body ? JSON.parse(e.init.body) : undefined, auth: e.init?.headers?.Authorization })
+    const custom = options.fetch?.(e.url, method, e.init?.body ? JSON.parse(e.init.body) : undefined)
+    if (custom !== undefined) {
+      return Promise.resolve(custom).then(a => ({ value: { ...a, ok: a.status < 300, headers: {} } })) as never
+    }
     for (const [suffix, answer] of Object.entries(options.routes ?? {})) {
       if (e.url.endsWith(suffix)) return { value: { ...answer, ok: answer.status < 300, headers: {} } }
     }
@@ -422,7 +433,7 @@ test('session.end with clear says bye, then the next tick follows the session to
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
   // The old id goes along, so the bus hands the name, inbox and Slack routing to the new one.
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.4.1', previous: DEFAULT_SESSION_ID })
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.5.0', previous: DEFAULT_SESSION_ID })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
@@ -439,11 +450,11 @@ test('both hellos and every wait carry the mod version', async ($, on) => {
 
   const hellos = calls.filter(c => c.url.endsWith('/hello'))
   expect(hellos.length).toBe(2)
-  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.4.1' })
-  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.4.1' })
+  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.5.0' })
+  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.5.0' })
   const waits = calls.filter(c => c.url.includes('/wait?'))
   expect(waits.length).toBeGreaterThan(0)
-  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.4.1')
+  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.5.0')
 })
 
 test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {
@@ -1808,4 +1819,601 @@ test('past the held-message cap (the oldest runs as a prompt at once) none is lo
   await clock.settle()
   expect(prompts.length).toBe(101)
   expect(prompts.map(p => Number(/msg (\d+)/.exec(p)?.[1]))).toEqual(Array.from({ length: 101 }, (_, i) => i))
+})
+
+// Slack prompts (0.5.0): a blocking prompt is also posted to Slack through /prompt, the answer long-polled
+// from /prompt/wait, and the prompt closed with /prompt/resolve. The proxy side is mocked here by a scripted
+// server; the wire contract is the spec's (docs/superpowers/specs/2026-10-10-slack-prompts-design.md).
+
+type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void }
+function defer<T>(): Deferred<T> {
+  let resolve!: (v: T) => void
+  let reject!: (e: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+const PROMPTS_HELLO: FetchAnswer = { status: 200, text: '{"address":"cplt-4a/comms-3a9e9c","prompts":true}' }
+const ANSWER = (answer: object): FetchAnswer => ({ status: 200, text: JSON.stringify({ answer }) })
+const CLOSED: FetchAnswer = { status: 410, text: '{"error":"closed"}' }
+const STILL_OPEN: FetchAnswer = { status: 204, text: '' }
+
+type WaitStep = FetchAnswer | (() => Promise<FetchAnswer>)
+
+// A scripted proxy for the prompt routes: /prompt is idempotent on the key (the same id for the same key),
+// /prompt/wait takes the next step from `waits` (closed when none is left), /prompt/resolve is recorded.
+function promptServer(opts: { waits?: WaitStep[]; open?: FetchAnswer | (() => Promise<FetchAnswer>); hello?: () => FetchAnswer } = {}) {
+  const ids = new Map<string, string>()
+  const waits = [...(opts.waits ?? [])]
+  const server = {
+    waits,
+    fetch: (url: string, method: string, body: unknown): FetchAnswer | Promise<FetchAnswer> | undefined => {
+      if (url.endsWith('/hello') && opts.hello) return opts.hello()
+      if (url.endsWith('/v1/agentbus/prompt') && method === 'POST') {
+        const make = () => {
+          const key = (body as { key: string }).key
+          if (!ids.has(key)) ids.set(key, `p_${ids.size + 1}`)
+          return { status: 200, text: JSON.stringify({ id: ids.get(key) }) }
+        }
+        if (typeof opts.open === 'function') return opts.open().then(a => (a.status === 200 ? make() : a))
+        return opts.open ?? make()
+      }
+      if (url.includes('/v1/agentbus/prompt/wait?')) {
+        const step = waits.shift()
+        if (step === undefined) return CLOSED
+        return typeof step === 'function' ? step() : step
+      }
+      if (url.endsWith('/prompt/resolve')) return { status: 200, text: '{}' }
+      return undefined
+    },
+  }
+  return server
+}
+
+type PromptWorld = Awaited<ReturnType<typeof promptWorld>>
+
+// An interactive session whose hello says prompts are on, with a bottom PermissionRequest hook counting how
+// many times the terminal dialog's side was reached (next).
+async function promptWorld(
+  $: TestArgs[0],
+  on: TestArgs[1],
+  server: ReturnType<typeof promptServer>,
+  options: WireOptions = {},
+  setup?: (on: TestArgs[1]) => void,
+) {
+  const clock = mock.clock(on)
+  const calls = wire($, on, [], undefined, PEERS, { routes: { '/hello': PROMPTS_HELLO }, ...options, fetch: server.fetch })
+  const state = { nexts: 0 }
+  on('classic.PermissionRequest', () => {
+    state.nexts++
+    return {}
+  })
+  // Hooks beneath the plugin must be registered before the test first calls $.
+  setup?.(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  return { clock, calls, state, server }
+}
+
+const opens = (calls: Call[]) => calls.filter(c => c.url.endsWith('/v1/agentbus/prompt') && c.method === 'POST')
+const promptWaits = (calls: Call[]) => calls.filter(c => c.url.includes('/v1/agentbus/prompt/wait?'))
+const resolves = (calls: Call[]) => calls.filter(c => c.url.endsWith('/prompt/resolve')).map(c => c.body as { session: string; id: string; outcome: string; note?: string })
+
+const BASH_INPUT = { command: 'ls -la', description: 'list' }
+const permission = (extra: object = {}, tool = 'Bash', input: object = BASH_INPUT) =>
+  ({ tool_name: tool, tool_input: input, permission_mode: 'default', ...extra }) as never
+const SUGGESTIONS = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls:*' }], behavior: 'allow', destination: 'localSettings' }]
+
+const PERMISSION_CHOICES: Array<[object, unknown]> = [
+    [{ choice: 'allow', by: 'alex' }, { behavior: 'allow' }],
+    [{ choice: 'always', by: 'alex' }, { behavior: 'allow', updatedPermissions: SUGGESTIONS }],
+    [{ choice: 'deny', by: 'alex' }, { behavior: 'deny', message: 'Denied from Slack by alex' }],
+    [{ choice: 'deny', by: 'alex', reason: 'not now' }, { behavior: 'deny', message: 'Denied from Slack by alex: not now' }],
+]
+for (const [answer, decision] of PERMISSION_CHOICES) {
+  test(`a permission dialog is posted as a prompt and answered from Slack: ${JSON.stringify(answer)}`, async ($, on) => {
+    const world = await promptWorld($, on, promptServer({ waits: [STILL_OPEN, ANSWER(answer)] }))
+    const out = await $.classic.PermissionRequest(permission({ permission_suggestions: SUGGESTIONS }))
+    expect(out).toEqual({ decision })
+    expect(world.state.nexts).toBe(0)
+    const open = at(opens(world.calls), 0)
+    expect(open.auth).toBe('Bearer test-token')
+    expect(open.body).toEqual({
+      session: DEFAULT_SESSION_ID,
+      key: await promptKey('', 'Bash', BASH_INPUT),
+      kind: 'permission',
+      title: 'Bash wants to run',
+      detail: 'ls -la',
+      always: true,
+    })
+    expect(promptWaits(world.calls).length).toBe(2)
+    expect(at(promptWaits(world.calls), 0).url).toBe(`http://bus.test:8317/v1/agentbus/prompt/wait?session=${DEFAULT_SESSION_ID}&id=p_1`)
+  })
+}
+
+const PLAN_CHOICES: Array<[object, unknown]> = [
+    [{ choice: 'approve_accept_edits' }, { behavior: 'allow', updatedPermissions: [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }] }],
+    [{ choice: 'approve' }, { behavior: 'allow', updatedPermissions: [{ type: 'setMode', mode: 'default', destination: 'session' }] }],
+    [{ choice: 'keep_planning', reason: 'split step 2' }, { behavior: 'deny', message: 'split step 2' }],
+    [{ choice: 'keep_planning' }, { behavior: 'deny', message: 'Keep planning.' }],
+    [{ choice: 'keep_planning', reason: '  ' }, { behavior: 'deny', message: 'Keep planning.' }],
+]
+for (const [answer, decision] of PLAN_CHOICES) {
+  test(`a plan is posted as a plan prompt and its choice maps to a decision: ${JSON.stringify(answer)}`, async ($, on) => {
+    const world = await promptWorld($, on, promptServer({ waits: [ANSWER(answer)] }))
+    const out = await $.classic.PermissionRequest(permission({}, 'ExitPlanMode', { plan: '# Plan\n1. do it' }))
+    expect(out).toEqual({ decision })
+    expect(at(opens(world.calls), 0).body).toMatchObject({ kind: 'plan', detail: '# Plan\n1. do it' })
+    expect(at(opens(world.calls), 0).body).not.toHaveProperty('always')
+  })
+}
+
+test('a plan with no text in the input says the plan is in the terminal', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [ANSWER({ choice: 'approve' })] }))
+  await $.classic.PermissionRequest(permission({}, 'ExitPlanMode', {}))
+  expect((at(opens(world.calls), 0).body as { detail: string }).detail).toBe('The plan text was not available; it is in the terminal.')
+})
+
+test('the prompt names a subagent, shows an Edit as a diff, and redacts secrets before they leave', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [ANSWER({ choice: 'allow' })] }))
+  const input = { file_path: 'C:/work/a.txt', old_string: 'k = "xoxb-12345-abcdef"\nsame', new_string: 'k = "x"\nsame' }
+  await $.classic.PermissionRequest(permission({ agent_id: 'agent-7', agent_type: 'general-purpose' }, 'Edit', input))
+  const body = at(opens(world.calls), 0).body as { key: string; agent: string; detail: string }
+  expect(body.agent).toBe('general-purpose')
+  expect(body.detail).toBe('C:/work/a.txt\n- k = "[redacted]"\n- same\n+ k = "x"\n+ same')
+  expect(body.key).toBe(await promptKey('agent-7', 'Edit', input))
+})
+
+test('an oversized command is cut and the cut is said', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [ANSWER({ choice: 'allow' })] }))
+  await $.classic.PermissionRequest(permission({}, 'Bash', { command: 'x'.repeat(100_050) }))
+  const detail = (at(opens(world.calls), 0).body as { detail: string }).detail
+  expect(detail.length).toBeLessThan(100_100)
+  expect(detail.endsWith('[50 more characters not sent]')).toBe(true)
+})
+
+// The fallbacks: each leaves the terminal dialog alone, reaching next exactly once.
+const FALLBACKS: Array<[string, () => ReturnType<typeof promptServer>, number]> = [
+  ['410', () => promptServer({ waits: [CLOSED] }), 1],
+  ['404 twice', () => promptServer({ waits: [{ status: 404, text: '' }, { status: 404, text: '' }] }), 2],
+  ['three errors', () => promptServer({ waits: [{ status: 500, text: '' }, { status: 502, text: '' }, { status: 500, text: '' }] }), 1],
+  ['open refused', () => promptServer({ open: { status: 429, text: '{"error":"too many"}' } }), 1],
+  ['open unreachable', () => promptServer({ open: { status: 502, text: '' } }), 1],
+  ['an answer of no known choice', () => promptServer({ waits: [ANSWER({ choice: 'submit' })] }), 1],
+]
+for (const [name, make, openCount] of FALLBACKS) {
+  test(`a prompt that is ${name} falls back to the terminal dialog, next called once`, async ($, on) => {
+    const world = await promptWorld($, on, make())
+    const out = await $.classic.PermissionRequest(permission())
+    expect(out).toEqual({})
+    expect(world.state.nexts).toBe(1)
+    expect(opens(world.calls).length).toBe(openCount)
+  })
+}
+
+test('a prompt lost by a proxy restart (404) is opened again and then answered', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [{ status: 404, text: '' }, STILL_OPEN, ANSWER({ choice: 'allow' })] }))
+  const out = await $.classic.PermissionRequest(permission())
+  expect(out).toEqual({ decision: { behavior: 'allow' } })
+  expect(opens(world.calls).length).toBe(2)
+  expect(world.state.nexts).toBe(0)
+})
+
+test('an error between good polls does not add up to three', async ($, on) => {
+  const e = { status: 503, text: '' }
+  const world = await promptWorld($, on, promptServer({ waits: [e, e, STILL_OPEN, e, e, ANSWER({ choice: 'allow' })] }))
+  expect(await $.classic.PermissionRequest(permission())).toEqual({ decision: { behavior: 'allow' } })
+  expect(world.state.nexts).toBe(0)
+})
+
+test('waitAnswer stops when told to (the abort), one fetch per pass, no clock wait', async () => {
+  const urls: string[] = []
+  const status = { code: 204 }
+  const stub = {
+    http: {
+      fetch: async (url: string) => {
+        urls.push(url)
+        return { status: status.code, ok: status.code < 300, headers: {}, text: '' }
+      },
+    },
+    clock: new Proxy({}, { get: () => () => { throw new Error('a clock wait') } }),
+  } as never
+  let polls = 0
+  expect(await waitAnswer(stub, DEFAULT_SESSION_ID, 'p_9', { stopped: () => polls++ >= 2 })).toEqual({ kind: 'stopped' })
+  expect(urls.length).toBe(2)
+  expect(at(urls, 0)).toContain('/v1/agentbus/prompt/wait?session=3a9e9c5c-0000-0000-0000-000000000000&id=p_9')
+  // A 404 with nothing to reopen with gives up at once; a 410 is closed; three errors give up.
+  status.code = 404
+  expect(await waitAnswer(stub, DEFAULT_SESSION_ID, 'p_9', {})).toEqual({ kind: 'failed' })
+  status.code = 410
+  expect(await waitAnswer(stub, DEFAULT_SESSION_ID, 'p_9', {})).toEqual({ kind: 'closed' })
+  status.code = 500
+  expect(await waitAnswer(stub, DEFAULT_SESSION_ID, 'p_9', {})).toEqual({ kind: 'failed' })
+  expect(urls.length).toBe(2 + 1 + 1 + 3)
+})
+
+test('the same dialog entered twice shares one key, one prompt and one answer', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [ANSWER({ choice: 'allow' }), ANSWER({ choice: 'allow' })] }))
+  const [a, b] = await Promise.all([$.classic.PermissionRequest(permission()), $.classic.PermissionRequest(permission())])
+  expect(a).toEqual({ decision: { behavior: 'allow' } })
+  expect(b).toEqual({ decision: { behavior: 'allow' } })
+  const posted = opens(world.calls)
+  expect(posted.length).toBe(2)
+  expect((at(posted, 0).body as { key: string }).key).toBe((at(posted, 1).body as { key: string }).key)
+  expect(promptWaits(world.calls).map(c => c.url.slice(-3))).toEqual(['p_1', 'p_1'])
+})
+
+const PROMPTS_OFF: Array<[string, WireOptions]> = [
+  ['the hello said false', { routes: { '/hello': { status: 200, text: '{"address":"a/b-1","prompts":false}' } } }],
+  ['the hello has no prompts', { routes: { '/hello': { status: 200, text: '{"address":"a/b-1"}' } } }],
+  ['the switch is off', { env: { AGENTBUS_SLACK_PROMPTS: '0' } }],
+]
+for (const [name, options] of PROMPTS_OFF) {
+  test(`no prompt is posted when ${name}`, async ($, on) => {
+    const world = await promptWorld($, on, promptServer(), options)
+    expect(await $.classic.PermissionRequest(permission())).toEqual({})
+    expect(world.state.nexts).toBe(1)
+    expect(world.calls.some(c => c.url.includes('/prompt'))).toBe(false)
+  })
+}
+
+test('no prompt is posted in a script run', async ($, on) => {
+  const server = promptServer()
+  const calls = wire($, on, [], undefined, PEERS, { routes: { '/hello': PROMPTS_HELLO }, fetch: server.fetch })
+  on('classic.PermissionRequest', () => ({}))
+  await $.session.start({ surface: null, isInteractive: false, cwd: 'C:/work/comms' })
+  await $.classic.PermissionRequest(permission())
+  expect(calls.some(c => c.url.includes('/prompt'))).toBe(false)
+})
+
+test('a re-hello after /clear updates whether prompts are on', async ($, on) => {
+  let prompts = false
+  const server = promptServer({
+    hello: () => ({ status: 200, text: JSON.stringify({ address: 'cplt-4a/comms-3a9e9c', prompts }) }),
+    waits: [ANSWER({ choice: 'allow' })],
+  })
+  const session = { id: DEFAULT_SESSION_ID }
+  const clock = mock.clock(on)
+  const calls = wire($, on, [], session, PEERS, { fetch: server.fetch })
+  on('classic.PermissionRequest', () => ({}))
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  expect(await $.classic.PermissionRequest(permission())).toEqual({})
+  expect(opens(calls).length).toBe(0)
+
+  prompts = true
+  session.id = 'cleared1-0000-0000-0000-000000000000'
+  await clock.advance(1000)
+  await clock.settle()
+  expect(await $.classic.PermissionRequest(permission())).toEqual({ decision: { behavior: 'allow' } })
+  expect((at(opens(calls), 0).body as { session: string }).session).toBe(session.id)
+})
+
+test('AskUserQuestion is left out of the PermissionRequest hook', async ($, on) => {
+  const world = await promptWorld($, on, promptServer())
+  expect(await $.classic.PermissionRequest(permission({}, 'AskUserQuestion', { questions: [] }))).toEqual({})
+  expect(world.state.nexts).toBe(1)
+  expect(opens(world.calls).length).toBe(0)
+})
+
+// Closing: the call that raised the prompt settling closes it. The call is held at a gate while its
+// permission prompt is open; `answer` is a Slack answer the hook returned before the call settled.
+async function settleWith($: TestArgs[0], on: TestArgs[1], gateValue: object | 'throw', answer?: object) {
+  const hold = defer<FetchAnswer>()
+  const gate = defer<object>()
+  const world = await promptWorld($, on, promptServer({ waits: [() => hold.promise] }), {}, o => o('tool.call', () => gate.promise as never))
+  const callP = $.tool.call(call('Bash')).catch(() => undefined)
+  await world.clock.settle()
+  const perm = $.classic.PermissionRequest(permission({}, 'Bash', { command: 'ls' }))
+  await world.clock.settle()
+  expect(opens(world.calls).length).toBe(1)
+  if (answer) {
+    hold.resolve(ANSWER(answer))
+    await perm
+  }
+  if (gateValue === 'throw') gate.reject(new Error('tool crashed'))
+  else gate.resolve(gateValue)
+  await callP
+  await world.clock.settle()
+  if (!answer) {
+    hold.resolve(CLOSED)
+    await perm
+  }
+  return resolves(world.calls)
+}
+
+test('a prompt is resolved ran when its call returns a result', async ($, on) => {
+  expect(await settleWith($, on, { result: { stdout: 'ok' } })).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'ran' }])
+})
+
+test('a prompt is resolved denied when its call is denied', async ($, on) => {
+  expect(await settleWith($, on, { deny: 'no' })).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'denied' }])
+})
+
+const ERRORED = { result: { stdout: 'boom' }, isError: true }
+
+test('an errored result closes its prompt cancelled', async ($, on) => {
+  expect(await settleWith($, on, ERRORED)).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'cancelled' }])
+})
+
+test('an errored result closes its prompt denied when the person denied it from Slack', async ($, on) => {
+  expect(await settleWith($, on, ERRORED, { choice: 'deny', by: 'alex' })).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'denied' }])
+})
+
+test('a prompt is resolved cancelled when its call throws', async ($, on) => {
+  expect(await settleWith($, on, 'throw')).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'cancelled' }])
+})
+
+test('a prompt whose call settled before the post returned is resolved at once', async ($, on) => {
+  const gate = defer<FetchAnswer>()
+  const world = await promptWorld($, on, promptServer({ open: () => gate.promise, waits: [CLOSED] }), {}, o =>
+    o('tool.call', () => ({ result: { stdout: 'ok' } })),
+  )
+  const perm = $.classic.PermissionRequest(permission({}, 'Bash', { command: 'ls' }))
+  await world.clock.settle()
+  await $.tool.call(call('Bash'))
+  await world.clock.settle()
+  expect(resolves(world.calls)).toEqual([])
+  gate.resolve({ status: 200, text: '{}' })
+  await perm
+  await world.clock.settle()
+  expect(resolves(world.calls)).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'ran' }])
+})
+
+test('a subagent call is recorded too, under its agent', async ($, on) => {
+  const hold = defer<FetchAnswer>()
+  const gate = defer<object>()
+  const world = await promptWorld($, on, promptServer({ waits: [() => hold.promise] }), {}, o => o('tool.call', () => gate.promise as never))
+  const callP = $.tool.call(call('Bash', { agentId: 'agent-7' }) as never)
+  await world.clock.settle()
+  const perm = $.classic.PermissionRequest(permission({ agent_id: 'agent-7', agent_type: 'reviewer' }, 'Bash', { command: 'ls' }))
+  await world.clock.settle()
+  gate.resolve({ result: { stdout: 'ok' } })
+  await callP
+  await world.clock.settle()
+  expect(resolves(world.calls)).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'ran' }])
+  hold.resolve(CLOSED)
+  await perm
+})
+
+test('a main-loop turn ending cancels every open prompt; a subagent turn ending does not', async ($, on) => {
+  const holds = [defer<FetchAnswer>(), defer<FetchAnswer>()]
+  const t = turns($, on)
+  const world = await promptWorld($, on, promptServer({ waits: holds.map(h => () => h.promise) }))
+  const p1 = $.classic.PermissionRequest(permission({}, 'Bash', { command: 'one' }))
+  const p2 = $.classic.PermissionRequest(permission({}, 'Bash', { command: 'two' }))
+  await world.clock.settle()
+  await t.start('go', 't1')
+  await t.complete('sub', { agentId: 'agent-7' })
+  await world.clock.settle()
+  expect(resolves(world.calls)).toEqual([])
+  await t.complete('t1')
+  await world.clock.settle()
+  expect(resolves(world.calls).map(r => r.outcome)).toEqual(['cancelled', 'cancelled'])
+  expect(resolves(world.calls).map(r => r.id).sort()).toEqual(['p_1', 'p_2'])
+  for (const h of holds) h.resolve(CLOSED)
+  await Promise.all([p1, p2])
+})
+
+test('the session ending marks every open prompt ended', async ($, on) => {
+  const hold = defer<FetchAnswer>()
+  const world = await promptWorld($, on, promptServer({ waits: [() => hold.promise] }))
+  const perm = $.classic.PermissionRequest(permission())
+  await world.clock.settle()
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: DEFAULT_SESSION_ID, resume: { id: DEFAULT_SESSION_ID } })
+  await world.clock.settle()
+  expect(resolves(world.calls)).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'ended' }])
+  expect(world.calls.some(c => c.url.endsWith('/bye'))).toBe(true)
+  hold.resolve(CLOSED)
+  await perm
+})
+
+// AskUserQuestion: the dialog and Slack race, and next(e) runs once.
+const QUESTIONS = [
+  {
+    question: 'Which library?',
+    header: 'Library',
+    options: [{ label: 'dayjs', description: 'small' }, { label: 'luxon', description: 'big' }, { label: 'moment', description: 'old' }],
+    multiSelect: false,
+  },
+  {
+    question: 'Which features?',
+    header: 'Features',
+    options: [{ label: 'tz', description: '' }, { label: 'fmt', description: '' }],
+    multiSelect: true,
+  },
+  { question: 'Name it?', header: 'Name', kind: 'text', options: [], multiSelect: false },
+  { question: 'How many?', header: 'Count', kind: 'number', min: 1, max: 10, step: 1, unit: 'px', options: [], multiSelect: false },
+]
+const ask = (extra: object = {}) => ({ tool: 'AskUserQuestion', questions: QUESTIONS, ...extra }) as never
+
+async function questionWorld($: TestArgs[0], on: TestArgs[1], server: ReturnType<typeof promptServer>, local: () => Promise<object> | object, options: WireOptions = {}) {
+  const locals = { n: 0 }
+  const world = await promptWorld($, on, server, options, o =>
+    o('tool.call', () => {
+      locals.n++
+      return local() as never
+    }),
+  )
+  return { ...world, locals }
+}
+
+test('a question answered in Slack wins, and its answers are keyed by question text', async ($, on) => {
+  const server = promptServer({
+    waits: [
+      STILL_OPEN,
+      ANSWER({ choice: 'submit', by: 'alex', answers: { q1: 'o2', q2: ['o1', 'o2'], q3: 'hello there', q4: 7 } }),
+    ],
+  })
+  const world = await questionWorld($, on, server, () => new Promise<object>(() => {}))
+  const out = await $.tool.call(ask())
+  expect(world.locals.n).toBe(1)
+  expect(out.result).toEqual({
+    questions: QUESTIONS,
+    answers: { 'Which library?': 'luxon', 'Which features?': 'tz, fmt', 'Name it?': 'hello there', 'How many?': '7' },
+  })
+  const body = at(opens(world.calls), 0).body as { kind: string; key: string; questions: Array<Record<string, unknown>> }
+  expect(body.kind).toBe('question')
+  expect(body.key).toBe(await promptKey('', 'AskUserQuestion', { questions: QUESTIONS }))
+  expect(body.questions.map(q => q.id)).toEqual(['q1', 'q2', 'q3', 'q4'])
+  expect(body.questions[0]).toEqual({
+    id: 'q1',
+    text: 'Which library?',
+    header: 'Library',
+    kind: 'choice',
+    multi: false,
+    options: [
+      { id: 'o1', label: 'dayjs', description: 'small' },
+      { id: 'o2', label: 'luxon', description: 'big' },
+      { id: 'o3', label: 'moment', description: 'old' },
+    ],
+  })
+  expect(body.questions[1]).toMatchObject({ multi: true })
+  expect(body.questions[2]).toEqual({ id: 'q3', text: 'Name it?', header: 'Name', kind: 'text' })
+  expect(body.questions[3]).toEqual({ id: 'q4', text: 'How many?', header: 'Count', kind: 'number', min: 1, max: 10, step: 1, unit: 'px' })
+  await world.clock.settle()
+  expect(resolves(world.calls)).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'answered' }])
+})
+
+test('an Other answer to a choice question is passed through as typed', () => {
+  expect(mapAnswers(QUESTIONS as never, { q1: 'something else', q2: [] })).toEqual({ 'Which library?': 'something else' })
+  expect(mapAnswers(QUESTIONS as never, {})).toBeNull()
+  expect(mapAnswers(QUESTIONS as never, undefined)).toBeNull()
+})
+
+test('a question answered at the keyboard wins: its result is returned, the remote loop stops, the prompt is resolved', async ($, on) => {
+  const hold = defer<FetchAnswer>()
+  const local = defer<object>()
+  const world = await questionWorld($, on, promptServer({ waits: [() => hold.promise, STILL_OPEN] }), () => local.promise)
+  const callP = $.tool.call(ask())
+  await world.clock.settle()
+  local.resolve({ result: { questions: QUESTIONS, answers: { 'Which library?': 'dayjs' } } })
+  const out = await callP
+  expect(out.result).toEqual({ questions: QUESTIONS, answers: { 'Which library?': 'dayjs' } })
+  expect(world.locals.n).toBe(1)
+  await world.clock.settle()
+  expect(resolves(world.calls)).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'answered', note: 'terminal' }])
+  // The long poll in flight ends; the loop makes no further request.
+  hold.resolve(STILL_OPEN)
+  await world.clock.settle()
+  expect(promptWaits(world.calls).length).toBe(1)
+})
+
+const QUESTION_FAILS: Array<[string, () => ReturnType<typeof promptServer>]> = [
+  ['the post fails', () => promptServer({ open: { status: 502, text: '' } })],
+  ['the prompt is closed', () => promptServer({ waits: [CLOSED] })],
+  ['the answer maps to nothing', () => promptServer({ waits: [ANSWER({ choice: 'allow' })] })],
+]
+for (const [name, make] of QUESTION_FAILS) {
+  test(`a question whose Slack side fails (${name}) is answered by the dialog, with no second next`, async ($, on) => {
+    const server = make()
+    const local = defer<object>()
+    const world = await questionWorld($, on, server, () => local.promise)
+    const callP = $.tool.call(ask())
+    await world.clock.settle()
+    local.resolve({ result: { questions: QUESTIONS, answers: { 'Which library?': 'moment' } } })
+    const out = await callP
+    expect((out.result as { answers: object }).answers).toEqual({ 'Which library?': 'moment' })
+    expect(world.locals.n).toBe(1)
+  })
+}
+
+test('a dialog that fails after Slack answered does not surface', async ($, on) => {
+  const server = promptServer({ waits: [ANSWER({ choice: 'submit', answers: { q1: 'o1' } })] })
+  const local = defer<object>()
+  const world = await questionWorld($, on, server, () => local.promise)
+  const out = await $.tool.call(ask())
+  expect((out.result as { answers: object }).answers).toEqual({ 'Which library?': 'dayjs' })
+  local.reject(new Error('dialog aborted'))
+  await world.clock.settle()
+})
+
+test('a question is left to the dialog when prompts are off', async ($, on) => {
+  const world = await questionWorld($, on, promptServer(), () => ({ result: { questions: QUESTIONS, answers: {} } }), { env: { AGENTBUS_SLACK_PROMPTS: '0' } })
+  await $.tool.call(ask())
+  expect(world.locals.n).toBe(1)
+  expect(opens(world.calls).length).toBe(0)
+})
+
+// The idle ping.
+const stop = (extra: object = {}) => ({ stop_hook_active: false, permission_mode: 'auto', last_assistant_message: 'All done.', ...extra }) as never
+const sends = (calls: Call[]) => calls.filter(c => c.url.endsWith('/send')).map(c => c.body as { from_session: string; to: string; body: string })
+
+test('the idle ping is posted when a main-loop turn ends in auto mode, and never blocks the stop', async ($, on) => {
+  let nexts = 0
+  const world = await promptWorld($, on, promptServer(), {}, o =>
+    o('classic.Stop', () => {
+      nexts++
+      return {}
+    }),
+  )
+  const long = 'k=1 token=sup3rsecret ' + 'y'.repeat(2000)
+  expect(await $.classic.Stop(stop({ last_assistant_message: long }))).toEqual({})
+  expect(nexts).toBe(1)
+  const sent = sends(world.calls)
+  expect(sent.length).toBe(1)
+  expect(at(sent, 0).from_session).toBe(DEFAULT_SESSION_ID)
+  expect(at(sent, 0).to).toBe('slack')
+  expect(at(sent, 0).body.startsWith('Waiting for you.\nk=1 token=[redacted] ')).toBe(true)
+  expect(at(sent, 0).body.length).toBe('Waiting for you.\n'.length + 1500)
+})
+
+test('the idle ping is not posted outside auto mode, for a subagent, or with prompts off', async ($, on) => {
+  const world = await promptWorld($, on, promptServer(), {}, o => o('classic.Stop', () => ({})))
+  await $.classic.Stop(stop({ permission_mode: 'default' }))
+  await $.classic.Stop(stop({ permission_mode: 'acceptEdits' }))
+  await $.classic.Stop(stop({ agent_id: 'agent-7', agent_type: 'reviewer' }))
+  expect(sends(world.calls)).toEqual([])
+})
+
+test('the idle ping is not posted when the switch is off', async ($, on) => {
+  const off = await promptWorld($, on, promptServer(), { env: { AGENTBUS_SLACK_PROMPTS: '0' } }, o => o('classic.Stop', () => ({})))
+  await $.classic.Stop(stop())
+  expect(sends(off.calls)).toEqual([])
+})
+
+// Pure pieces.
+test('redact masks the token and the shapes of other secrets, and leaves ordinary text alone', () => {
+  const secrets = [
+    'xoxb-1234-abcd-efgh',
+    'xoxp-1234-abcd',
+    'xapp-1-A0B1C2-3456',
+    'sk-abcdefgh12345678',
+    'sk-ant-api03-abcdefghijkl',
+    'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+    'gho_abcdefghijklmnopqrstuvwxyz0123456789',
+    'github_pat_11ABCDEFG0abcdefghij_klmnop',
+    'AKIAIOSFODNN7EXAMPLE',
+    'Bearer abcdefghijklmnop.qrstuv',
+  ]
+  for (const s of secrets) expect(redact(`run ${s} now`), s).toBe('run [redacted] now')
+  expect(redact('-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- tail')).toBe('[redacted] tail')
+  expect(redact('curl -d password=hunter2 -d secret="a b" -d token=abc')).toBe('curl -d password=[redacted] -d secret=[redacted] -d token=[redacted]')
+  expect(redact('risk-assessment of the task-list')).toBe('risk-assessment of the task-list')
+  expect(redact('plain text, a Bearer of news')).toBe('plain text, a Bearer of news')
+})
+
+test('the proxy token is redacted from a prompt too', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [ANSWER({ choice: 'allow' })] }))
+  await $.classic.PermissionRequest(permission({}, 'Bash', { command: 'echo test-token' }))
+  expect((at(opens(world.calls), 0).body as { detail: string }).detail).toBe('echo [redacted]')
+})
+
+test('stable JSON sorts keys at every depth and the key is a sha-256 hex digest', async () => {
+  expect(stableJSON({ b: 1, a: { d: [3, { y: 1, x: 2 }], c: undefined } })).toBe('{"a":{"d":[3,{"x":2,"y":1}]},"b":1}')
+  const a = await promptKey('', 'Bash', { command: 'ls', description: 'd' })
+  expect(a).toMatch(/^[0-9a-f]{64}$/)
+  expect(await promptKey('', 'Bash', { description: 'd', command: 'ls' })).toBe(a)
+  expect(await promptKey('agent-1', 'Bash', { command: 'ls', description: 'd' })).not.toBe(a)
+  // A tool.call's arguments key like the dialog's tool_input once the envelope is gone.
+  const envelope = { tool: 'Bash', tool_use_id: 'tu_1', agentId: 'agent-1', requestMeta: { x: 1 }, consent: true, command: 'ls', description: 'd' }
+  expect(await callKey(envelope)).toBe(await promptKey('agent-1', 'Bash', { command: 'ls', description: 'd' }))
+  expect(await callKey({ tool: 'Bash', command: 'ls', description: 'd' })).toBe(a)
+})
+
+test('decisionFor offers always only with suggestions', () => {
+  expect(decisionFor({ tool_name: 'Bash', tool_input: {} }, { choice: 'always' })).toEqual({ behavior: 'allow' })
+  expect(decisionFor({ tool_name: 'Bash', tool_input: {}, permission_suggestions: [] }, { choice: 'always' })).toEqual({ behavior: 'allow' })
+  expect(decisionFor({ tool_name: 'Bash', tool_input: {} }, { choice: 'nonsense' })).toBeNull()
 })

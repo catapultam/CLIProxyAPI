@@ -4,7 +4,7 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.4.1'
+export const VERSION = '0.5.0'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
@@ -425,8 +425,24 @@ const BUS_NAME = /^[A-Za-z0-9._-]{1,64}$/
 
 // Keeps the proxy token out of anything posted to Slack. Runs before any cut, so no prefix of the
 // token survives a truncation.
-function redact(text: string): string {
-  return token ? text.split(token).join('[redacted]') : text
+// It also masks the shapes of other secrets (Slack, OpenAI and Anthropic, GitHub and AWS keys, private
+// keys, bearer tokens, password=/token=/secret= values), for the prompts and the idle ping.
+const SECRET_SHAPES: Array<[RegExp, string]> = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[redacted]'],
+  [/\bxox[abpr]-[A-Za-z0-9-]{4,}/g, '[redacted]'],
+  [/\bxapp-[A-Za-z0-9-]{4,}/g, '[redacted]'],
+  [/\bsk-[A-Za-z0-9_-]{8,}/g, '[redacted]'],
+  [/\b(?:ghp|gho)_[A-Za-z0-9]{16,}/g, '[redacted]'],
+  [/\bgithub_pat_[A-Za-z0-9_]{16,}/g, '[redacted]'],
+  [/\bAKIA[0-9A-Z]{16}\b/g, '[redacted]'],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, '[redacted]'],
+  [/\b(passw(?:or)?d|token|secret)(\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s"']+)/gi, '$1$2[redacted]'],
+]
+
+export function redact(text: string): string {
+  let out = token ? text.split(token).join('[redacted]') : text
+  for (const [shape, to] of SECRET_SHAPES) out = out.replace(shape, to)
+  return out
 }
 
 function errorText(err: unknown): string {
@@ -1036,6 +1052,456 @@ async function waitOnce($: EngineInterface) {
   }
 }
 
+// Slack prompts (0.5.0). The proxy's Slack bridge posts a blocking prompt to an owner's DM and takes the
+// answer; this side notices the prompt, races the terminal dialog against that answer, and closes the
+// prompt when its call settles. Everything fails open: on any error the terminal dialog is all there is,
+// and `next(e)` runs once, never twice.
+
+// Set from the last hello's `prompts`; the environment switch and a non-interactive session turn it off.
+let helloPrompts = false
+let promptsAllowed = false
+// The most text of one prompt sent to the proxy, after redaction; the cut is always said.
+const MAX_DETAIL_CHARS = 100_000
+const PLAN_MAX_AGE_MS = 6 * 60 * 60 * 1000
+const PLAN_MISSING = 'The plan text was not available; it is in the terminal.'
+
+function promptsActive(): boolean {
+  return promptsAllowed && helloPrompts && Boolean(base && token && session)
+}
+
+// Keys sorted at every depth, so equal inputs hash equal whatever order they were built in.
+export function stableJSON(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(v => stableJSON(v === undefined ? null : v)).join(',')}]`
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    const parts = Object.keys(obj)
+      .filter(k => obj[k] !== undefined)
+      .sort()
+      .map(k => `${JSON.stringify(k)}:${stableJSON(obj[k])}`)
+    return `{${parts.join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+// sha-256 hex of agent|tool|stable JSON of the input: the proxy's key for one prompt.
+export async function promptKey(agent: string, tool: string, input: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(`${agent}|${tool}|${stableJSON(input)}`)
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+  return Array.from(digest, b => b.toString(16).padStart(2, '0')).join('')
+}
+
+// What a tool.call hook gets, less the envelope: it should equal a PermissionRequest's tool_input (G4).
+const ENVELOPE_KEYS = new Set(['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'])
+
+export async function callKey(e: object): Promise<string> {
+  const rec = e as Record<string, unknown>
+  const input: Record<string, unknown> = {}
+  for (const k of Object.keys(rec)) if (!ENVELOPE_KEYS.has(k)) input[k] = rec[k]
+  const agent = typeof rec.agentId === 'string' ? rec.agentId : ''
+  return promptKey(agent, String(rec.tool ?? ''), input)
+}
+
+// The text cut to max, said when it was.
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text
+  return `${text.slice(0, max)}\n[${text.length - max} more characters not sent]`
+}
+
+function previewLines(text: string, sign: string): string {
+  return text
+    .split('\n')
+    .map(l => sign + l)
+    .join('\n')
+}
+
+// The detail a permission prompt shows, before redaction.
+export function permissionDetail(tool: string, input: unknown): string {
+  const inp = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
+  const str = (v: unknown) => (typeof v === 'string' ? v : '')
+  if (tool === 'Bash' && typeof inp.command === 'string') return inp.command
+  if (tool === 'Edit' && typeof inp.file_path === 'string') {
+    return `${inp.file_path}\n${previewLines(str(inp.old_string), '- ')}\n${previewLines(str(inp.new_string), '+ ')}`
+  }
+  if (tool === 'MultiEdit' && typeof inp.file_path === 'string' && Array.isArray(inp.edits)) {
+    const edits = (inp.edits as Array<Record<string, unknown>>).map(
+      ed => `${previewLines(str(ed?.old_string), '- ')}\n${previewLines(str(ed?.new_string), '+ ')}`,
+    )
+    return `${inp.file_path}\n${edits.join('\n@@\n')}`
+  }
+  if (tool === 'Write' && typeof inp.file_path === 'string') return `${inp.file_path}\n${previewLines(str(inp.content), '+ ')}`
+  if (tool === 'WebFetch' && typeof inp.url === 'string') return inp.prompt ? `${inp.url}\n${str(inp.prompt)}` : inp.url
+  try {
+    return JSON.stringify(input, null, 2) ?? String(input)
+  } catch {
+    return String(input)
+  }
+}
+
+// An ExitPlanMode plan: tool_input.plan, else the newest plan file changed in the last 6 hours.
+async function planText($: EngineInterface, input: unknown): Promise<string> {
+  const plan = (input as { plan?: unknown } | null)?.plan
+  if (typeof plan === 'string' && plan.trim()) return plan
+  try {
+    const home = ((await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? '').replace(/[\\/]+$/, '')
+    if (!home) return PLAN_MISSING
+    const dir = `${home}/.claude/plans`
+    const now = await $.clock.now()
+    const files = (await $.fs.list(dir))
+      .filter(f => f.kind === 'file' && f.name.toLowerCase().endsWith('.md') && now - f.mtimeMs <= PLAN_MAX_AGE_MS)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    if (files[0]) {
+      const text = await $.fs.read(`${dir}/${files[0].name}`)
+      if (text.trim()) return text
+    }
+  } catch {
+    // No plans folder or unreadable: the plan stays in the terminal.
+  }
+  return PLAN_MISSING
+}
+
+type PromptOutcome = 'ran' | 'denied' | 'answered' | 'cancelled' | 'ended'
+type PromptRec = { id: string; key: string; sid: string; slackDeny: boolean }
+// Every prompt this mod opened and has not closed: by id, and by the key of the call it belongs to.
+const openPrompts = new Map<string, PromptRec>()
+const idsByKey = new Map<string, Set<string>>()
+// The tool calls in flight by key (how many), and the last result of a key that has none left.
+const inflight = new Map<string, number>()
+type CallResult = 'ran' | 'denied' | 'errored' | 'cancelled'
+const settledCalls = new Map<string, CallResult>()
+const MAX_SETTLED = 200
+
+function track(rec: PromptRec) {
+  openPrompts.set(rec.id, rec)
+  const ids = idsByKey.get(rec.key) ?? new Set<string>()
+  ids.add(rec.id)
+  idsByKey.set(rec.key, ids)
+}
+
+function untrack(id: string): PromptRec | undefined {
+  const rec = openPrompts.get(id)
+  if (!rec) return undefined
+  openPrompts.delete(id)
+  const ids = idsByKey.get(rec.key)
+  ids?.delete(id)
+  if (ids && ids.size === 0) idsByKey.delete(rec.key)
+  return rec
+}
+
+// POST /prompt/resolve. The id leaves the registry first, so no other path resolves it again with
+// another outcome.
+async function resolveId($: EngineInterface, id: string, outcome: PromptOutcome, note?: string) {
+  const rec = untrack(id)
+  if (!rec) return
+  try {
+    await bus($, 'POST', '/prompt/resolve', { session: rec.sid, id, outcome, ...(note ? { note } : {}) })
+  } catch {
+    // The proxy closes the prompt itself when its session ends or after 24 hours.
+  }
+}
+
+async function resolveAll($: EngineInterface, outcome: PromptOutcome) {
+  await Promise.all([...openPrompts.keys()].map(id => resolveId($, id, outcome)))
+}
+
+function outcomeFor(rec: PromptRec | undefined, result: CallResult): PromptOutcome {
+  if (result === 'ran' || result === 'denied') return result
+  // An errored result is a refusal when the person refused from Slack; otherwise it is not known to be
+  // either way, so it is only said to be over.
+  return rec?.slackDeny ? 'denied' : 'cancelled'
+}
+
+function closeKey($: EngineInterface, key: string, result: CallResult) {
+  for (const id of [...(idsByKey.get(key) ?? [])]) void resolveId($, id, outcomeFor(openPrompts.get(id), result))
+}
+
+// A tool.call is starting: counted under its key until it settles.
+async function callStarted(e: object): Promise<string> {
+  if (!promptsActive()) return ''
+  try {
+    const key = await callKey(e)
+    inflight.set(key, (inflight.get(key) ?? 0) + 1)
+    settledCalls.delete(key)
+    return key
+  } catch {
+    return ''
+  }
+}
+
+function callSettled($: EngineInterface, key: string, result: CallResult) {
+  if (!key) return
+  const left = (inflight.get(key) ?? 1) - 1
+  if (left > 0) {
+    inflight.set(key, left)
+    return
+  }
+  inflight.delete(key)
+  settledCalls.set(key, result)
+  if (settledCalls.size > MAX_SETTLED) settledCalls.delete(settledCalls.keys().next().value as string)
+  closeKey($, key, result)
+}
+
+// Reports how the call came out without touching the promise: the caller returns the same one.
+function watchCall<T extends { deny?: string; isError?: boolean }>($: EngineInterface, key: string, signal: AbortSignal, p: Promise<T>): Promise<T> {
+  if (!key) return p
+  p.then(
+    r => callSettled($, key, signal.aborted ? 'cancelled' : r.deny !== undefined ? 'denied' : r.isError ? 'errored' : 'ran'),
+    () => callSettled($, key, 'cancelled'),
+  )
+  return p
+}
+
+type PromptBody = {
+  kind: 'permission' | 'plan' | 'question'
+  title: string
+  detail: string
+  agent?: string
+  always?: boolean
+  questions?: object[]
+}
+
+// Opens the prompt (or joins the open one under the same key) and registers it under `key`. Null when
+// prompts are off, the proxy refuses, or it cannot be reached. A call that already settled by the time
+// the post returned closes the prompt at once, with its result.
+async function openPrompt($: EngineInterface, key: string, body: PromptBody): Promise<PromptRec | null> {
+  const sid = session
+  try {
+    const res = await bus($, 'POST', '/prompt', { session: sid, key, ...body })
+    const id = res.json?.id
+    if (res.status !== 200 || typeof id !== 'string' || !id) return null
+    const rec = openPrompts.get(id) ?? { id, key, sid, slackDeny: false }
+    track(rec)
+    const settled = settledCalls.get(key)
+    if (body.kind !== 'question' && settled && !inflight.has(key)) void resolveId($, id, outcomeFor(rec, settled))
+    return rec
+  } catch {
+    return null
+  }
+}
+
+type PromptAnswer = { choice?: string; reason?: string; answers?: Record<string, unknown>; by?: string }
+type Waited = { kind: 'answer'; answer: PromptAnswer } | { kind: 'closed' } | { kind: 'failed' } | { kind: 'stopped' }
+
+// Long-polls the answer, one fetch per iteration (the hook's budget is frozen while a fetch is in
+// flight, and no $.clock wait is used, which would not be). 404: the proxy lost the prompt (a restart),
+// so it is opened again once per streak of 404s; a second one in a row, or three errors in a row, give up.
+export async function waitAnswer(
+  $: EngineInterface,
+  sid: string,
+  firstId: string,
+  opts: { reopen?: () => Promise<string | null>; stopped?: () => boolean } = {},
+): Promise<Waited> {
+  let id = firstId
+  let errors = 0
+  let reopened = false
+  for (;;) {
+    if (opts.stopped?.()) return { kind: 'stopped' }
+    let res: { status: number; json: Record<string, unknown> | null }
+    try {
+      res = await bus($, 'GET', `/prompt/wait?session=${encodeURIComponent(sid)}&id=${encodeURIComponent(id)}`)
+    } catch {
+      if (++errors >= 3) return { kind: 'failed' }
+      continue
+    }
+    if (res.status === 200) {
+      const answer = res.json?.answer
+      if (answer && typeof answer === 'object') return { kind: 'answer', answer: answer as PromptAnswer }
+    } else if (res.status === 204) {
+      errors = 0
+      reopened = false
+      continue
+    } else if (res.status === 410) {
+      return { kind: 'closed' }
+    } else if (res.status === 404) {
+      if (reopened || !opts.reopen) return { kind: 'failed' }
+      reopened = true
+      const next = await opts.reopen().catch(() => null)
+      if (!next) return { kind: 'failed' }
+      id = next
+      continue
+    }
+    if (++errors >= 3) return { kind: 'failed' }
+  }
+}
+
+function deniedMessage(by: string | undefined, reason: string | undefined): string {
+  return `Denied from Slack by ${by || 'an owner'}${reason ? `: ${reason}` : ''}`
+}
+
+type PermissionHookInput = {
+  tool_name: string
+  tool_input: unknown
+  permission_suggestions?: unknown[]
+  agent_id?: string
+  agent_type?: string
+}
+
+// The decision a Slack answer stands for, or null when it names none this prompt offers.
+export function decisionFor(e: PermissionHookInput, answer: PromptAnswer): { behavior: string } | null {
+  const suggestions = Array.isArray(e.permission_suggestions) ? e.permission_suggestions : []
+  const setMode = (mode: string) => [{ type: 'setMode', mode, destination: 'session' }]
+  switch (answer.choice) {
+    case 'allow':
+      return { behavior: 'allow' }
+    case 'always':
+      return suggestions.length > 0
+        ? { behavior: 'allow', updatedPermissions: JSON.parse(JSON.stringify(suggestions)) } as { behavior: string }
+        : { behavior: 'allow' }
+    case 'deny':
+      return { behavior: 'deny', message: deniedMessage(answer.by, answer.reason) } as { behavior: string }
+    case 'approve_accept_edits':
+      return { behavior: 'allow', updatedPermissions: setMode('acceptEdits') } as { behavior: string }
+    case 'approve':
+      return { behavior: 'allow', updatedPermissions: setMode('default') } as { behavior: string }
+    case 'keep_planning':
+      return { behavior: 'deny', message: answer.reason?.trim() ? answer.reason : 'Keep planning.' } as { behavior: string }
+  }
+  return null
+}
+
+// A PermissionRequest answered from Slack: the decision, or null to leave it to the terminal dialog.
+async function askSlackPermission($: EngineInterface, e: PermissionHookInput, signal: AbortSignal) {
+  const tool = e.tool_name
+  const agentId = e.agent_id ?? ''
+  const key = await promptKey(agentId, tool, e.tool_input)
+  const isPlan = tool === 'ExitPlanMode'
+  const raw = isPlan ? await planText($, e.tool_input) : permissionDetail(tool, e.tool_input)
+  const body: PromptBody = {
+    kind: isPlan ? 'plan' : 'permission',
+    title: redact(isPlan ? 'Plan ready for approval' : `${tool} wants to run`).slice(0, 150),
+    detail: clip(redact(raw), MAX_DETAIL_CHARS),
+  }
+  if (agentId) body.agent = redact(e.agent_type || agentId).slice(0, 100)
+  if (!isPlan && Array.isArray(e.permission_suggestions) && e.permission_suggestions.length > 0) body.always = true
+  const rec = await openPrompt($, key, body)
+  if (!rec) return null
+  const waited = await waitAnswer($, rec.sid, rec.id, {
+    reopen: async () => {
+      const again = await openPrompt($, key, body)
+      if (!again) return null
+      if (again.id !== rec.id) untrack(rec.id)
+      return again.id
+    },
+    stopped: () => signal.aborted,
+  })
+  if (waited.kind !== 'answer') return null
+  const decision = decisionFor(e, waited.answer)
+  if (!decision) return null
+  if (decision.behavior === 'deny') for (const id of idsByKey.get(key) ?? []) {
+    const r = openPrompts.get(id)
+    if (r) r.slackDeny = true
+  }
+  return { decision }
+}
+
+type AskQuestion = {
+  question: string
+  header?: string
+  kind?: 'choice' | 'text' | 'number'
+  options?: ReadonlyArray<{ label: string; description?: string }>
+  multiSelect?: boolean
+  min?: number
+  max?: number
+  step?: number
+  unit?: string
+}
+
+// A question's answers, as AskUserQuestion's output keeps them: by question text; a choice by its label
+// (an Other text as typed), several choices comma-joined, a number as a string. Null when no answer
+// maps (the terminal dialog is then left to answer).
+export function mapAnswers(questions: ReadonlyArray<AskQuestion>, answers: Record<string, unknown> | undefined): Record<string, string> | null {
+  if (!answers || typeof answers !== 'object') return null
+  const out: Record<string, string> = {}
+  questions.slice(0, 4).forEach((q, i) => {
+    const raw = answers[`q${i + 1}`]
+    if (raw === undefined || raw === null || raw === '') return
+    const options = q.options ?? []
+    const label = (v: unknown) => {
+      const s = String(v)
+      const m = /^o(\d+)$/.exec(s)
+      const opt = m ? options[Number(m[1]) - 1] : undefined
+      return opt ? opt.label : s
+    }
+    const text = Array.isArray(raw) ? raw.map(label).join(', ') : q.kind === 'text' || q.kind === 'number' ? String(raw) : label(raw)
+    if (text) out[q.question] = text
+  })
+  return Object.keys(out).length > 0 ? out : null
+}
+
+function questionPayload(questions: ReadonlyArray<AskQuestion>): object[] {
+  return questions.slice(0, 4).map((q, i) => {
+    const kind = q.kind === 'text' || q.kind === 'number' ? q.kind : 'choice'
+    const out: Record<string, unknown> = {
+      id: `q${i + 1}`,
+      text: redact(q.question),
+      header: redact(q.header ?? ''),
+      kind,
+    }
+    if (kind === 'choice') {
+      out.multi = q.multiSelect === true
+      out.options = (q.options ?? []).slice(0, 10).map((o, j) => ({
+        id: `o${j + 1}`,
+        label: redact(o.label),
+        ...(o.description ? { description: redact(o.description) } : {}),
+      }))
+    } else if (kind === 'number') {
+      for (const k of ['min', 'max', 'step'] as const) if (typeof q[k] === 'number') out[k] = q[k]
+      if (q.unit) out.unit = redact(q.unit)
+    }
+    return out
+  })
+}
+
+// One AskUserQuestion's remote half: the prompt it opened, and whether it was ended without waiting.
+type QuestionRace = { stop: boolean; rec?: PromptRec; final?: { outcome: PromptOutcome; note?: string } }
+
+// Opens the question prompt and waits; resolves to the answers keyed by question text, or null. Never
+// throws.
+async function askSlackQuestion(
+  $: EngineInterface,
+  e: { questions: ReadonlyArray<AskQuestion>; agentId?: string },
+  key: string,
+  race: QuestionRace,
+): Promise<Record<string, string> | null> {
+  try {
+    const questions = e.questions
+    const body: PromptBody = {
+      kind: 'question',
+      title: 'Claude has a question',
+      detail: redact(questions.map(q => q.question).join('\n')),
+      questions: questionPayload(questions),
+    }
+    if (e.agentId) body.agent = redact(e.agentId).slice(0, 100)
+    const rec = await openPrompt($, key, body)
+    if (!rec) return null
+    race.rec = rec
+    if (race.final) {
+      await resolveId($, rec.id, race.final.outcome, race.final.note)
+      return null
+    }
+    const waited = await waitAnswer($, rec.sid, rec.id, {
+      reopen: async () => {
+        const again = await openPrompt($, key, body)
+        if (!again) return null
+        if (again.id !== rec.id) untrack(rec.id)
+        race.rec = again
+        return again.id
+      },
+      stopped: () => race.stop,
+    })
+    if (waited.kind !== 'answer') return null
+    return mapAnswers(questions, waited.answer.answers)
+  } catch {
+    return null
+  }
+}
+
+// Ends the question prompt from the local side (or after a remote answer); safe before the post returned.
+async function finishQuestion($: EngineInterface, race: QuestionRace, outcome: PromptOutcome, note?: string) {
+  race.stop = true
+  race.final = { outcome, note }
+  if (race.rec) await resolveId($, race.rec.id, outcome, note)
+}
+
 export const register: Register = on => {
   // Registered first, so it is this plugin's outermost tool.call hook and sees the result after the
   // ListAgents and SendMessage hooks below rewrote it. Every main-loop tool result the model asked for
@@ -1043,9 +1509,12 @@ export const register: Register = on => {
   // the result. Not a subagent's call, not one another plugin made ($.tool.call), not a refused or
   // abandoned call: the messages then stay held for the next result, or run as prompts after the turn.
   on('tool.call', async ($, e, next) => {
-    if (e.agentId || next.origin.plugin !== 'engine') return next(e)
+    // Every call is counted under its key before the guards below, a subagent's and another plugin's too,
+    // so a prompt opened for it closes when it settles (Slack prompts).
+    const callTag = promptsActive() ? await callStarted(e) : ''
+    if (e.agentId || next.origin.plugin !== 'engine') return watchCall($, callTag, next.signal, next(e))
     // Whatever arrived while the tool ran counts too, so the check for held messages comes after it.
-    const answered = await next(e)
+    const answered = await watchCall($, callTag, next.signal, next(e))
     if (next.signal.aborted || answered.deny !== undefined || midTurn.length === 0) return answered
     // Taken before the append is awaited, so a parallel tool result (concurrency-safe tools run at once,
     // each result through this hook) can't deliver them again; put back at the front if it fails.
@@ -1091,12 +1560,20 @@ export const register: Register = on => {
     machine = await machineName($)
     session = await $.session.id()
     ended = false
+    helloPrompts = false
+    openPrompts.clear()
+    idsByKey.clear()
+    inflight.clear()
+    settledCalls.clear()
+    promptsAllowed = e.isInteractive === true && (await $.env.get('AGENTBUS_SLACK_PROMPTS')) !== '0'
     if (base && token && session) {
       try {
         const { json } = await bus($, 'POST', '/hello', { session, machine, cwd: e.cwd, mod: true, version: VERSION })
         address = (json?.address as string) ?? ''
+        helloPrompts = json?.prompts === true
       } catch {
         address = ''
+        helloPrompts = false
       }
       if (address) $.ui.log(`on the agentbus as ${address}`)
       // Polling only where a person is at the prompt: a one-shot `claude -p` run could never show
@@ -1114,8 +1591,10 @@ export const register: Register = on => {
             try {
               const { json } = await bus($, 'POST', '/hello', { session, machine, mod: true, version: VERSION, previous })
               address = (json?.address as string) ?? ''
+              helloPrompts = json?.prompts === true
             } catch {
               address = ''
+              helloPrompts = false
             }
           }
           if (isWaiting || (await $.clock.now()) < retryAt) return
@@ -1136,7 +1615,7 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     cancelWorking()
     try {
-      await Promise.race([bus($, 'POST', '/bye', { session }), $.clock.sleep(1000)])
+      await Promise.race([Promise.all([resolveAll($, 'ended'), bus($, 'POST', '/bye', { session })]), $.clock.sleep(1000)])
     } catch {
       // Exiting; nothing to do about a failed bye.
     }
@@ -1201,6 +1680,8 @@ export const register: Register = on => {
     if (!e.agentId) {
       cancelWorking()
       inTurn = false
+      // Whatever prompt is still open belongs to a call this turn no longer waits on.
+      void resolveAll($, 'cancelled')
       // A turn that did not end with an answer may never have acted on the messages delivered into
       // it: they run again as prompts (submitMessage tracks them afresh, so this turn doesn't ack them).
       if (e.reason !== 'answer') for (const m of deliveredThisTurn) void submitMessage($, m)
@@ -1216,6 +1697,63 @@ export const register: Register = on => {
     }
     return next(e)
   })
+
+  // Permission dialogs and plan approvals, also answerable from Slack. The dialog stays up beside the
+  // prompt; a keyboard answer wins and this hook's late answer is ignored. AskUserQuestion is handled by
+  // the tool.call race below. Any failure leaves the terminal dialog alone, with next(e) run once.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    if (!promptsActive() || e.tool_name === 'AskUserQuestion') return next(e)
+    let answered: Awaited<ReturnType<typeof askSlackPermission>> = null
+    try {
+      answered = await askSlackPermission($, e as unknown as PermissionHookInput, next.signal)
+    } catch {
+      answered = null
+    }
+    // The decision's shape is checked by decisionFor.
+    return answered ? (answered as never) : next(e)
+  }).catch(($, e, next) => next(e))
+
+  // AskUserQuestion: the terminal dialog and the Slack prompt race. The dialog's own next(e) promise is
+  // kept and returned when it wins or Slack fails, so next is called exactly once.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    if (!promptsActive()) return next(e)
+    const local = next(e)
+    const localDone = local.then(
+      r => ({ r }),
+      err => ({ err }),
+    )
+    const race: QuestionRace = { stop: false }
+    let remote: Promise<Record<string, string> | null>
+    try {
+      const key = await callKey(e)
+      remote = askSlackQuestion($, e as unknown as { questions: AskQuestion[]; agentId?: string }, key, race)
+    } catch {
+      remote = Promise.resolve(null)
+    }
+    const first = await Promise.race([localDone, remote.then(answers => ({ answers }))])
+    if ('answers' in first && first.answers) {
+      await finishQuestion($, race, 'answered')
+      return { result: { questions: e.questions, answers: first.answers } } as never
+    }
+    if ('answers' in first) return local
+    await finishQuestion($, race, 'answered', 'terminal')
+    return local
+  }).catch(($, e, next) => next(e))
+
+  // The idle ping: a main-loop turn that ends in auto mode tells the session's Slack thread it is waiting.
+  // It never blocks the stop.
+  on('classic.Stop', async ($, e, next) => {
+    if (promptsActive() && !e.agent_id && e.permission_mode === 'auto') {
+      try {
+        const last = redact(e.last_assistant_message ?? '').slice(0, 1500)
+        await bus($, 'POST', '/send', { from_session: session, to: 'slack', body: `Waiting for you.
+${last}` })
+      } catch {
+        // The proxy is unreachable; the stop goes on.
+      }
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
     const to = typeof e.to === 'string' ? e.to.trim() : ''
