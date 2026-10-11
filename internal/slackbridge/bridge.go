@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -35,6 +36,9 @@ type Config struct {
 	CommandsDir string
 	// APIBase overrides https://slack.com/api/ (tests).
 	APIBase string
+	// Secrets are extra literal values (proxy API keys) that prompt text is
+	// scrubbed of before it is posted, besides the bot and app tokens.
+	Secrets []string
 }
 
 // parseHome reads a home setting, case-insensitively: homeDM or homeChannel
@@ -65,6 +69,7 @@ var (
 	_ agentbus.ImagePoster  = (*Bridge)(nil)
 	_ agentbus.OwnerChecker = (*Bridge)(nil)
 	_ agentbus.OwnerLister  = (*Bridge)(nil)
+	_ agentbus.PromptBridge = (*Bridge)(nil)
 )
 
 // Bridge links the agentbus to one Slack channel. It implements
@@ -158,6 +163,20 @@ type Bridge struct {
 	// runCtx is the context of the running bridge (Start), for work started
 	// outside the job queue.
 	runCtx context.Context
+
+	// connected is set while the Socket Mode connection is up (Slack said
+	// hello), for the prompts capability.
+	connected atomic.Bool
+	// promptByID, promptByKey (by session and key) and promptThreads (the
+	// DM thread a session's prompts go under) hold the prompts (see
+	// prompts.go); promptMu guards them and every prompt in them, and is
+	// never held across a Slack or Store call. promptWaitFor overrides the
+	// /prompt/wait long-poll (tests).
+	promptMu      sync.Mutex
+	promptByID    map[string]*prompt
+	promptByKey   map[string]*prompt
+	promptThreads map[string]promptThread
+	promptWaitFor time.Duration
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -680,10 +699,18 @@ func (b *Bridge) enqueue(j job) {
 // the command queue is full, the new job is dropped (a remove has already
 // been applied by then; only its reply is lost).
 func (b *Bridge) enqueueCommand(j job) {
+	if !b.offerCommand(j) {
+		log.Warn("slack: command queue full, dropped a command job")
+	}
+}
+
+// offerCommand adds a command job and reports whether the queue took it.
+func (b *Bridge) offerCommand(j job) bool {
 	select {
 	case b.commands <- j:
+		return true
 	default:
-		log.Warn("slack: command queue full, dropped a command job")
+		return false
 	}
 }
 

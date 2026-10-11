@@ -30,6 +30,7 @@ func (b *Bridge) SessionMoved(oldID, newID string) {
 		return
 	}
 	b.state.moveSession(oldID, newID)
+	b.movePrompts(oldID, newID)
 	log.Infof("slack: routing of %s moved to %s", shortID(oldID), shortID(newID))
 }
 

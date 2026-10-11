@@ -402,3 +402,24 @@ func (a *api) openConnection(ctx context.Context, token string) (string, error) 
 	}
 	return body.Get("url").String(), nil
 }
+
+// postBlocks posts blocks (a JSON array) with text as the plain fallback,
+// into threadTS when set, and returns the new message's ts.
+func (a *api) postBlocks(ctx context.Context, token, channel, text, blocks, threadTS string) (string, error) {
+	params := url.Values{"channel": {channel}, "text": {text}, "blocks": {blocks}}
+	if threadTS != "" {
+		params.Set("thread_ts", threadTS)
+	}
+	body, err := a.call(ctx, token, "chat.postMessage", params)
+	if err != nil {
+		return "", err
+	}
+	return body.Get("ts").String(), nil
+}
+
+// updateMessage replaces the text and blocks (a JSON array) of the bot's
+// message ts in channel. chat:write covers it.
+func (a *api) updateMessage(ctx context.Context, token, channel, ts, text, blocks string) error {
+	_, err := a.call(ctx, token, "chat.update", url.Values{"channel": {channel}, "ts": {ts}, "text": {text}, "blocks": {blocks}})
+	return err
+}

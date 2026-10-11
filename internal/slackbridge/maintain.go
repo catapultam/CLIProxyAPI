@@ -25,6 +25,8 @@ func (b *Bridge) runMaintenance(ctx context.Context) {
 	defer flush.Stop()
 	housekeeping := time.NewTicker(maintainEvery)
 	defer housekeeping.Stop()
+	prompts := time.NewTicker(promptSweepEvery)
+	defer prompts.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -33,6 +35,8 @@ func (b *Bridge) runMaintenance(ctx context.Context) {
 			if errFlush := b.state.flush(); errFlush != nil {
 				logSaveError(errFlush)
 			}
+		case <-prompts.C:
+			b.sweepPrompts()
 		case <-housekeeping.C:
 			b.maintain()
 			b.refreshBotName(ctx)

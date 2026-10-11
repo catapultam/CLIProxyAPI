@@ -369,6 +369,8 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 		ts := "1700000000." + strconv.Itoa(100000+f.nextTS)
 		f.mu.Unlock()
 		writeJSON(w, map[string]any{"ok": true, "ts": ts, "channel": r.PostForm.Get("channel")})
+	case "chat.update":
+		writeJSON(w, map[string]any{"ok": true, "ts": r.PostForm.Get("ts"), "channel": r.PostForm.Get("channel")})
 	case "reactions.add", "reactions.remove":
 		key := reactionKey{r.PostForm.Get("channel"), r.PostForm.Get("timestamp"), r.PostForm.Get("name")}
 		f.mu.Lock()

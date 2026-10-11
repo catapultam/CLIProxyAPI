@@ -65,6 +65,7 @@ func (b *Bridge) connectOnce(ctx context.Context) (bool, error) {
 	if errDial != nil {
 		return false, dialError(errDial)
 	}
+	defer b.connected.Store(false)
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	defer func() {
@@ -85,6 +86,7 @@ func (b *Bridge) connectOnce(ctx context.Context) (bool, error) {
 		switch env.Type {
 		case "hello":
 			connected = true
+			b.connected.Store(true)
 		case "disconnect":
 			return connected, nil
 		case "events_api":

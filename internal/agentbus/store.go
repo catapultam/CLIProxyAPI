@@ -763,13 +763,19 @@ func (s *Store) WaiterCurrent(id string, gen uint64) bool {
 // resolvable afterward.
 func (s *Store) Bye(id string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	sess, ok := s.byID[id]
 	if !ok {
+		s.mu.Unlock()
 		return
 	}
 	sess.Closed = true
 	s.dirty = true
+	pb, _ := s.bridge.(PromptBridge)
+	s.mu.Unlock()
+	if pb != nil {
+		// Without the lock: the bridge closes the session's open prompts.
+		pb.SessionEnded(id)
+	}
 }
 
 func (s *Store) statusLocked(sess *session, now time.Time) string {

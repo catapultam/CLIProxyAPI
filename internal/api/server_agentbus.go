@@ -62,6 +62,9 @@ func (s *Server) slackConfig() slackbridge.Config {
 		Home:          sc.Home,
 		StatePath:     s.runtimeStatePath("slack-state.json"),
 		CommandsDir:   s.runtimeStatePath("agent-commands"),
+		// The proxy's own API keys are redacted from prompt text posted to
+		// Slack. Read at bridge start, like the rest of this block.
+		Secrets: append([]string(nil), s.cfg.APIKeys...),
 	}
 }
 

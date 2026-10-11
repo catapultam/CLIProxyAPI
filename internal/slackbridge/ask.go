@@ -100,6 +100,16 @@ type interactivePayload struct {
 		Text  string `json:"text"`
 		TS    string `json:"ts"`
 	} `json:"message"`
+	// Actions, ResponseURL and Container come with a block_actions click.
+	Actions []struct {
+		ActionID string `json:"action_id"`
+		Value    string `json:"value"`
+	} `json:"actions"`
+	ResponseURL string `json:"response_url"`
+	Container   struct {
+		ChannelID string `json:"channel_id"`
+		MessageTS string `json:"message_ts"`
+	} `json:"container"`
 	View struct {
 		CallbackID      string `json:"callback_id"`
 		PrivateMetadata string `json:"private_metadata"`
@@ -115,6 +125,9 @@ type viewValue struct {
 	SelectedOption *struct {
 		Value string `json:"value"`
 	} `json:"selected_option"`
+	SelectedOptions []struct {
+		Value string `json:"value"`
+	} `json:"selected_options"`
 }
 
 // slashPayload is the part of a slash command payload the bridge reads.
@@ -140,6 +153,10 @@ func (b *Bridge) handleInteractive(raw json.RawMessage) map[string]any {
 		b.askShortcut(p)
 	case p.Type == "view_submission" && p.View.CallbackID == askViewCallbackID:
 		return b.askSubmit(p)
+	case p.Type == "block_actions" && hasPromptAction(p):
+		b.promptAction(p)
+	case p.Type == "view_submission" && p.View.CallbackID == promptModalID:
+		return b.promptSubmit(p)
 	}
 	return nil
 }

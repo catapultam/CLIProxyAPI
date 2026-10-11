@@ -31,6 +31,9 @@ func (s *Store) Register(group *gin.RouterGroup) {
 	group.POST("/dismiss", s.handleDismiss)
 	group.POST("/done", s.handleDone)
 	group.POST("/working", s.handleWorking)
+	group.POST("/prompt", s.handlePrompt)
+	group.GET("/prompt/wait", s.handlePromptWait)
+	group.POST("/prompt/resolve", s.handlePromptResolve)
 	group.POST("/slack/upload", s.handleSlackUpload)
 	group.GET("/image", s.handleImage)
 }
@@ -236,7 +239,11 @@ func (s *Store) handleHello(c *gin.Context) {
 			log.Infof("agentbus: %s can't take over %s: %v", s.Address(strings.TrimSpace(req.Session)), s.Address(prev), errHandOff)
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"address": s.Address(strings.TrimSpace(req.Session))})
+	prompts := false
+	if pb := s.promptBridge(); pb != nil {
+		prompts = pb.PromptsAvailable()
+	}
+	c.JSON(http.StatusOK, gin.H{"address": s.Address(strings.TrimSpace(req.Session)), "prompts": prompts})
 }
 
 type byeRequest struct {
