@@ -717,12 +717,15 @@ func TestPromptLateClickChangesNothing(t *testing.T) {
 	// Also after the prompt closed, and for a modal submit.
 	e.resolve(sidA, id, "ran")
 	e.click("UALEX", id, "deny")
-	if ack := e.submit("UALEX", id, map[string]any{}); ack == nil || ack["errors"].(map[string]string)["reason"] != "Already answered." {
+	// A late modal submit closes the modal (no errors map naming a block the
+	// modal may not have) and says so privately.
+	if ack := e.submit("UALEX", id, map[string]any{}); ack != nil {
 		t.Fatalf("late submit ack = %+v", ack)
 	}
 	drainJobs(t, e.b)
-	if got := len(e.f.callsTo("chat.postEphemeral")); got != 2 {
-		t.Fatalf("ephemerals = %d", got)
+	eph = e.f.callsTo("chat.postEphemeral")
+	if len(eph) != 3 || eph[2].Form.Get("text") != "This prompt is no longer open." {
+		t.Fatalf("ephemerals = %+v", eph)
 	}
 	if a := e.answerJSON(sidA, id); a.Get("choice").String() != "allow" {
 		t.Fatalf("answer changed to %s", a.Raw)
@@ -805,8 +808,11 @@ func TestPromptRedrawsAreCoalescedAndRenderTheLastState(t *testing.T) {
 	if got := len(e.updates()); got != 0 {
 		t.Fatalf("%d edits before the job ran", got)
 	}
-	if got := len(e.b.commands); got != 1 {
-		t.Fatalf("%d redraw jobs queued, want 1", got)
+	if got := len(e.b.commands); got != 0 {
+		t.Fatalf("%d jobs on the command queue, want 0 (redraws have their own path)", got)
+	}
+	if got := len(e.b.promptDirty); got != 1 {
+		t.Fatalf("%d prompts marked dirty, want 1", got)
 	}
 	drainJobs(t, e.b)
 	if got := len(e.updates()); got != 1 {
@@ -848,7 +854,7 @@ func TestPromptFailedEditIsRetriedWithTheLatestState(t *testing.T) {
 	}
 }
 
-func TestPromptEditSurvivesAFullCommandQueue(t *testing.T) {
+func TestPromptEditDoesNotUseTheCommandQueue(t *testing.T) {
 	e := newPromptEnv(t)
 	id := e.open(permReq(sidA, "k", nil))
 	for len(e.b.commands) < cap(e.b.commands) {
@@ -856,15 +862,36 @@ func TestPromptEditSurvivesAFullCommandQueue(t *testing.T) {
 	}
 	e.click("UALEX", id, "allow")
 	e.resolve(sidA, id, "ran")
-	drainJobs(t, e.b)
-	if len(e.updates()) != 0 {
-		t.Fatal("the edit was queued despite a full queue")
-	}
-	e.b.sweepPrompts()
-	drainJobs(t, e.b)
+	// The edit lands although the command queue is full, and leaves it full.
+	e.b.drainRedraws(context.Background())
 	if got := e.lastStatus(); got != "Allowed by alex · ran" {
 		t.Fatalf("status = %q", got)
 	}
+	if len(e.b.commands) != cap(e.b.commands) {
+		t.Fatal("a redraw took a command queue slot")
+	}
+}
+
+func TestPromptRedrawLoopRunsWithTheBridge(t *testing.T) {
+	e := newPromptEnv(t)
+	id := e.open(permReq(sidA, "k", nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.b.runRedraws(ctx)
+	}()
+	e.click("UALEX", id, "allow")
+	deadline := time.After(5 * time.Second)
+	for len(e.updates()) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("the redraw loop never edited the message")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
 }
 
 func TestPromptPermanentEditFailureGivesUp(t *testing.T) {
@@ -880,12 +907,28 @@ func TestPromptPermanentEditFailureGivesUp(t *testing.T) {
 	}
 }
 
+func TestPermanentEditErrors(t *testing.T) {
+	for _, code := range []string{"msg_too_long", "invalid_arguments", "invalid_blocks", "message_not_found", "cant_update_message", "channel_not_found"} {
+		if !permanentEditError(&apiError{method: "chat.update", code: code}) {
+			t.Errorf("%s is not permanent", code)
+		}
+	}
+	for _, code := range []string{"internal_error", "ratelimited"} {
+		if permanentEditError(&apiError{method: "chat.update", code: code}) {
+			t.Errorf("%s is permanent", code)
+		}
+	}
+}
+
 func TestPromptClickMakesNoSlackCallBeforeItsAck(t *testing.T) {
 	e := newPromptEnv(t)
 	id := e.open(permReq(sidA, "k", nil))
 	calls := len(e.f.methods())
 	if ack := e.click("UALEX", id, "allow"); ack != nil {
 		t.Fatalf("ack = %v", ack)
+	}
+	if got := len(e.f.methods()); got != calls {
+		t.Fatalf("click made %d Slack calls", got-calls)
 	}
 	e.resolve(sidA, id, "ran")
 	id2 := e.open(questionReq(sidA, "q"))
@@ -985,7 +1028,7 @@ func TestPromptEscapedChunksNeverSplitAnEntity(t *testing.T) {
 	}
 }
 
-func TestPromptExpiryCapsAndRetention(t *testing.T) {
+func TestPromptExpiryAndRetention(t *testing.T) {
 	e := newPromptEnv(t)
 	clock := newTestClock()
 	e.b.state.now = clock.now
@@ -999,14 +1042,12 @@ func TestPromptExpiryCapsAndRetention(t *testing.T) {
 		t.Fatalf("status = %q", got)
 	}
 
-	// A repeat within 10 minutes of the close gets the same prompt; after it, a new one.
+	// A resolved prompt stays findable by id for promptRetain: its waiter
+	// still gets the answer, then 410, then 404 once forgotten.
 	id2 := e.open(permReq(sidA, "k2", nil))
 	e.click("UALEX", id2, "allow")
 	e.resolve(sidA, id2, "ran")
 	clock.advance(promptRetain - time.Minute)
-	if same := e.open(permReq(sidA, "k2", nil)); same != id2 {
-		t.Fatal("a repeat inside the window got a new prompt")
-	}
 	if a := e.answerJSON(sidA, id2); a.Get("choice").String() != "allow" {
 		t.Fatalf("answer inside the window = %s", a.Raw)
 	}
@@ -1014,12 +1055,98 @@ func TestPromptExpiryCapsAndRetention(t *testing.T) {
 	if w := e.wait(sidA, id2); w.Code != http.StatusGone {
 		t.Fatalf("wait after the window = %d", w.Code)
 	}
-	if fresh := e.open(permReq(sidA, "k2", nil)); fresh == id2 {
-		t.Fatal("a repeat after the window got the old prompt")
-	}
 	clock.advance(promptForget + time.Minute)
+	e.b.sweepPrompts()
 	if w := e.wait(sidA, id2); w.Code != http.StatusNotFound {
 		t.Fatalf("forgotten prompt = %d", w.Code)
+	}
+}
+
+func TestPromptSweepExpiresOpenPrompts(t *testing.T) {
+	e := newPromptEnv(t)
+	clock := newTestClock()
+	e.b.state.now = clock.now
+	id := e.open(permReq(sidA, "k", nil))
+	clock.advance(promptTTL + time.Minute)
+	e.b.sweepPrompts()
+	e.b.promptMu.Lock()
+	state := e.b.promptByID[id].state
+	e.b.promptMu.Unlock()
+	if state != promptClosedState {
+		t.Fatal("the sweep left an expired prompt open")
+	}
+	// A repeat open of the key gets a new prompt.
+	if again := e.open(permReq(sidA, "k", nil)); again == id {
+		t.Fatal("an expired prompt was reused")
+	}
+}
+
+func TestPromptReopenAfterResolveMakesANewPromptWithoutAReplayedAnswer(t *testing.T) {
+	e := newPromptEnv(t)
+	id := e.open(permReq(sidA, "same", nil))
+	e.click("UALEX", id, "allow")
+	// Answered but not yet resolved: still the same prompt.
+	if again := e.open(permReq(sidA, "same", nil)); again != id {
+		t.Fatalf("an answered, unresolved prompt got a new id %s", again)
+	}
+	e.resolve(sidA, id, "ran")
+	posts := len(e.f.callsTo("chat.postMessage"))
+	fresh := e.open(permReq(sidA, "same", nil))
+	if fresh == id {
+		t.Fatal("a resolved prompt was reused")
+	}
+	if got := len(e.f.callsTo("chat.postMessage")); got != posts+1 {
+		t.Fatalf("the new prompt made %d posts, want 1", got-posts)
+	}
+	// The new prompt is open: no replayed answer.
+	if w := e.wait(sidA, fresh); w.Code != http.StatusNoContent {
+		t.Fatalf("wait on the new prompt = %d %s", w.Code, w.Body)
+	}
+	// A waiter that still holds the old id gets its answer.
+	if a := e.answerJSON(sidA, id); a.Get("choice").String() != "allow" {
+		t.Fatalf("old id answer = %s", a.Raw)
+	}
+}
+
+func TestPromptClosedRecordsAreCapped(t *testing.T) {
+	e := newPromptEnv(t)
+	first := e.open(permReq(sidA, "first", nil))
+	e.resolve(sidA, first, "ran")
+	for i := 0; i < maxClosedPrompts; i++ {
+		id := e.open(permReq(sidA, "k"+strconv.Itoa(i), nil))
+		e.resolve(sidA, id, "ran")
+	}
+	e.b.promptMu.Lock()
+	n, kept := len(e.b.closedPrompts), e.b.promptByID[first]
+	e.b.promptMu.Unlock()
+	if n != maxClosedPrompts || kept != nil {
+		t.Fatalf("closed records %d (want %d), oldest kept %v", n, maxClosedPrompts, kept != nil)
+	}
+	if w := e.wait(sidA, first); w.Code != http.StatusNotFound {
+		t.Fatalf("evicted prompt = %d", w.Code)
+	}
+}
+
+func TestPromptClosedRecordDropsItsDetailOnceDrawn(t *testing.T) {
+	e := newPromptEnv(t)
+	id := e.open(permReq(sidA, "k", map[string]any{"detail": strings.Repeat("x", 5000)}))
+	e.click("UALEX", id, "allow")
+	e.resolve(sidA, id, "ran")
+	e.b.promptMu.Lock()
+	has := e.b.promptByID[id].req.Detail != ""
+	e.b.promptMu.Unlock()
+	if !has {
+		t.Fatal("the detail went before the final message was drawn")
+	}
+	drainJobs(t, e.b)
+	e.b.promptMu.Lock()
+	has = e.b.promptByID[id].req.Detail != ""
+	e.b.promptMu.Unlock()
+	if has {
+		t.Fatal("the detail is still held after the final draw")
+	}
+	if got := e.lastStatus(); got != "Allowed by alex · ran" {
+		t.Fatalf("status = %q", got)
 	}
 }
 
@@ -1122,9 +1249,30 @@ func TestPromptLeaseLapseClosesPrompts(t *testing.T) {
 }
 
 func TestPromptHandOffClosesOldSessionPrompts(t *testing.T) {
-	e := newPromptEnv(t)
+	clock := newTestClock()
+	f := newFakeSlack(t)
+	bus := agentbus.NewStore("", clock.now)
+	bus.Hello(sidA, "pc", "/work/flyer", "flyer", true)
+	b, err := New(testConfig(f, t.TempDir()), bus)
+	if err != nil || b == nil {
+		t.Fatalf("New = %v, %v", b, err)
+	}
+	b.backoff = func(int) time.Duration { return 0 }
+	b.retryDelay = 0
+	b.state.now = clock.now
+	if err = b.resolve(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	bus.SetBridge(b)
+	e := mountPromptEnv(t, b, f, bus)
 	old := e.open(permReq(sidA, "k", nil))
-	e.b.SessionMoved(sidA, sidB)
+	// The old session goes offline, then the new one takes over through the
+	// store's real HandOff, which calls SessionMoved on the bridge.
+	clock.advance(35 * time.Minute)
+	bus.Hello(sidB, "pc", "/work/flyer", "", true)
+	if err = bus.HandOff(sidA, sidB); err != nil {
+		t.Fatalf("HandOff = %v", err)
+	}
 	if w := e.wait(sidA, old); w.Code != http.StatusGone {
 		t.Fatalf("old session's prompt after hand-off = %d", w.Code)
 	}
@@ -1137,6 +1285,30 @@ func TestPromptHandOffClosesOldSessionPrompts(t *testing.T) {
 	posts := e.f.callsTo("chat.postMessage")
 	if len(posts) != 3 || posts[2].Form.Get("thread_ts") != "1700000000.100001" {
 		t.Fatalf("posts after hand-off = %d", len(posts))
+	}
+	b.promptMu.Lock()
+	_, oldThread := b.promptThreads[sidA]
+	b.promptMu.Unlock()
+	if oldThread {
+		t.Fatal("the old session's prompt thread is still held")
+	}
+}
+
+func TestPromptThreadsAreForgottenOnBye(t *testing.T) {
+	e := newPromptEnv(t)
+	e.open(permReq(sidA, "k", nil))
+	e.b.promptMu.Lock()
+	_, has := e.b.promptThreads[sidA]
+	e.b.promptMu.Unlock()
+	if !has {
+		t.Fatal("no prompt thread to prune")
+	}
+	e.bus.Bye(sidA)
+	e.b.promptMu.Lock()
+	_, has = e.b.promptThreads[sidA]
+	e.b.promptMu.Unlock()
+	if has {
+		t.Fatal("a session that said bye keeps its prompt thread")
 	}
 }
 

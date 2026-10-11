@@ -49,6 +49,7 @@ func newTestBridge(t *testing.T) (*Bridge, *fakeSlack, *agentbus.Store) {
 }
 
 // drainJobs runs queued jobs the way runJobs picks them: command jobs first.
+// It then runs the prompt redraws the redraw loop would have drawn.
 func drainJobs(t *testing.T, b *Bridge) {
 	t.Helper()
 	for {
@@ -59,6 +60,7 @@ func drainJobs(t *testing.T, b *Bridge) {
 			select {
 			case j = <-b.jobs:
 			default:
+				b.drainRedraws(context.Background())
 				return
 			}
 		}

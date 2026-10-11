@@ -3,17 +3,20 @@ package slackbridge
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
 )
 
 // Rendering of prompts as Block Kit: the message (buttons while open, a
 // status line once answered or closed) and the modals. Every agent-supplied
-// string is redacted, escaped for mrkdwn, and only then cut to Slack's
-// limits, so a cut never splits an entity.
+// string is redacted first, then escaped for mrkdwn and cut to Slack's limits
+// on an escape boundary, so a cut never splits an entity or a secret.
 
 const (
 	// maxHeaderRunes is Slack's header block text limit.
@@ -23,6 +26,8 @@ const (
 	maxSectionRunes = 2900
 	// maxDetailBlocks caps the detail sections of one message.
 	maxDetailBlocks = 40
+	// maxMessageBlocks is Slack's limit on the blocks of one message.
+	maxMessageBlocks = 50
 	// maxButtonRunes is Slack's button text limit.
 	maxButtonRunes = 75
 	// maxReasonInput caps the modal's reason field.
@@ -30,39 +35,153 @@ const (
 	// maxLabelRunes caps a modal input label (Slack's limit is 2,000).
 	maxLabelRunes = 1900
 
+	// noteTerminal is the resolve note of a call settled in the terminal.
+	noteTerminal = "terminal"
+
 	otherSuffix = "_other"
 	redacted    = "[redacted]"
 )
+
+// secretWord ends the name of a setting that holds a secret.
+const secretWord = `(?:token|secret|passw(?:or)?d|api[-_]?key|access[-_]?key|private[-_]?key|credential)s?`
 
 // secretShapes are the token shapes redact removes.
 var secretShapes = []*regexp.Regexp{
 	regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)`),
 	regexp.MustCompile(`xox[abpr]-[A-Za-z0-9-]+`),
 	regexp.MustCompile(`xapp-[A-Za-z0-9-]+`),
-	regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]+`),
-	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}`),
-	regexp.MustCompile(`\bgh[po]_[A-Za-z0-9]{16,}`),
+	regexp.MustCompile(`\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}`),
+	regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{20,}`),
 	regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{16,}`),
 	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
 	regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`),
 }
 
-// secretAssign matches password=, token= and secret= and keeps the name.
-var secretAssign = regexp.MustCompile(`(?i)\b(password|passwd|token|secret)=\S+`)
+// secretValue is a value: quoted, or a run of non-space characters.
+const secretValue = `"[^"\n]*"|'[^'\n]*'|["']?\S+`
+
+var (
+	// secretAssign matches NAME=value, NAME: value and "NAME": "value" for any
+	// name that ends in a secret word. Group 1 is everything up to the value,
+	// group 2 the value.
+	secretAssign = regexp.MustCompile(`(?i)\b([A-Za-z0-9_]*` + secretWord + `["']?[ \t]*[=:][ \t]*)(` + secretValue + `)`)
+	// secretFlag matches a command-line flag such as --password x or
+	// --token=x. Group 1 is the flag with what precedes it, group 2 the
+	// separator, group 3 the value.
+	secretFlag = regexp.MustCompile(`(?im)((?:^|[\s'"])--?[A-Za-z0-9_-]*` + secretWord + `)(=|[ \t]+)(` + secretValue + `)`)
+	// codeExpr is a value that is code, not a literal: an identifier called,
+	// indexed or dereferenced.
+	codeExpr = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*[\[(.]`)
+	// fenceRun is a run of backticks long enough to open or close a fence.
+	fenceRun = regexp.MustCompile("`{3,}")
+)
+
+// redactValue is value with its secret replaced by the placeholder, keeping
+// matching quotes around it.
+func redactValue(value string) string {
+	if n := len(value); n >= 2 && (value[0] == '"' || value[0] == '\'') && value[n-1] == value[0] {
+		return value[:1] + redacted + value[n-1:]
+	}
+	return redacted
+}
+
+// isCodeValue reports whether an unquoted value reads as code (token =
+// tokens[i]) and not as a secret. A JWT looks like a dotted identifier but is
+// a secret.
+func isCodeValue(value string) bool {
+	return codeExpr.MatchString(value) && !strings.HasPrefix(value, "eyJ")
+}
+
+// redactAssignments redacts the values of secret-named settings and flags.
+func redactAssignments(s string) string {
+	s = secretFlag.ReplaceAllStringFunc(s, func(m string) string {
+		sub := secretFlag.FindStringSubmatch(m)
+		if strings.TrimSpace(sub[2]) == "" && strings.HasPrefix(sub[3], "-") {
+			return m // the next flag, not a value
+		}
+		return sub[1] + sub[2] + redactValue(sub[3])
+	})
+	return secretAssign.ReplaceAllStringFunc(s, func(m string) string {
+		sub := secretAssign.FindStringSubmatch(m)
+		if isCodeValue(sub[2]) {
+			return m
+		}
+		return sub[1] + redactValue(sub[2])
+	})
+}
+
+// minSecretPrefix is the shortest prefix of a configured secret that redact
+// treats as that secret cut short.
+const minSecretPrefix = 8
+
+// redactCutSecret replaces a run of minSecretPrefix or more characters that is
+// a proper prefix of lit (the secret after a client cut it short) when it
+// ends the text or comes before whitespace or an ellipsis.
+func redactCutSecret(s, lit string) string {
+	if len(lit) <= minSecretPrefix {
+		return s
+	}
+	head := lit[:minSecretPrefix]
+	var out strings.Builder
+	written, from := 0, 0
+	for from < len(s) {
+		j := strings.Index(s[from:], head)
+		if j < 0 {
+			break
+		}
+		start := from + j
+		end := start + minSecretPrefix
+		for end < len(s) && end-start < len(lit) && s[end] == lit[end-start] {
+			end++
+		}
+		rest := s[end:]
+		boundary := rest == "" || strings.HasPrefix(rest, "…") || strings.HasPrefix(rest, "...")
+		if !boundary {
+			r, _ := utf8.DecodeRuneInString(rest)
+			boundary = unicode.IsSpace(r)
+		}
+		if boundary && end-start < len(lit) {
+			out.WriteString(s[written:start])
+			out.WriteString(redacted)
+			written = end
+			from = end
+		} else {
+			from = start + 1
+		}
+	}
+	out.WriteString(s[written:])
+	return out.String()
+}
+
+// breakFences puts a zero-width space after every backtick of a run of three
+// or more, so no run can close a code fence.
+func breakFences(s string) string {
+	return fenceRun.ReplaceAllStringFunc(s, func(m string) string {
+		return strings.ReplaceAll(m, "`", "`​")
+	})
+}
 
 // redact removes secrets from s before it is posted: the configured tokens
-// and extra values (the caller's own bearer token), and common token shapes.
+// and extra values (the caller's own bearer token) whole or cut short, common
+// token shapes, and the values of secret-named settings. It runs before any
+// cut to Slack's limits.
 func (b *Bridge) redact(s string, extra []string) string {
 	literals := append([]string{b.cfg.BotToken, b.cfg.AppToken}, b.cfg.Secrets...)
-	for _, lit := range append(literals, extra...) {
+	literals = append(literals, extra...)
+	for _, lit := range literals {
 		if len(strings.TrimSpace(lit)) >= 6 {
 			s = strings.ReplaceAll(s, lit, redacted)
+		}
+	}
+	for _, lit := range literals {
+		if strings.TrimSpace(lit) != "" {
+			s = redactCutSecret(s, lit)
 		}
 	}
 	for _, re := range secretShapes {
 		s = re.ReplaceAllString(s, redacted)
 	}
-	return secretAssign.ReplaceAllString(s, "${1}="+redacted)
+	return redactAssignments(s)
 }
 
 // promptText is the text helper of one render.
@@ -71,9 +190,26 @@ type promptText struct {
 	extra []string
 }
 
-// mrkdwn is s redacted and escaped for mrkdwn, cut to n characters.
+// mrkdwn is s redacted, then escaped for mrkdwn and cut to n characters of
+// the escaped text, at an escape boundary.
 func (t promptText) mrkdwn(s string, n int) string {
-	return firstRunes(escape(t.b.redact(s, t.extra)), n)
+	return escapeCut(t.b.redact(s, t.extra), n)
+}
+
+// escapeCut escapes raw for mrkdwn, stopping before the character that would
+// take the result past n characters, so an escape is never split.
+func escapeCut(raw string, n int) string {
+	var sb strings.Builder
+	width := 0
+	for _, r := range raw {
+		w := escWidth(r)
+		if width+w > n {
+			break
+		}
+		sb.WriteString(escape(string(r)))
+		width += w
+	}
+	return sb.String()
 }
 
 // plain is s redacted, cut to n characters, for a plain_text field (which
@@ -107,6 +243,9 @@ func escWidth(r rune) int {
 // past the last piece.
 func chunkEscaped(raw string, limit, maxChunks int) (chunks []string, notShown int) {
 	runes := []rune(raw)
+	if maxChunks <= 0 {
+		return nil, len(runes)
+	}
 	var cur strings.Builder
 	width := 0
 	for i, r := range runes {
@@ -166,7 +305,9 @@ func (b *Bridge) renderPrompt(s promptSnap) (text, blocks string) {
 	if agent := strings.TrimSpace(s.req.Agent); agent != "" {
 		out = append(out, contextBlock("Subagent: *"+t.mrkdwn(agent, 100)+"*"))
 	}
-	out = append(out, b.detailBlocks(t, s.req)...)
+	// out holds the header and agent line; one more block, the actions or the
+	// status, closes the message.
+	out = append(out, b.detailBlocks(t, s.req, maxMessageBlocks-len(out)-1)...)
 	status := b.promptStatus(t, s)
 	if s.state == promptOpenState {
 		out = append(out, promptActions(t, s.id, s.req))
@@ -183,16 +324,18 @@ func (b *Bridge) renderPrompt(s promptSnap) (text, blocks string) {
 }
 
 // detailBlocks are the sections that show the prompt's detail (or its
-// questions).
-func (b *Bridge) detailBlocks(t promptText, req agentbus.PromptRequest) []map[string]any {
+// questions), at most room blocks in all; one of them stays free for the
+// notice that says how much of the detail is not shown.
+func (b *Bridge) detailBlocks(t promptText, req agentbus.PromptRequest, room int) []map[string]any {
 	var out []map[string]any
 	if req.Kind == agentbus.PromptKindQuestion {
 		for _, q := range req.Questions {
-			head := t.mrkdwn(q.Text, maxSectionRunes)
+			head := ""
 			if h := strings.TrimSpace(q.Header); h != "" {
-				head = "*" + t.mrkdwn(h, 100) + "*\n" + head
+				head = "*" + t.mrkdwn(h, 100) + "*\n"
 			}
-			out = append(out, mrkdwnBlock(firstRunes(head, maxSectionRunes)))
+			head += t.mrkdwn(q.Text, maxSectionRunes-len([]rune(head)))
+			out = append(out, mrkdwnBlock(head))
 			if lines := optionLines(t, q); lines != "" {
 				out = append(out, mrkdwnBlock(lines))
 			}
@@ -205,9 +348,10 @@ func (b *Bridge) detailBlocks(t promptText, req agentbus.PromptRequest) []map[st
 	fenced := req.Kind != agentbus.PromptKindPlan
 	if fenced {
 		// A fence inside the text would end ours early.
-		detail = strings.ReplaceAll(detail, "```", "``​`")
+		detail = breakFences(detail)
 	}
-	chunks, notShown := chunkEscaped(detail, maxSectionRunes, maxDetailBlocks)
+	budget := min(maxDetailBlocks, room-len(out)-1)
+	chunks, notShown := chunkEscaped(detail, maxSectionRunes, budget)
 	for _, c := range chunks {
 		if fenced {
 			c = "```\n" + c + "\n```"
@@ -220,7 +364,8 @@ func (b *Bridge) detailBlocks(t promptText, req agentbus.PromptRequest) []map[st
 	return out
 }
 
-// optionLines lists a question's options that have descriptions.
+// optionLines lists a question's options that have descriptions, as many
+// whole lines as fit one section.
 func optionLines(t promptText, q agentbus.PromptQuestion) string {
 	var lines []string
 	described := false
@@ -235,7 +380,21 @@ func optionLines(t promptText, q agentbus.PromptQuestion) string {
 	if !described {
 		return ""
 	}
-	return firstRunes(strings.Join(lines, "\n"), maxSectionRunes)
+	var sb strings.Builder
+	width := 0
+	for i, line := range lines {
+		w := len([]rune(line)) + 1
+		if width+w > maxSectionRunes-2 {
+			sb.WriteString("\n…")
+			break
+		}
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(line)
+		width += w
+	}
+	return sb.String()
 }
 
 func promptButton(label, id, what, style string) map[string]any {
@@ -360,6 +519,11 @@ func (b *Bridge) promptStatus(t promptText, s promptSnap) string {
 	if s.state == promptAnsweredState {
 		return chose + reason + " · waiting for the session"
 	}
+	if s.note == noteTerminal {
+		// The call was settled at the keyboard: never claim the Slack answer
+		// decided it.
+		return chose + reason + " · " + s.outcome + " (answered in the terminal first)"
+	}
 	switch s.outcome {
 	case agentbus.OutcomeRan:
 		if allows {
@@ -473,12 +637,28 @@ func questionInputs(t promptText, i int, q agentbus.PromptQuestion) []map[string
 		"element": map[string]any{"type": "plain_text_input", "action_id": id, "multiline": true, "max_length": maxReasonRunes}}}
 }
 
-// decimalsAllowed is false only for a number question whose step and minimum
-// are whole numbers.
+// decimalsAllowed is false only for a number question with a whole step of at
+// least 1 and whole bounds; any other step, or none, may take a decimal.
 func decimalsAllowed(q agentbus.PromptQuestion) bool {
-	whole := func(f float64) bool { return f == float64(int64(f)) }
-	if q.Step == nil || *q.Step < 1 || !whole(*q.Step) {
+	if q.Step == nil || *q.Step < 1 || !wholeNumber(*q.Step) {
 		return true
 	}
-	return q.Min != nil && !whole(*q.Min)
+	return (q.Min != nil && !wholeNumber(*q.Min)) || (q.Max != nil && !wholeNumber(*q.Max))
+}
+
+func wholeNumber(f float64) bool {
+	return f == math.Trunc(f) && !math.IsInf(f, 0)
+}
+
+// formatNumber is f as plain decimal digits: no exponent and no float noise
+// (0.30000000000000004 reads 0.3).
+func formatNumber(f float64) string {
+	r, err := strconv.ParseFloat(strconv.FormatFloat(f, 'g', 12, 64), 64)
+	if err != nil {
+		r = f
+	}
+	if r == 0 {
+		r = 0 // no negative zero
+	}
+	return strconv.FormatFloat(r, 'f', -1, 64)
 }

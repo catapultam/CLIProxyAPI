@@ -4,15 +4,18 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentbus"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // Prompts: blocking Claude Code prompts the agentbus mod opens through
@@ -31,11 +34,16 @@ const (
 	maxPrompts           = 200
 	// promptTTL is how long a prompt stays open before it closes by itself.
 	promptTTL = 24 * time.Hour
-	// promptRetain is how long after a prompt closed a repeat open still gets
-	// its id and a wait still gets its answer.
+	// promptRetain is how long after a prompt closed a wait that already holds
+	// its id still gets the answer. A new open with the same key never gets a
+	// closed prompt back: it makes a new one.
 	promptRetain = 10 * time.Minute
 	// promptForget is how long a closed prompt's record is kept at all.
 	promptForget = time.Hour
+	// maxClosedPrompts caps the closed records kept; the oldest go first.
+	maxClosedPrompts = 1000
+	// maxStaleEdits caps the stale-message edits waiting for the redraw loop.
+	maxStaleEdits = 50
 	// promptWaitMax is one long-poll of /prompt/wait.
 	promptWaitMax = 25 * time.Second
 	// promptSweepEvery is how often the bridge sweeps prompts.
@@ -48,6 +56,9 @@ const (
 
 	notOwnerAnswer = "Only an owner can answer this."
 	alreadyAnswer  = "Already answered."
+	noLongerOpen   = "This prompt is no longer open."
+	staleAnswer    = "This prompt is from before a restart and can't be answered here; answer in the terminal."
+	staleStatus    = "From before a restart; answer in the terminal."
 
 	// outcomeExpired is the outcome of a prompt that outlived promptTTL.
 	outcomeExpired = "expired"
@@ -74,7 +85,10 @@ type prompt struct {
 	answer     *agentbus.PromptAnswer
 	answeredAt time.Time
 	outcome    string
-	closedAt   time.Time
+	// note is the mod's note on the resolve that closed the prompt ("terminal"
+	// when the call was settled at the keyboard).
+	note     string
+	closedAt time.Time
 
 	// channel and ts locate the posted message; empty until it is posted.
 	channel, ts string
@@ -84,12 +98,16 @@ type prompt struct {
 	// changed is closed (and replaced) on every state change, to wake waiters.
 	changed chan struct{}
 
-	// dirty: the message must be redrawn. queued: a redraw job is queued or
-	// running. fails and retryAt pace the retries of a failed edit.
-	dirty, queued bool
-	fails         int
-	retryAt       time.Time
+	// dirty: the message must be redrawn (the prompt is in b.promptDirty).
+	// fails and retryAt pace the retries of a failed edit.
+	dirty   bool
+	fails   int
+	retryAt time.Time
 }
+
+// staleEdit is an edit of a message of a prompt this proxy no longer knows
+// (from before a restart): its buttons come off.
+type staleEdit struct{ channel, ts, text, blocks string }
 
 // promptThread is the top-level DM message a session's prompts are posted
 // under, when its home thread is not in the owner's DM.
@@ -102,6 +120,7 @@ type promptSnap struct {
 	state   promptState
 	answer  *agentbus.PromptAnswer
 	outcome string
+	note    string
 }
 
 func newPromptID() string {
@@ -122,7 +141,7 @@ func (b *Bridge) workCtx() context.Context {
 }
 
 func (p *prompt) snap() promptSnap {
-	s := promptSnap{id: p.id, req: p.req, state: p.state, outcome: p.outcome}
+	s := promptSnap{id: p.id, req: p.req, state: p.state, outcome: p.outcome, note: p.note}
 	if p.answer != nil {
 		a := *p.answer
 		s.answer = &a
@@ -137,10 +156,18 @@ func (p *prompt) wakeLocked() {
 }
 
 // PromptsAvailable reports whether prompts can be offered now: the socket is
-// connected and the first owner (whose DM prompts go to) is still an owner.
-// It implements agentbus.PromptBridge.
+// connected, the first owner (whose DM prompts go to) is still an owner, and
+// their DM can be opened (the opened channel is cached, so only a failure
+// costs a Slack call). It implements agentbus.PromptBridge.
 func (b *Bridge) PromptsAvailable() bool {
-	return b.connected.Load() && b.ownerReady()
+	if !b.connected.Load() || !b.ownerReady() {
+		return false
+	}
+	if _, err := b.dmChannel(b.workCtx(), b.ownerID); err != nil {
+		log.Warnf("slack: prompts unavailable, can't open the owner's DM: %v", err)
+		return false
+	}
+	return true
 }
 
 func (b *Bridge) ownerReady() bool {
@@ -153,62 +180,109 @@ func (b *Bridge) initPromptsLocked() {
 		b.promptByID = map[string]*prompt{}
 		b.promptByKey = map[string]*prompt{}
 		b.promptThreads = map[string]promptThread{}
+		b.promptDirty = map[string]*prompt{}
+	}
+}
+
+func promptKeyOf(p *prompt) string { return p.session + "\x00" + p.key }
+
+// forgetPromptLocked drops p's record. The caller holds b.promptMu.
+func (b *Bridge) forgetPromptLocked(p *prompt) {
+	delete(b.promptByID, p.id)
+	delete(b.promptDirty, p.id)
+	if b.promptByKey[promptKeyOf(p)] == p {
+		delete(b.promptByKey, promptKeyOf(p))
+	}
+}
+
+// expireDueLocked closes p when it outlived promptTTL. The caller holds
+// b.promptMu.
+func (b *Bridge) expireDueLocked(p *prompt, now time.Time) {
+	if p.state != promptClosedState && now.Sub(p.openedAt) >= promptTTL {
+		b.closePromptLocked(p, outcomeExpired, "", now)
 	}
 }
 
 // expirePromptsLocked closes prompts older than promptTTL and forgets closed
-// ones after promptForget. The caller holds b.promptMu.
+// ones after promptForget. Only the sweep runs it. The caller holds
+// b.promptMu.
 func (b *Bridge) expirePromptsLocked(now time.Time) {
 	for _, p := range b.promptByID {
-		switch {
-		case p.state != promptClosedState && now.Sub(p.openedAt) >= promptTTL:
-			b.closePromptLocked(p, outcomeExpired, now)
-		case p.state == promptClosedState && now.Sub(p.closedAt) >= promptForget:
-			delete(b.promptByID, p.id)
-			if b.promptByKey[p.session+"\x00"+p.key] == p {
-				delete(b.promptByKey, p.session+"\x00"+p.key)
-			}
-		}
+		b.expireDueLocked(p, now)
 	}
+	for len(b.closedPrompts) > 0 && now.Sub(b.closedPrompts[0].closedAt) >= promptForget {
+		b.dropOldestClosedLocked()
+	}
+}
+
+// dropOldestClosedLocked forgets the oldest closed record. The caller holds
+// b.promptMu.
+func (b *Bridge) dropOldestClosedLocked() {
+	b.forgetPromptLocked(b.closedPrompts[0])
+	b.closedPrompts[0] = nil
+	b.closedPrompts = b.closedPrompts[1:]
 }
 
 // closePromptLocked closes an open or answered prompt, wakes its waiters and
-// marks its message for redraw. The caller holds b.promptMu.
-func (b *Bridge) closePromptLocked(p *prompt, outcome string, now time.Time) {
+// marks its message for redraw. A closed prompt is never reused by a new
+// open, only found by its id. The caller holds b.promptMu.
+func (b *Bridge) closePromptLocked(p *prompt, outcome, note string, now time.Time) {
 	if p.state == promptClosedState {
 		return
 	}
-	p.state, p.outcome, p.closedAt = promptClosedState, outcome, now
+	p.state, p.outcome, p.note, p.closedAt = promptClosedState, outcome, note, now
+	if b.promptByKey[promptKeyOf(p)] == p {
+		delete(b.promptByKey, promptKeyOf(p))
+	}
 	p.wakeLocked()
+	b.closedPrompts = append(b.closedPrompts, p)
+	for len(b.closedPrompts) > maxClosedPrompts {
+		b.dropOldestClosedLocked()
+	}
 	b.markPromptDirtyLocked(p)
 }
 
-// markPromptDirtyLocked records that p's message must be redrawn and queues
-// the one redraw job per prompt. A prompt not posted yet is drawn by its
-// post. The caller holds b.promptMu.
-func (b *Bridge) markPromptDirtyLocked(p *prompt) {
-	p.dirty = true
-	if p.ts == "" || p.queued {
-		return
-	}
-	if b.offerCommand(b.promptRedrawJob(p)) {
-		p.queued = true
-	}
-	// A full command queue leaves p dirty and not queued; the sweep offers it
-	// again.
+// scrubPromptLocked drops what a closed prompt's final message was drawn
+// from, keeping a short title for the logs. The caller holds b.promptMu.
+func scrubPromptLocked(p *prompt) {
+	p.req.Detail, p.req.Questions = "", nil
+	p.req.Title = firstRunes(p.req.Title, maxHeaderRunes)
+	p.req.Agent = firstRunes(p.req.Agent, 100)
 }
 
-// reservePrompt returns the open prompt for req's (session, key), or
-// reserves a new one. isNew says the caller must post it.
+// markPromptDirtyLocked records that p's message must be redrawn and wakes
+// the redraw loop. A prompt not posted yet is drawn by its post. The caller
+// holds b.promptMu.
+func (b *Bridge) markPromptDirtyLocked(p *prompt) {
+	p.dirty = true
+	if p.ts == "" {
+		return
+	}
+	b.promptDirty[p.id] = p
+	b.wakeRedraw()
+}
+
+// wakeRedraw nudges the redraw loop; a nudge already pending is enough.
+func (b *Bridge) wakeRedraw() {
+	select {
+	case b.redrawWake <- struct{}{}:
+	default:
+	}
+}
+
+// reservePrompt returns the live (open, or answered but not yet resolved)
+// prompt for req's (session, key), or reserves a new one. isNew says the
+// caller must post it. A closed prompt is never returned: its key opens a
+// new prompt.
 func (b *Bridge) reservePrompt(req agentbus.PromptRequest) (p *prompt, isNew bool, err error) {
 	now := b.state.now()
 	b.promptMu.Lock()
 	defer b.promptMu.Unlock()
 	b.initPromptsLocked()
-	b.expirePromptsLocked(now)
 	k := req.Session + "\x00" + req.Key
 	if old := b.promptByKey[k]; old != nil {
-		if old.state != promptClosedState || now.Sub(old.closedAt) <= promptRetain {
+		b.expireDueLocked(old, now)
+		if old.state != promptClosedState {
 			return old, false, nil
 		}
 	}
@@ -235,10 +309,11 @@ func (b *Bridge) reservePrompt(req agentbus.PromptRequest) (p *prompt, isNew boo
 }
 
 // OpenPrompt posts req to the first owner's DM and returns the prompt's id.
-// A repeat for the same (session, key) while the prompt is open, or for
-// promptRetain after it closed, returns the same id and posts nothing; a
-// concurrent open waits for the first one's post. It implements
-// agentbus.PromptBridge and runs in the caller's goroutine.
+// A repeat for the same (session, key) while the prompt is open, or answered
+// but not resolved, returns the same id and posts nothing; a concurrent open
+// waits for the first one's post. Once the prompt closed, the key opens a new
+// prompt. It implements agentbus.PromptBridge and runs in the caller's
+// goroutine.
 func (b *Bridge) OpenPrompt(ctx context.Context, o agentbus.Outbound, req agentbus.PromptRequest) (string, error) {
 	if !b.ownerReady() {
 		return "", agentbus.ErrPromptsOff
@@ -266,9 +341,10 @@ func (b *Bridge) OpenPrompt(ctx context.Context, o agentbus.Outbound, req agentb
 	return p.id, nil
 }
 
-// postPrompt posts p, retrying once; when both fail the prompt closes. It
-// uses the bridge's own context, not the request's, so a client that gave up
-// can't abort a post Slack already made.
+// postPrompt posts p. It retries once, and only when Slack surely did not
+// take the post; after an ambiguous failure a retry could double-post, so the
+// prompt closes instead. It uses the bridge's own context, not the request's,
+// so a client that gave up can't abort a post Slack already made.
 func (b *Bridge) postPrompt(o agentbus.Outbound, p *prompt) {
 	ctx := b.workCtx()
 	var err error
@@ -276,19 +352,21 @@ func (b *Bridge) postPrompt(o agentbus.Outbound, p *prompt) {
 		if attempt > 0 && !b.sleep(ctx, b.retryDelay) {
 			break
 		}
-		if err = b.tryPostPrompt(ctx, o, p); err == nil {
+		var retry bool
+		if retry, err = b.tryPostPrompt(ctx, o, p); err == nil {
 			break
 		}
 		log.Warnf("slack: prompt post for %s failed: %v", o.Address, err)
+		if !retry {
+			break
+		}
 	}
 	b.promptMu.Lock()
 	defer b.promptMu.Unlock()
 	if err != nil {
 		p.postFailed = true
-		b.closePromptLocked(p, outcomeFailed, b.state.now())
-		if b.promptByKey[p.session+"\x00"+p.key] == p {
-			delete(b.promptByKey, p.session+"\x00"+p.key)
-		}
+		b.closePromptLocked(p, outcomeFailed, "", b.state.now())
+		scrubPromptLocked(p)
 	} else if p.dirty || p.state != promptOpenState {
 		// Answered or closed while it was being posted: draw the latest.
 		b.markPromptDirtyLocked(p)
@@ -296,10 +374,25 @@ func (b *Bridge) postPrompt(o agentbus.Outbound, p *prompt) {
 	close(p.posted)
 }
 
-func (b *Bridge) tryPostPrompt(ctx context.Context, o agentbus.Outbound, p *prompt) error {
+// postNotAccepted reports whether err from a Slack call means Slack did not
+// take the request: it answered with an error, or the connection failed
+// before the request was sent. Any other failure may have posted.
+func postNotAccepted(err error) bool {
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
+// tryPostPrompt makes one attempt to post p. retry says a second attempt is
+// safe when this one failed.
+func (b *Bridge) tryPostPrompt(ctx context.Context, o agentbus.Outbound, p *prompt) (retry bool, err error) {
 	channel, thread, err := b.promptTarget(ctx, o)
 	if err != nil {
-		return err
+		// Nothing of the prompt itself was sent yet.
+		return true, err
 	}
 	b.promptMu.Lock()
 	snap := p.snap()
@@ -307,12 +400,12 @@ func (b *Bridge) tryPostPrompt(ctx context.Context, o agentbus.Outbound, p *prom
 	text, blocks := b.renderPrompt(snap)
 	ts, err := b.api.postBlocks(ctx, b.cfg.BotToken, channel, text, blocks, thread)
 	if err != nil {
-		return err
+		return postNotAccepted(err), err
 	}
 	b.promptMu.Lock()
 	p.channel, p.ts = channel, ts
 	b.promptMu.Unlock()
-	return nil
+	return false, nil
 }
 
 // promptTarget picks where session o's prompt goes: the first owner's DM,
@@ -367,12 +460,12 @@ func (b *Bridge) WaitPrompt(ctx context.Context, session, id string) agentbus.Pr
 		now := b.state.now()
 		b.promptMu.Lock()
 		b.initPromptsLocked()
-		b.expirePromptsLocked(now)
 		p := b.promptByID[id]
 		if p == nil || p.session != session {
 			b.promptMu.Unlock()
 			return agentbus.PromptWait{State: agentbus.PromptGone}
 		}
+		b.expireDueLocked(p, now)
 		switch {
 		case p.state == promptClosedState && now.Sub(p.closedAt) > promptRetain:
 			b.promptMu.Unlock()
@@ -398,8 +491,8 @@ func (b *Bridge) WaitPrompt(ctx context.Context, session, id string) agentbus.Pr
 }
 
 // ResolvePrompt closes session's prompt id with outcome (the mod's account of
-// how the call ended). The first close wins; a repeat is fine. It implements
-// agentbus.PromptBridge.
+// how the call ended) and note. The first close wins; a repeat is fine. It
+// implements agentbus.PromptBridge.
 func (b *Bridge) ResolvePrompt(session, id, outcome, note string) error {
 	b.promptMu.Lock()
 	defer b.promptMu.Unlock()
@@ -408,17 +501,18 @@ func (b *Bridge) ResolvePrompt(session, id, outcome, note string) error {
 	if p == nil || p.session != session {
 		return agentbus.ErrPromptUnknown
 	}
-	b.closePromptLocked(p, outcome, b.state.now())
+	b.closePromptLocked(p, outcome, strings.TrimSpace(note), b.state.now())
 	return nil
 }
 
-// SessionEnded closes every prompt of a session that said bye. It implements
-// agentbus.PromptBridge.
+// SessionEnded closes every prompt of a session that said bye and forgets its
+// prompt thread. It implements agentbus.PromptBridge.
 func (b *Bridge) SessionEnded(session string) {
 	b.closeSessionPrompts(session)
+	b.forgetPromptThreads(session)
 }
 
-// closeSessionPrompts closes session's open prompts as ended.
+// closeSessionPrompts closes the open prompts of sessions as ended.
 func (b *Bridge) closeSessionPrompts(sessions ...string) {
 	now := b.state.now()
 	b.promptMu.Lock()
@@ -426,9 +520,18 @@ func (b *Bridge) closeSessionPrompts(sessions ...string) {
 	for _, p := range b.promptByID {
 		for _, sid := range sessions {
 			if p.session == sid {
-				b.closePromptLocked(p, agentbus.OutcomeEnded, now)
+				b.closePromptLocked(p, agentbus.OutcomeEnded, "", now)
 			}
 		}
+	}
+}
+
+// forgetPromptThreads drops the prompt threads of sessions that are gone.
+func (b *Bridge) forgetPromptThreads(sessions ...string) {
+	b.promptMu.Lock()
+	defer b.promptMu.Unlock()
+	for _, sid := range sessions {
+		delete(b.promptThreads, sid)
 	}
 }
 
@@ -449,7 +552,8 @@ func (b *Bridge) movePrompts(oldID, newID string) {
 
 // sweepPrompts is the prompts' housekeeping: it closes prompts past their
 // TTL and those of sessions that went offline (their lease lapsed), forgets
-// old closed ones, and queues redraws that are due again.
+// old closed ones, and wakes the redraw loop for edits that are due again.
+// It is the only place that scans every prompt for expiry.
 func (b *Bridge) sweepPrompts() {
 	var sessions []string
 	seen := map[string]bool{}
@@ -471,62 +575,164 @@ func (b *Bridge) sweepPrompts() {
 	}
 	if len(gone) > 0 {
 		b.closeSessionPrompts(gone...)
+		b.forgetPromptThreads(gone...)
 	}
 	now := b.state.now()
 	b.promptMu.Lock()
-	defer b.promptMu.Unlock()
+	b.initPromptsLocked()
 	b.expirePromptsLocked(now)
-	for _, p := range b.promptByID {
-		if p.dirty && !p.queued && p.ts != "" && !now.Before(p.retryAt) {
-			b.markPromptDirtyLocked(p)
+	pending := len(b.promptDirty) > 0 || len(b.staleEdits) > 0
+	b.promptMu.Unlock()
+	if pending {
+		b.wakeRedraw()
+	}
+}
+
+// runRedraws is the one goroutine that edits prompt messages, so edits never
+// share a queue with owner commands or answers. It runs until ctx ends.
+func (b *Bridge) runRedraws(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-b.redrawWake:
+			b.drainRedraws(ctx)
 		}
 	}
 }
 
-// promptRedrawJob redraws p's message. It renders the state at the moment it
+// drainRedraws draws every stale message and every dirty prompt whose retry
+// time has come. A prompt that fails stays dirty for the sweep to wake again.
+func (b *Bridge) drainRedraws(ctx context.Context) {
+	b.promptMu.Lock()
+	stale := b.staleEdits
+	b.staleEdits = nil
+	b.promptMu.Unlock()
+	for _, e := range stale {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := b.api.updateMessage(ctx, b.cfg.BotToken, e.channel, e.ts, e.text, e.blocks); err != nil {
+			log.Warnf("slack: could not close a stale prompt message: %v", err)
+		}
+	}
+	now := b.state.now()
+	b.promptMu.Lock()
+	var due []*prompt
+	for _, p := range b.promptDirty {
+		if !now.Before(p.retryAt) {
+			due = append(due, p)
+		}
+	}
+	b.promptMu.Unlock()
+	for _, p := range due {
+		if ctx.Err() != nil {
+			return
+		}
+		b.redrawPrompt(ctx, p)
+	}
+}
+
+// redrawPrompt redraws p's message. It renders the state at the moment it
 // runs and loops while the prompt changes under it, so the last state always
-// lands and a stale edit can't bring the buttons back.
-func (b *Bridge) promptRedrawJob(p *prompt) job {
-	return func(ctx context.Context) error {
-		for {
-			b.promptMu.Lock()
-			if !p.dirty || p.ts == "" {
-				p.queued = false
-				b.promptMu.Unlock()
-				return nil
-			}
-			p.dirty = false
-			snap, channel, ts := p.snap(), p.channel, p.ts
+// lands and a stale edit can't bring the buttons back. Once a closed
+// prompt's final state is drawn (or given up on), its large fields go.
+func (b *Bridge) redrawPrompt(ctx context.Context, p *prompt) {
+	for {
+		b.promptMu.Lock()
+		if !p.dirty || p.ts == "" {
+			delete(b.promptDirty, p.id)
 			b.promptMu.Unlock()
-			text, blocks := b.renderPrompt(snap)
-			err := b.api.updateMessage(ctx, b.cfg.BotToken, channel, ts, text, blocks)
-			if err == nil {
-				b.promptMu.Lock()
-				p.fails = 0
+			return
+		}
+		p.dirty = false
+		snap, channel, ts := p.snap(), p.channel, p.ts
+		b.promptMu.Unlock()
+		text, blocks := b.renderPrompt(snap)
+		err := b.api.updateMessage(ctx, b.cfg.BotToken, channel, ts, text, blocks)
+		b.promptMu.Lock()
+		switch {
+		case err == nil:
+			p.fails = 0
+			if p.dirty {
 				b.promptMu.Unlock()
 				continue
 			}
-			if ctx.Err() != nil {
-				b.promptMu.Lock()
-				p.dirty, p.queued = true, false
-				b.promptMu.Unlock()
-				return err
-			}
-			b.promptMu.Lock()
-			p.queued = false
-			if permanentEditError(err) || p.fails+1 >= maxRedrawFails {
-				p.dirty = false
-				log.Warnf("slack: gave up redrawing a prompt message: %v", err)
-			} else {
-				p.dirty = true
-				p.fails++
-				p.retryAt = b.state.now().Add(b.backoff(p.fails))
-				log.Warnf("slack: prompt message edit failed (will retry): %v", err)
-			}
-			b.promptMu.Unlock()
-			return nil
+			b.finishRedrawLocked(p)
+		case ctx.Err() != nil:
+			p.dirty = true
+		case permanentEditError(err) || p.fails+1 >= maxRedrawFails:
+			p.dirty = false
+			log.Warnf("slack: gave up redrawing a prompt message: %v", err)
+			b.finishRedrawLocked(p)
+		default:
+			p.dirty = true
+			p.fails++
+			p.retryAt = b.state.now().Add(b.backoff(p.fails))
+			log.Warnf("slack: prompt message edit failed (will retry): %v", err)
+		}
+		b.promptMu.Unlock()
+		return
+	}
+}
+
+// finishRedrawLocked takes p off the dirty set after its last edit. The
+// caller holds b.promptMu.
+func (b *Bridge) finishRedrawLocked(p *prompt) {
+	delete(b.promptDirty, p.id)
+	if p.state == promptClosedState {
+		scrubPromptLocked(p)
+	}
+}
+
+// queueStaleEdit queues the removal of the buttons of a prompt message from
+// before a restart, best effort: the proxy knows nothing of the prompt, so
+// the message keeps its blocks and loses its actions.
+func (b *Bridge) queueStaleEdit(p interactivePayload) {
+	channel, ts := p.Container.ChannelID, p.Container.MessageTS
+	if channel == "" {
+		channel = p.Channel.ID
+	}
+	if ts == "" {
+		ts = p.Message.TS
+	}
+	if channel == "" || ts == "" {
+		return
+	}
+	var keep []json.RawMessage
+	for _, blk := range gjson.ParseBytes(p.Message.Blocks).Array() {
+		if blk.Get("type").String() != "actions" {
+			keep = append(keep, json.RawMessage(blk.Raw))
 		}
 	}
+	data, err := json.Marshal(append(keep, mustJSON(contextBlock(staleStatus))))
+	if err != nil {
+		return
+	}
+	text := p.Message.Text
+	if text == "" {
+		text = staleStatus
+	}
+	b.promptMu.Lock()
+	defer b.promptMu.Unlock()
+	if len(b.staleEdits) >= maxStaleEdits {
+		return
+	}
+	for _, e := range b.staleEdits {
+		if e.channel == channel && e.ts == ts {
+			return
+		}
+	}
+	b.staleEdits = append(b.staleEdits, staleEdit{channel: channel, ts: ts, text: text, blocks: string(data)})
+	b.wakeRedraw()
+}
+
+func mustJSON(v any) json.RawMessage {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return data
 }
 
 // permanentEditError reports a chat.update failure no retry fixes.
@@ -536,7 +742,9 @@ func permanentEditError(err error) bool {
 		return false
 	}
 	switch apiErr.code {
-	case "message_not_found", "channel_not_found", "cant_update_message", "edit_window_closed", "is_archived", "not_in_channel", "invalid_blocks", "invalid_blocks_format":
+	case "msg_too_long", "invalid_arguments", "invalid_blocks", "invalid_blocks_format",
+		"message_not_found", "cant_update_message", "channel_not_found",
+		"edit_window_closed", "is_archived", "not_in_channel":
 		return true
 	}
 	return false
@@ -608,7 +816,14 @@ func (b *Bridge) promptAction(p interactivePayload) {
 	b.promptMu.Lock()
 	b.initPromptsLocked()
 	pr := b.promptByID[id]
-	if pr == nil || pr.state != promptOpenState {
+	if pr == nil {
+		// Not a prompt this proxy knows: the message is from before a restart.
+		b.promptMu.Unlock()
+		b.promptEphemeral(channel, user.ID, staleAnswer)
+		b.queueStaleEdit(p)
+		return
+	}
+	if pr.state != promptOpenState {
 		b.promptMu.Unlock()
 		b.promptEphemeral(channel, user.ID, alreadyAnswer)
 		return
@@ -694,7 +909,9 @@ func modalErrors(errs map[string]string) map[string]any {
 }
 
 // promptSubmit handles the prompt modal's submit. A valid one from an owner
-// answers the prompt and closes the modal; otherwise the ack shows why.
+// answers the prompt and closes the modal; an invalid one shows why. When the
+// prompt is gone the modal closes and the user is told so privately, since
+// the modal may have no block to hang an error on.
 func (b *Bridge) promptSubmit(p interactivePayload) map[string]any {
 	id := strings.TrimSpace(p.View.PrivateMetadata)
 	user, ok := b.state.user(p.User.ID)
@@ -702,26 +919,34 @@ func (b *Bridge) promptSubmit(p interactivePayload) map[string]any {
 	defer b.promptMu.Unlock()
 	b.initPromptsLocked()
 	pr := b.promptByID[id]
-	first := "reason"
-	if pr != nil && pr.req.Kind == agentbus.PromptKindQuestion {
-		first = "q0"
-	}
 	if !ok || !user.config {
 		log.Infof("slack: refused a prompt submit from %s: not an owner", p.User.ID)
 		b.promptEphemeral("", p.User.ID, notOwnerAnswer)
-		return modalErrors(map[string]string{first: notOwnerAnswer})
+		if pr == nil {
+			return nil
+		}
+		return modalErrors(map[string]string{firstPromptBlock(pr.req): notOwnerAnswer})
 	}
 	if pr == nil || pr.state != promptOpenState {
-		return modalErrors(map[string]string{first: alreadyAnswer})
+		b.promptEphemeral("", user.ID, noLongerOpen)
+		return nil
 	}
 	answer, errs := parsePromptModal(pr.req, p.View.State.Values, user.Label)
 	if len(errs) > 0 {
 		return modalErrors(errs)
 	}
 	if !b.answerPromptLocked(pr, answer) {
-		return modalErrors(map[string]string{first: alreadyAnswer})
+		b.promptEphemeral("", user.ID, noLongerOpen)
 	}
 	return nil
+}
+
+// firstPromptBlock is the id of the first input block of req's modal.
+func firstPromptBlock(req agentbus.PromptRequest) string {
+	if req.Kind == agentbus.PromptKindQuestion {
+		return questionBlock(0)
+	}
+	return "reason"
 }
 
 // parsePromptModal reads a submitted prompt modal into an answer, or the
@@ -822,8 +1047,4 @@ func parseNumberAnswer(q agentbus.PromptQuestion, raw string) (any, string) {
 		return int64(f), ""
 	}
 	return f, ""
-}
-
-func formatNumber(f float64) string {
-	return strconv.FormatFloat(f, 'f', -1, 64)
 }

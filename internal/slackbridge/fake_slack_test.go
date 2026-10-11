@@ -40,6 +40,7 @@ type fakeSlack struct {
 	nextTS   int
 	opened   int
 	fail     map[string]string // method -> Slack error code
+	hangup   map[string]bool   // method -> close the connection without answering
 	toClient chan string
 	acks     chan string
 	// ackPayloads holds the payload each ack carried, by envelope id.
@@ -182,6 +183,7 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		},
 		channels:  []fakeChannel{{ID: "CGEN", Name: "general"}, {ID: "CAGENTS", Name: "agents"}},
 		fail:      map[string]string{},
+		hangup:    map[string]bool{},
 		reactions: map[reactionKey]bool{},
 		toClient:  make(chan string, 16),
 		acks:      make(chan string, 16),
@@ -307,6 +309,14 @@ func (f *fakeSlack) ackPayload(id string) string {
 	return ""
 }
 
+// setHangup makes method close the connection after recording the call, so
+// the caller can't tell whether Slack took it.
+func (f *fakeSlack) setHangup(method string, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hangup[method] = on
+}
+
 // setFail makes method return a Slack error (under the lock, so -race is clean).
 func (f *fakeSlack) setFail(method, code string) {
 	f.mu.Lock()
@@ -322,8 +332,16 @@ func (f *fakeSlack) handleAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	f.calls = append(f.calls, fakeCall{Method: method, Form: r.PostForm, Auth: r.Header.Get("Authorization")})
-	code := f.fail[method]
+	code, hangup := f.fail[method], f.hangup[method]
 	f.mu.Unlock()
+	if hangup {
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}
+		return
+	}
 	if code != "" {
 		writeJSON(w, map[string]any{"ok": false, "error": code})
 		return

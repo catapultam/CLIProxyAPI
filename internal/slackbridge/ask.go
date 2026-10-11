@@ -99,6 +99,8 @@ type interactivePayload struct {
 		BotID string `json:"bot_id"`
 		Text  string `json:"text"`
 		TS    string `json:"ts"`
+		// Blocks come with a block_actions click on a bot message.
+		Blocks json.RawMessage `json:"blocks"`
 	} `json:"message"`
 	// Actions, ResponseURL and Container come with a block_actions click.
 	Actions []struct {

@@ -131,13 +131,21 @@ Slack bridge is on and connected, and an owner DM can be opened. Otherwise
 - `always` (permission only) offers "Always allow". `questions` is used only by
   `kind: question`: 1 to 4 questions, at most 10 options each (Slack's radio
   and checkbox limit; the mod sends no more than `AskUserQuestion` allows).
-- **Idempotent on `(session, key)`**: while a prompt with that key is open, or
-  for 10 minutes after it closed, a repeat returns the same `id` and posts
-  nothing. This makes hook re-entry, and two identical calls in flight, share
-  one prompt and one answer. Reservation is atomic under the store lock;
+- **Idempotent on `(session, key)` only while the prompt is live**: while the
+  prompt with that key is open, or answered but not yet resolved, a repeat
+  returns the same `id` and posts nothing. This makes hook re-entry, and two
+  identical calls in flight, share one prompt and one answer. Once the prompt
+  is resolved, expired or closed for any reason, the key is free: a new open
+  with the same key creates a new prompt with a new `id` and a new Slack post,
+  and never replays the old answer. The closed record stays findable by `id`
+  for 10 minutes (a waiter that holds the id still gets its answer, then
+  `410`), and is forgotten after an hour; at most 1,000 closed records are
+  kept, the oldest evicted first. Reservation is atomic under the store lock;
   concurrent opens get the same id; a failed Slack post leaves the prompt
-  reserved and retries the post once, and if that fails the prompt closes and
-  the route returns `502`.
+  reserved and retries the post once, but only when Slack surely did not take
+  it (a Slack error reply, or a connection failure before the request was
+  sent). After an ambiguous failure the post is not retried, since it could
+  double-post: the prompt closes and the route returns `502`.
 - Returns `200 {"id": "p_<32 hex>"}`. `404 {"error": ...}` when prompts are
   off or the session is unknown; `400` on a malformed body.
 - Ids are 128-bit random. Every prompt route checks that the `session` given
@@ -187,14 +195,26 @@ has no guests.
 `chat.postMessage` with `blocks` (new: `postBlocks` in `api.go`) and a plain
 `text` fallback ("Claude needs you: <title>"). All agent-supplied text goes
 through the existing agent-text escaping (no `<!channel>`, no forged
-mentions) and the proxy-token redaction, then is cut to Slack's limits after
-escaping:
+mentions) and the proxy-token redaction, then is cut to Slack's limits on an
+escape boundary (redaction always runs before any cut, and a cut never splits
+`&amp;`). The redaction covers the configured bot and app tokens, the proxy's
+API keys and the caller's bearer (whole, or a run of 8 or more characters of
+one that a client cut short, at the end of the text or before an ellipsis or
+whitespace), common token shapes (`xox`, `xapp`, `sk-`, `gh[pousr]_`,
+`github_pat_`, AWS key ids, private keys, `Bearer`), and the literal value of
+any setting whose name ends in `token`, `secret`, `password`, `api_key`,
+`access_key`, `private_key` or `credential` (`NAME=value`, `NAME: value`,
+JSON `"name": "value"`, and flags such as `--password x`), except a value that
+is a code expression (`token = tokens[i]`). Every run of three or more
+backticks in a fenced detail is broken, so a detail cannot close the fence:
 
 - header: title (≤150) and, for subagents, `agent`;
 - detail: split into `section` blocks of ≤2,900 characters inside code fences
   for permission and denial, plain mrkdwn for plan. At most 40 such blocks;
-  past that a line says how many characters were not shown. A long command is
-  never silently cut mid-way: the cut is always said.
+  past that a line says how many characters were not shown. The budget is
+  computed from the blocks already used, so a message never exceeds Slack's 50
+  blocks (for example 4 questions of 10 options plus a huge detail). A long
+  command is never silently cut mid-way: the cut is always said.
 - actions (`action_id` `prompt:<id>:<choice>`, value the choice):
 
 | kind | buttons |
@@ -230,16 +250,23 @@ goroutine, as `askShortcut` already does.
 
 ### Message edits
 
-One redraw job per prompt at a time, coalesced. A prompt marked dirty while
-its job is queued is not queued again. The job renders the prompt's state at
-the moment it runs, so the last state always wins and a stale edit cannot put
-the buttons back. A failed `chat.update` (new `updateMessage` in `api.go`;
+Redraws never use the 64-slot command queue that carries owner commands,
+answer delivery and `/clanker` jobs. A prompt marked dirty goes into a set of
+prompt ids that one dedicated goroutine (started and stopped with the bridge)
+drains: for each, it renders the prompt's state at the moment it runs, so the
+last state always wins and a stale edit cannot put the buttons back, and calls
+`chat.update`. Marking is coalescing (a prompt is in the set once) and never
+blocks the ack path. A permanent failure (`msg_too_long`, `invalid_arguments`,
+`invalid_blocks`, `message_not_found`, `cant_update_message`,
+`channel_not_found`, and the like) gives up at once. Once a closed prompt's
+final state is drawn, its large `detail` and `questions` are dropped from
+memory. A failed `chat.update` (new `updateMessage` in `api.go`;
 `chat:write` covers it, no new scope) is retried with the bridge's usual
 backoff.
 
 States, shown as a context line replacing the buttons:
 
-- answered: `alex chose Allow — waiting for the session`;
+- answered: `alex chose Allow · waiting for the session`;
 - then from `/prompt/resolve`:
   - `Allowed by alex · ran`;
   - `Denied by alex: <reason>`;
@@ -248,7 +275,10 @@ States, shown as a context line replacing the buttons:
   - `Session ended`;
 - an answer whose outcome disagrees is shown as both. For example, a Slack
   Deny reaching a call already approved at the keyboard shows
-  `alex chose Deny · ran (answered in the terminal first)`.
+  `alex chose Deny · ran (answered in the terminal first)`. When the resolve
+  carries the note `terminal` and a Slack answer exists, the status always
+  says both, whatever the Slack choice was, and never claims the Slack answer
+  decided the call.
 
 ### Lifetime
 
@@ -263,7 +293,18 @@ terminal. A prompt closes:
 - on a session hand-off, for the old session's prompts.
 
 A proxy restart loses them. The mod's next wait gets `404` and re-opens the
-prompt with the same key, so an unattended session recovers.
+prompt with the same key, so an unattended session recovers. A click on an
+old message from before the restart gets an ephemeral "This prompt is from
+before a restart and can't be answered here; answer in the terminal.", and the
+message is edited, best effort and through the redraw goroutine, to lose its
+buttons. A modal submit for a prompt that is gone closes the modal and posts
+an ephemeral "This prompt is no longer open.".
+
+Prompt availability (`prompts` in `/hello`) also requires that the first
+owner's DM can be opened; the opened channel is cached, and a failure makes it
+false until the next successful open. Sweeping (every 5 s) is the only full
+scan for expiry. A session's prompt thread is dropped on `/bye`, lease lapse
+and hand-off.
 
 ## Mod (agentbus)
 

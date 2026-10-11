@@ -177,6 +177,15 @@ type Bridge struct {
 	promptByKey   map[string]*prompt
 	promptThreads map[string]promptThread
 	promptWaitFor time.Duration
+	// promptDirty holds the prompts whose message must be redrawn,
+	// closedPrompts the closed ones oldest first (capped), and staleEdits the
+	// messages of prompts from before a restart whose buttons come off. One
+	// goroutine (runRedraws, woken through redrawWake) draws them, apart from
+	// the command queue. promptMu guards all three.
+	promptDirty   map[string]*prompt
+	closedPrompts []*prompt
+	staleEdits    []staleEdit
+	redrawWake    chan struct{}
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -206,6 +215,7 @@ func New(cfg Config, bus *agentbus.Store) (*Bridge, error) {
 		cmdRegistry:   newRegistry(cfg.CommandsDir),
 		jobs:          make(chan job, jobQueueSize),
 		commands:      make(chan job, commandQueueSize),
+		redrawWake:    make(chan struct{}, 1),
 		backoff:       defaultBackoff,
 		retryDelay:    2 * time.Second,
 		seen:          map[string]bool{},
@@ -856,10 +866,14 @@ func (b *Bridge) Start() {
 		}
 		b.bus.SetBridge(b)
 		log.Infof("slack: bridge on, %s, allowed users %s", b.homeDescription(), strings.Join(b.Users(), ", "))
-		b.jobsWG.Add(2)
+		b.jobsWG.Add(3)
 		go func() {
 			defer b.jobsWG.Done()
 			b.runJobs(ctx)
+		}()
+		go func() {
+			defer b.jobsWG.Done()
+			b.runRedraws(ctx)
 		}()
 		go func() {
 			defer b.jobsWG.Done()
