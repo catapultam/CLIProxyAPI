@@ -1843,19 +1843,26 @@ const STILL_OPEN: FetchAnswer = { status: 204, text: '' }
 
 type WaitStep = FetchAnswer | (() => Promise<FetchAnswer>)
 
-// A scripted proxy for the prompt routes: /prompt is idempotent on the key (the same id for the same key),
-// /prompt/wait takes the next step from `waits` (closed when none is left), /prompt/resolve is recorded.
-function promptServer(opts: { waits?: WaitStep[]; open?: FetchAnswer | (() => Promise<FetchAnswer>); hello?: () => FetchAnswer } = {}) {
+// A scripted proxy for the prompt routes. /prompt models the proxy's rule: the same key gets the same id
+// only while that prompt is open; a closed prompt (resolved, or answered 410) is never handed out again, the
+// key gets a new one. `returnClosed` breaks that rule on purpose: it hands the closed id back (a stale
+// proxy). /prompt/wait takes the next step from `waits` (closed when none is left), /prompt/resolve is
+// recorded and closes the prompt.
+function promptServer(opts: { waits?: WaitStep[]; open?: FetchAnswer | (() => Promise<FetchAnswer>); hello?: () => FetchAnswer; returnClosed?: boolean } = {}) {
   const ids = new Map<string, string>()
+  const closed = new Set<string>()
+  let made = 0
   const waits = [...(opts.waits ?? [])]
   const server = {
     waits,
+    closed,
     fetch: (url: string, method: string, body: unknown): FetchAnswer | Promise<FetchAnswer> | undefined => {
       if (url.endsWith('/hello') && opts.hello) return opts.hello()
       if (url.endsWith('/v1/agentbus/prompt') && method === 'POST') {
         const make = () => {
           const key = (body as { key: string }).key
-          if (!ids.has(key)) ids.set(key, `p_${ids.size + 1}`)
+          const have = ids.get(key)
+          if (!have || (closed.has(have) && !opts.returnClosed)) ids.set(key, `p_${++made}`)
           return { status: 200, text: JSON.stringify({ id: ids.get(key) }) }
         }
         if (typeof opts.open === 'function') return opts.open().then(a => (a.status === 200 ? make() : a))
@@ -1863,10 +1870,17 @@ function promptServer(opts: { waits?: WaitStep[]; open?: FetchAnswer | (() => Pr
       }
       if (url.includes('/v1/agentbus/prompt/wait?')) {
         const step = waits.shift()
-        if (step === undefined) return CLOSED
-        return typeof step === 'function' ? step() : step
+        const answer = step === undefined ? CLOSED : typeof step === 'function' ? step() : step
+        const id = /[?&]id=([^&]+)/.exec(url)?.[1]
+        return Promise.resolve(answer).then(a => {
+          if (a.status === 410 && id) closed.add(id)
+          return a
+        })
       }
-      if (url.endsWith('/prompt/resolve')) return { status: 200, text: '{}' }
+      if (url.endsWith('/prompt/resolve')) {
+        closed.add((body as { id: string }).id)
+        return { status: 200, text: '{}' }
+      }
       return undefined
     },
   }
@@ -1886,10 +1900,11 @@ async function promptWorld(
 ) {
   const clock = mock.clock(on)
   const calls = wire($, on, [], undefined, PEERS, { routes: { '/hello': PROMPTS_HELLO }, ...options, fetch: server.fetch })
-  const state = { nexts: 0 }
+  // below is what the hooks beneath the plugin answer (nothing, unless a test sets it).
+  const state = { nexts: 0, below: (): unknown | Promise<unknown> => ({}) }
   on('classic.PermissionRequest', () => {
     state.nexts++
-    return {}
+    return state.below() as never
   })
   // Hooks beneath the plugin must be registered before the test first calls $.
   setup?.(on)
@@ -1917,7 +1932,7 @@ for (const [answer, decision] of PERMISSION_CHOICES) {
     const world = await promptWorld($, on, promptServer({ waits: [STILL_OPEN, ANSWER(answer)] }))
     const out = await $.classic.PermissionRequest(permission({ permission_suggestions: SUGGESTIONS }))
     expect(out).toEqual({ decision })
-    expect(world.state.nexts).toBe(0)
+    expect(world.state.nexts).toBe(1)
     const open = at(opens(world.calls), 0)
     expect(open.auth).toBe('Bearer test-token')
     expect(open.body).toEqual({
@@ -1998,14 +2013,14 @@ test('a prompt lost by a proxy restart (404) is opened again and then answered',
   const out = await $.classic.PermissionRequest(permission())
   expect(out).toEqual({ decision: { behavior: 'allow' } })
   expect(opens(world.calls).length).toBe(2)
-  expect(world.state.nexts).toBe(0)
+  expect(world.state.nexts).toBe(1)
 })
 
 test('an error between good polls does not add up to three', async ($, on) => {
   const e = { status: 503, text: '' }
   const world = await promptWorld($, on, promptServer({ waits: [e, e, STILL_OPEN, e, e, ANSWER({ choice: 'allow' })] }))
   expect(await $.classic.PermissionRequest(permission())).toEqual({ decision: { behavior: 'allow' } })
-  expect(world.state.nexts).toBe(0)
+  expect(world.state.nexts).toBe(1)
 })
 
 test('waitAnswer stops when told to (the abort), one fetch per pass, no clock wait', async () => {
@@ -2243,7 +2258,7 @@ test('a question answered in Slack wins, and its answers are keyed by question t
   const server = promptServer({
     waits: [
       STILL_OPEN,
-      ANSWER({ choice: 'submit', by: 'alex', answers: { q1: 'o2', q2: ['o1', 'o2'], q3: 'hello there', q4: 7 } }),
+      ANSWER({ choice: 'submit', by: 'alex', answers: { q1: 'luxon', q2: ['tz', 'fmt'], q3: 'hello there', q4: 7 } }),
     ],
   })
   const world = await questionWorld($, on, server, () => new Promise<object>(() => {}))
@@ -2256,6 +2271,7 @@ test('a question answered in Slack wins, and its answers are keyed by question t
   const body = at(opens(world.calls), 0).body as { kind: string; key: string; questions: Array<Record<string, unknown>> }
   expect(body.kind).toBe('question')
   expect(body.key).toBe(await promptKey('', 'AskUserQuestion', { questions: QUESTIONS }))
+  expect((body as { detail?: string }).detail).toBe('')
   expect(body.questions.map(q => q.id)).toEqual(['q1', 'q2', 'q3', 'q4'])
   expect(body.questions[0]).toEqual({
     id: 'q1',
@@ -2320,7 +2336,7 @@ for (const [name, make] of QUESTION_FAILS) {
 }
 
 test('a dialog that fails after Slack answered does not surface', async ($, on) => {
-  const server = promptServer({ waits: [ANSWER({ choice: 'submit', answers: { q1: 'o1' } })] })
+  const server = promptServer({ waits: [ANSWER({ choice: 'submit', answers: { q1: 'dayjs' } })] })
   const local = defer<object>()
   const world = await questionWorld($, on, server, () => local.promise)
   const out = await $.tool.call(ask())
@@ -2351,6 +2367,7 @@ test('the idle ping is posted when a main-loop turn ends in auto mode, and never
   const long = 'k=1 token=sup3rsecret ' + 'y'.repeat(2000)
   expect(await $.classic.Stop(stop({ last_assistant_message: long }))).toEqual({})
   expect(nexts).toBe(1)
+  await world.clock.settle()
   const sent = sends(world.calls)
   expect(sent.length).toBe(1)
   expect(at(sent, 0).from_session).toBe(DEFAULT_SESSION_ID)
@@ -2364,6 +2381,7 @@ test('the idle ping is not posted outside auto mode, for a subagent, or with pro
   await $.classic.Stop(stop({ permission_mode: 'default' }))
   await $.classic.Stop(stop({ permission_mode: 'acceptEdits' }))
   await $.classic.Stop(stop({ agent_id: 'agent-7', agent_type: 'reviewer' }))
+  await world.clock.settle()
   expect(sends(world.calls)).toEqual([])
 })
 
@@ -2379,8 +2397,8 @@ test('redact masks the token and the shapes of other secrets, and leaves ordinar
     'xoxb-1234-abcd-efgh',
     'xoxp-1234-abcd',
     'xapp-1-A0B1C2-3456',
-    'sk-abcdefgh12345678',
-    'sk-ant-api03-abcdefghijkl',
+    'sk-abcdefgh12345678abcd',
+    'sk-ant-api03-abcdefghijklmnopqrst',
     'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
     'gho_abcdefghijklmnopqrstuvwxyz0123456789',
     'github_pat_11ABCDEFG0abcdefghij_klmnop',
@@ -2416,4 +2434,256 @@ test('decisionFor offers always only with suggestions', () => {
   expect(decisionFor({ tool_name: 'Bash', tool_input: {} }, { choice: 'always' })).toEqual({ behavior: 'allow' })
   expect(decisionFor({ tool_name: 'Bash', tool_input: {}, permission_suggestions: [] }, { choice: 'always' })).toEqual({ behavior: 'allow' })
   expect(decisionFor({ tool_name: 'Bash', tool_input: {} }, { choice: 'nonsense' })).toBeNull()
+})
+
+// ---- Review fixes: stale ids, late re-entry, settings hooks first, redaction, idle ping, plan, turn end.
+
+test('an id this session saw closed, handed out again by the proxy, is not waited on', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ returnClosed: true, waits: [CLOSED, ANSWER({ choice: 'allow' })] }))
+  expect(await $.classic.PermissionRequest(permission())).toEqual({})
+  expect(promptWaits(world.calls).length).toBe(1)
+  // The same key again: the proxy returns p_1, which was closed; the stale answer on it is never read.
+  expect(await $.classic.PermissionRequest(permission())).toEqual({})
+  expect(opens(world.calls).length).toBe(2)
+  expect(promptWaits(world.calls).length).toBe(1)
+  expect(world.state.nexts).toBe(2)
+})
+
+test('the mock proxy hands a key a new id once its prompt is closed (reuse only while open)', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [CLOSED, ANSWER({ choice: 'allow' })] }))
+  expect(await $.classic.PermissionRequest(permission())).toEqual({})
+  expect(await $.classic.PermissionRequest(permission())).toEqual({ decision: { behavior: 'allow' } })
+  expect(promptWaits(world.calls).map(c => c.url.slice(-3))).toEqual(['p_1', 'p_2'])
+})
+
+test('a PermissionRequest that arrives after its call settled opens no prompt', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [ANSWER({ choice: 'allow' })] }), {}, o => o('tool.call', () => ({ result: { stdout: 'ok' } })))
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'tu_1', ...BASH_INPUT } as never)
+  await world.clock.settle()
+  expect(await $.classic.PermissionRequest(permission())).toEqual({})
+  expect(opens(world.calls).length).toBe(0)
+  expect(world.state.nexts).toBe(1)
+})
+
+test('a tool.call and its PermissionRequest key alike once the envelope is stripped from the call', async ($, on) => {
+  const gate = defer<object>()
+  const hold = defer<FetchAnswer>()
+  const world = await promptWorld($, on, promptServer({ waits: [() => hold.promise] }), {}, o => o('tool.call', () => gate.promise as never))
+  const envelope = { tool: 'Bash', tool_use_id: 'tu_9', agentId: 'agent-7', consent: true, command: 'git status', description: 'status' }
+  const callP = $.tool.call(envelope as never)
+  await world.clock.settle()
+  const input = Object.fromEntries(Object.entries(envelope).filter(([k]) => !['tool', 'tool_use_id', 'agentId', 'consent'].includes(k)))
+  const perm = $.classic.PermissionRequest(permission({ agent_id: 'agent-7', agent_type: 'reviewer' }, 'Bash', input))
+  await world.clock.settle()
+  expect((at(opens(world.calls), 0).body as { key: string }).key).toBe(await callKey(envelope))
+  gate.resolve({ result: { stdout: 'ok' } })
+  await callP
+  await world.clock.settle()
+  // The call settling found the prompt by its key and closed it.
+  expect(resolves(world.calls)).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'ran' }])
+  hold.resolve(CLOSED)
+  await perm
+})
+
+test('the hooks beneath run first; a decision from them is returned without waiting for Slack', async ($, on) => {
+  const hold = defer<FetchAnswer>()
+  const world = await promptWorld($, on, promptServer({ waits: [() => hold.promise] }))
+  world.state.below = () => ({ decision: { behavior: 'allow' } })
+  expect(await $.classic.PermissionRequest(permission())).toEqual({ decision: { behavior: 'allow' } })
+  expect(world.state.nexts).toBe(1)
+  // The Slack loop is told to stop; whatever poll was in flight ends without another.
+  hold.resolve(STILL_OPEN)
+  await world.clock.settle()
+  expect(promptWaits(world.calls).length).toBeLessThanOrEqual(1)
+})
+
+test('when the hooks beneath decide nothing, the Slack answer is returned (next called once)', async ($, on) => {
+  const below = defer<object>()
+  const world = await promptWorld($, on, promptServer({ waits: [STILL_OPEN, STILL_OPEN, ANSWER({ choice: 'allow' })] }))
+  world.state.below = () => below.promise
+  const perm = $.classic.PermissionRequest(permission())
+  await world.clock.settle()
+  below.resolve({})
+  await world.clock.settle()
+  expect(await perm).toEqual({ decision: { behavior: 'allow' } })
+  expect(world.state.nexts).toBe(1)
+  expect(promptWaits(world.calls).length).toBe(3)
+})
+
+test('a Slack answer is returned while the hooks beneath are still running', async ($, on) => {
+  const below = defer<object>()
+  const world = await promptWorld($, on, promptServer({ waits: [ANSWER({ choice: 'deny', by: 'alex' })] }))
+  world.state.below = () => below.promise
+  expect(await $.classic.PermissionRequest(permission())).toEqual({ decision: { behavior: 'deny', message: 'Denied from Slack by alex' } })
+  expect(world.state.nexts).toBe(1)
+  below.resolve({})
+})
+
+test('Slack closing leaves the answer of the hooks beneath', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: [CLOSED] }))
+  world.state.below = () => ({ decision: { behavior: 'deny', message: 'settings hook says no' } })
+  expect(await $.classic.PermissionRequest(permission())).toEqual({ decision: { behavior: 'deny', message: 'settings hook says no' } })
+  expect(world.state.nexts).toBe(1)
+})
+
+// Redaction.
+test('redact masks names that end in token, secret, password, api key and the like, after an underscore too', () => {
+  const cases: Array<[string, string]> = [
+    ['ANTHROPIC_AUTH_TOKEN=abc123', 'ANTHROPIC_AUTH_TOKEN=[redacted]'],
+    ['GITHUB_TOKEN=ghs_x', 'GITHUB_TOKEN=[redacted]'],
+    ['DB_PASSWORD=hunter2', 'DB_PASSWORD=[redacted]'],
+    ['AWS_SECRET_ACCESS_KEY=x', 'AWS_SECRET_ACCESS_KEY=[redacted]'],
+    ['{"password": "x y"}', '{"password": [redacted]}'],
+    ['{"api_key":"abc"}', '{"api_key":[redacted]}'],
+    ['curl --password x https://h', 'curl --password [redacted] https://h'],
+    ['curl --token x https://h', 'curl --token [redacted] https://h'],
+    ['cli --token=abc --other', 'cli --token=[redacted] --other'],
+    ['cli --api-key "a b" run', 'cli --api-key [redacted] run'],
+    ['url?token=abc&x=1', 'url?token=[redacted]&x=1'],
+    ['a=1;secret=zz;b=2', 'a=1;secret=[redacted];b=2'],
+    ['credentials: s3cr3t', 'credentials: [redacted]'],
+    ['PRIVATE_KEY=abc', 'PRIVATE_KEY=[redacted]'],
+  ]
+  for (const [from, to] of cases) expect(redact(from), from).toBe(to)
+  expect(redact('run ghs_abcdefghijklmnopqrstuvwxyz0123 now')).toBe('run [redacted] now')
+  expect(redact('run ghu_abcdefghijklmnopqrstuvwxyz0123 now')).toBe('run [redacted] now')
+  expect(redact('x ghr_abcdefghijklmnopqrstuvwxyz0123')).toBe('x [redacted]')
+})
+
+test('redact leaves code expressions and ordinary words alone', () => {
+  const same = [
+    'token = tokens[i]',
+    'secret = getSecret()',
+    'password = cfg.password',
+    'const apiKey = process.env.KEY',
+    'pip install sk-learn',
+    'the sk-learn package and the tokenizer module',
+    'risk-assessment-for-the-task-list-in-detail',
+    'a secretary and a passwords policy',
+  ]
+  for (const t of same) expect(redact(t), t).toBe(t)
+  expect(redact('sk-learn is fine but sk-abcdefghijklmnopqrstuvwx is not')).toBe('sk-learn is fine but [redacted] is not')
+  expect(redact('sk-ant-api03-abcdefghijklmnopqrstuvwxyz')).toBe('[redacted]')
+})
+
+// The idle ping.
+test('the idle ping is fired without waiting: the stop returns while the send is still in flight', async ($, on) => {
+  const gate = defer<FetchAnswer>()
+  const server = promptServer()
+  const inner = server.fetch
+  server.fetch = (url, method, body) => (url.endsWith('/send') ? gate.promise : inner(url, method, body))
+  const world = await promptWorld($, on, server, {}, o => o('classic.Stop', () => ({})))
+  expect(await $.classic.Stop(stop())).toEqual({})
+  await world.clock.settle()
+  expect(sends(world.calls).length).toBe(1)
+  gate.resolve({ status: 200, text: '{}' })
+  await world.clock.settle()
+})
+
+test('the idle ping is not posted for a stop hook\'s stop or with background work, and still is with none', async ($, on) => {
+  const world = await promptWorld($, on, promptServer(), {}, o => o('classic.Stop', () => ({})))
+  await $.classic.Stop(stop({ stop_hook_active: true }))
+  await $.classic.Stop(stop({ background_tasks: [{ id: 'b1', type: 'shell', status: 'running', description: 'sleep' }] }))
+  await world.clock.settle()
+  expect(sends(world.calls)).toEqual([])
+  await $.classic.Stop(stop({ background_tasks: [] }))
+  await world.clock.settle()
+  expect(sends(world.calls).length).toBe(1)
+})
+
+// Plan text from the session's own transcript.
+const PLAN_FALLBACK = 'The plan text was not available; it is in the terminal.'
+async function planDetail(
+  $: TestArgs[0],
+  on: TestArgs[1],
+  files: Record<string, string | Error>,
+  options: WireOptions = {},
+  input: object = {},
+  extra: object = { transcript_path: 'C:/t/session.jsonl' },
+) {
+  // The engine may turn / into \ (Windows); paths are compared with / only.
+  const slashed = (path: string) => path.replace(/\\/g, '/')
+  // (and a drive may be put before a rooted path), so a path matches the file whose name it ends with.
+  const known = Object.entries(files).map(([k, v]) => [slashed(k), v] as const)
+  const reads: string[] = []
+  on('fs.read', (_$, e) => {
+    const hit = known.find(([k]) => slashed(e.path).endsWith(k))
+    reads.push(hit ? hit[0] : slashed(e.path))
+    const f = hit?.[1]
+    if (f === undefined || f instanceof Error) throw f ?? new Error('ENOENT')
+    return { value: f } as never
+  })
+  const world = await promptWorld($, on, promptServer({ waits: [ANSWER({ choice: 'approve' })] }), options)
+  await $.classic.PermissionRequest(permission(extra, 'ExitPlanMode', input))
+  return { detail: (at(opens(world.calls), 0).body as { detail: string }).detail, reads }
+}
+
+test('the plan is the last plans/<name>.md the transcript names, read from the config dir', async ($, on) => {
+  const transcript = '{"a":"wrote .claude/plans/old-plan.md"}\n{"a":"edited /home/u/.claude/plans/cool-plan.md ok"}\n{"x":"plans/none.txt"}'
+  const { detail, reads } = await planDetail($, on, { 'C:/t/session.jsonl': transcript, '/home/u/.claude/plans/cool-plan.md': '# The plan' })
+  expect(detail).toBe('# The plan')
+  expect(reads).toEqual(['C:/t/session.jsonl', '/home/u/.claude/plans/cool-plan.md'])
+})
+
+test('a relative plan path resolves under CLAUDE_CONFIG_DIR', async ($, on) => {
+  const rel = await planDetail($, on, { 'C:/t/session.jsonl': 'saw .claude/plans/a-b.md', 'D:/cfg/plans/a-b.md': 'relative plan' }, { env: { CLAUDE_CONFIG_DIR: 'D:/cfg/' } })
+  expect(rel.detail).toBe('relative plan')
+})
+
+test('a Windows path in a JSON transcript is used as it is', async ($, on) => {
+  const transcript = '{"file_path":"C:\\\\Users\\\\alex\\\\.claude\\\\plans\\\\win-plan.md"}'
+  const { detail, reads } = await planDetail($, on, { 'C:/t/session.jsonl': transcript, 'C:\\Users\\alex\\.claude/plans/win-plan.md': 'win plan' })
+  expect(detail).toBe('win plan')
+  expect(reads[1]).toBe('C:/Users/alex/.claude/plans/win-plan.md')
+})
+
+test('a plan the transcript does not name, an unreadable transcript or file say the plan is in the terminal', async ($, on) => {
+  expect((await planDetail($, on, { 'C:/t/session.jsonl': 'no plan here' })).detail).toBe(PLAN_FALLBACK)
+})
+
+test('an unreadable transcript says the plan is in the terminal', async ($, on) => {
+  expect((await planDetail($, on, {})).detail).toBe(PLAN_FALLBACK)
+})
+
+test('an unreadable plan file says the plan is in the terminal', async ($, on) => {
+  expect((await planDetail($, on, { 'C:/t/session.jsonl': 'x /h/.claude/plans/p.md' })).detail).toBe(PLAN_FALLBACK)
+})
+
+test('no transcript path says the plan is in the terminal', async ($, on) => {
+  expect((await planDetail($, on, {}, {}, {}, {})).detail).toBe(PLAN_FALLBACK)
+})
+
+test('tool_input.plan still comes first, and no file is read', async ($, on) => {
+  const first = await planDetail($, on, { 'C:/t/session.jsonl': 'x /h/.claude/plans/p.md', '/h/.claude/plans/p.md': 'from file' }, {}, { plan: 'inline plan' })
+  expect(first.detail).toBe('inline plan')
+  expect(first.reads).toEqual([])
+})
+
+// Subagent prompts outlive the main loop's turn.
+test('a main-loop turn ending cancels only main-loop prompts; a subagent prompt closes with the session', async ($, on) => {
+  const holds = [defer<FetchAnswer>(), defer<FetchAnswer>()]
+  const t = turns($, on)
+  const world = await promptWorld($, on, promptServer({ waits: holds.map(h => () => h.promise) }))
+  const main = $.classic.PermissionRequest(permission({}, 'Bash', { command: 'one' }))
+  await world.clock.settle()
+  const sub = $.classic.PermissionRequest(permission({ agent_id: 'agent-7', agent_type: 'reviewer' }, 'Bash', { command: 'two' }))
+  await world.clock.settle()
+  await t.start('go', 't1')
+  await t.complete('t1')
+  await world.clock.settle()
+  expect(resolves(world.calls)).toEqual([{ session: DEFAULT_SESSION_ID, id: 'p_1', outcome: 'cancelled' }])
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: DEFAULT_SESSION_ID, resume: { id: DEFAULT_SESSION_ID } })
+  await world.clock.settle()
+  expect(resolves(world.calls).map(r => `${r.id}:${r.outcome}`)).toEqual(['p_1:cancelled', 'p_2:ended'])
+  for (const h of holds) h.resolve(CLOSED)
+  await Promise.all([main, sub])
+})
+
+test('an option label that looks like an id passes through mapAnswers unchanged', () => {
+  expect(mapAnswers(QUESTIONS as never, { q1: 'o2', q2: ['o1', 'Other text'], q3: 'o3', q4: 7 })).toEqual({
+    'Which library?': 'o2',
+    'Which features?': 'o1, Other text',
+    'Name it?': 'o3',
+    'How many?': '7',
+  })
 })

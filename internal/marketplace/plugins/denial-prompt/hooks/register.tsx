@@ -24,6 +24,9 @@ const AUTO_MODE_DENIAL =
 
 type Choice = 'allow' | 'deny' | 'timeout'
 
+// Whether a person is at the prompt, from session.start; not known to be until it says so.
+let interactive = false
+
 const pending = atom({ plugin: 'denial-prompt', key: 'pending' } as const, {})
 
 // denialText returns the refusal text when the result is an auto-mode denial.
@@ -32,8 +35,40 @@ export function denialText(r: ToolCallResult): string | undefined {
   return text !== undefined && AUTO_MODE_DENIAL.test(text) ? text : undefined
 }
 
-// summarize names the blocked action in one short line.
-export function summarize(e: ToolCallInput): string {
+// Names whose value is a secret: any identifier ending in one of these (GITHUB_TOKEN, db_password,
+// "api-key"). \b would miss them after an underscore, so the match is anchored on identifier characters.
+const SECRET_NAME = '(?:token|secret|passw(?:or)?d|api[_-]?key|access[_-]?key|private[_-]?key|credential)s?'
+// A literal value, quoted or bare. One that starts like a code expression (tokens[i], getSecret(),
+// cfg.password) is not matched.
+const SECRET_VALUE = `(?![A-Za-z_$][\\w$]*[\\[(.])(?:"[^"]*"|'[^']*'|[^\\s"'&;]+)`
+const SECRET_SHAPES: Array<[RegExp, string]> = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[redacted]'],
+  [/\bxox[abpr]-[A-Za-z0-9-]{4,}/g, '[redacted]'],
+  [/\bxapp-[A-Za-z0-9-]{4,}/g, '[redacted]'],
+  [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}/g, '[redacted]'],
+  [/(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}/g, '[redacted]'],
+  [/\bgithub_pat_[A-Za-z0-9_]{16,}/g, '[redacted]'],
+  [/\bAKIA[0-9A-Z]{16}\b/g, '[redacted]'],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, '[redacted]'],
+  // name=value, name: value, "name": "value", --name=value
+  [new RegExp(`((?<![A-Za-z0-9_-])[A-Za-z0-9_-]*${SECRET_NAME}["']?\\s*[:=]\\s*)${SECRET_VALUE}`, 'gi'), '$1[redacted]'],
+  // --name value
+  [new RegExp(`(--[A-Za-z0-9_-]*${SECRET_NAME}\\s+)(?!-)${SECRET_VALUE}`, 'gi'), '$1[redacted]'],
+]
+
+// redact masks the proxy token (when given) and the shapes of other secrets. (A copy of agentbus's: the
+// plugins stay independent.)
+export function redact(text: string, proxyToken = ''): string {
+  let out = proxyToken ? text.split(proxyToken).join('[redacted]') : text
+  for (const [shape, to] of SECRET_SHAPES) out = out.replace(shape, to)
+  return out
+}
+
+// The most of the blocked action sent to Slack.
+const MAX_DETAIL_CHARS = 100_000
+
+// actionText is the blocked action as the call gave it, before redaction.
+function actionText(e: ToolCallInput): string {
   const args = e as unknown as Record<string, unknown>
   const detail =
     typeof args.command === 'string'
@@ -43,8 +78,20 @@ export function summarize(e: ToolCallInput): string {
         : typeof args.url === 'string'
           ? args.url
           : Object.values(args).find((v): v is string => typeof v === 'string' && v !== e.tool && v !== e.tool_use_id)
-  const line = `${e.tool}${detail ? `: ${detail.replace(/\s+/g, ' ').trim()}` : ''}`
+  return `${e.tool}${detail ? `: ${detail}` : ''}`
+}
+
+// summarize names the blocked action in one short line. It is redacted before it is cut, so no secret
+// survives half-cut.
+export function summarize(e: ToolCallInput, proxyToken = ''): string {
+  const line = redact(actionText(e), proxyToken).replace(/\s+/g, ' ').trim()
   return line.length > 160 ? `${line.slice(0, 159)}…` : line
+}
+
+// fullAction is the redacted blocked action for Slack, up to 100,000 characters.
+export function fullAction(e: ToolCallInput, proxyToken = ''): string {
+  const text = redact(actionText(e), proxyToken)
+  return text.length > MAX_DETAIL_CHARS ? `${text.slice(0, MAX_DETAIL_CHARS)}\n[${text.length - MAX_DETAIL_CHARS} more characters not sent]` : text
 }
 
 // Each row's resolver; a band press, a Slack answer or the countdown settles it.
@@ -102,9 +149,11 @@ async function bus($: EngineInterface): Promise<Bus | undefined> {
 
 type Slack = { bus: Bus; session: string; id: string }
 
-// openSlack posts the denial to the proxy; undefined when prompts are unavailable.
-async function openSlack($: EngineInterface, toolUseId: string, summary: string): Promise<Slack | undefined> {
+// openSlack posts the denial to the proxy; undefined when prompts are unavailable (off, or no person at
+// the prompt).
+async function openSlack($: EngineInterface, toolUseId: string, summary: string, detail: string): Promise<Slack | undefined> {
   try {
+    if (!interactive || (await $.env.get('AGENTBUS_SLACK_PROMPTS')) === '0') return undefined
     const b = await bus($)
     if (!b) return undefined
     const session = await $.session.id()
@@ -113,8 +162,8 @@ async function openSlack($: EngineInterface, toolUseId: string, summary: string)
       session,
       key: await sha256Hex(`denial|${toolUseId}`),
       kind: 'denial',
-      title: 'Auto mode blocked',
-      detail: summary,
+      title: `Auto mode blocked: ${summary}`,
+      detail,
     })
     const id = res?.status === 200 ? res.json?.id : undefined
     return typeof id === 'string' && id ? { bus: b, session, id } : undefined
@@ -173,8 +222,16 @@ type Decision = { choice: Choice; window: number; slack?: Slack }
 
 // ask shows the question above the prompt on its own row and resolves with the
 // user's choice, from the band or from Slack.
-async function ask($: EngineInterface, rowId: string, summary: string, signal: AbortSignal): Promise<Decision> {
-  const slack = await openSlack($, rowId, summary)
+async function ask(
+  $: EngineInterface,
+  rowId: string,
+  summary: string,
+  detail: string,
+  toolUseId: string | undefined,
+  signal: AbortSignal,
+): Promise<Decision> {
+  // Without a tool_use_id there is no stable key for Slack: the local row only.
+  const slack = toolUseId && !signal.aborted ? await openSlack($, toolUseId, summary, detail) : undefined
   let window = slack ? SLACK_SECONDS : LOCAL_SECONDS
   const show = async (secondsLeft: number) => {
     await update($, pending, p => (rowId in p ? { ...p, [rowId]: { summary, secondsLeft } } : p))
@@ -183,7 +240,13 @@ async function ask($: EngineInterface, rowId: string, summary: string, signal: A
   let settled = false
   const stop = { value: false }
   const local = new AbortController()
-  const onAbort = () => local.abort()
+  // Esc: the call is interrupted, so the Slack wait ends too and the row settles as a timeout. Nothing
+  // pressed or answered afterwards can run the call again.
+  const onAbort = () => {
+    stop.value = true
+    answers.get(rowId)?.('timeout')
+    local.abort()
+  }
   signal.addEventListener('abort', onAbort)
   try {
     const press = new Promise<Choice>(resolve => {
@@ -194,6 +257,7 @@ async function ask($: EngineInterface, rowId: string, summary: string, signal: A
         }
       })
     })
+    if (signal.aborted) onAbort()
     const safe = <T,>(p: Promise<T>, fallback: T) => p.catch(() => fallback)
     const shortWindow = async (): Promise<Choice> =>
       Promise.race([press, safe(countdown($, window, local.signal, () => settled, show), 'timeout' as Choice)])
@@ -231,15 +295,23 @@ async function resolveSlack(s: Slack | undefined, outcome: 'ran' | 'denied' | 'c
 }
 
 export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    interactive = e.isInteractive === true
+    return next(e)
+  })
+
   on('tool.call', async ($, e, next) => {
     const r = await next(e)
     const denied = denialText(r)
     if (denied === undefined) return r
 
-    const summary = summarize(e)
-    const rowId = e.tool_use_id ?? `denial-${++nextRow}`
-    const d = await ask($, rowId, summary, next.signal)
-    const { choice, slack } = d
+    const proxyToken = await $.env.get('ANTHROPIC_AUTH_TOKEN').then(v => v ?? '', () => '')
+    const summary = summarize(e, proxyToken)
+    const rowId = e.tool_use_id ?? `local-${++nextRow}`
+    const d = await ask($, rowId, summary, fullAction(e, proxyToken), e.tool_use_id, next.signal)
+    const { slack } = d
+    // An interrupted call (Esc) is never run again, whatever was pressed or answered.
+    const choice: Choice = next.signal.aborted ? 'timeout' : d.choice
 
     if (choice !== 'allow') {
       await resolveSlack(slack, choice === 'deny' ? 'denied' : 'cancelled')
@@ -255,7 +327,8 @@ export const register: Register = on => {
         ...(args as Parameters<typeof $.tool.call>[0]),
         consent: `The user pressed "1: Allow once" on "Auto mode blocked: ${summary}"`,
       })
-      await resolveSlack(slack, out.deny !== undefined || out.isError === true ? 'denied' : 'ran')
+      // The call ran, even if it failed; only an explicit deny result is a denial.
+      await resolveSlack(slack, out.deny !== undefined ? 'denied' : 'ran')
       return out
     } catch (err) {
       await resolveSlack(slack, 'cancelled')
@@ -267,15 +340,17 @@ export const register: Register = on => {
     const rows = Object.entries(await read($, pending))
     if (rows.length === 0) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
+    // Keys only while one row is open: with several, a timed-out row's keys could land on another row's action.
+    const keys = rows.length === 1
     return (
       <Box flexDirection="column">
-        {rows.map(([id, p], i) => (
+        {rows.map(([id, p]) => (
           <Box key={`row:${id}`} flexDirection="column">
             <Text>Auto mode blocked: {p.summary}</Text>
             <Box>
-              <Button key={`allow:${id}`} hotkey={i === 0 ? '1' : undefined} plain label="Allow once" onPress={() => answers.get(id)?.('allow')} />
+              <Button key={`allow:${id}`} hotkey={keys ? '1' : undefined} plain label="Allow once" onPress={() => answers.get(id)?.('allow')} />
               <Text> </Text>
-              <Button key={`deny:${id}`} hotkey={i === 0 ? '2' : undefined} plain label="Deny" onPress={() => answers.get(id)?.('deny')} />
+              <Button key={`deny:${id}`} hotkey={keys ? '2' : undefined} plain label="Deny" onPress={() => answers.get(id)?.('deny')} />
               <Text dimColor> · denies in {left(p.secondsLeft)}</Text>
             </Box>
           </Box>
