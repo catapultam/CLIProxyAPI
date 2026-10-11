@@ -282,7 +282,11 @@ func (b *Bridge) reservePrompt(req agentbus.PromptRequest) (p *prompt, isNew boo
 	k := req.Session + "\x00" + req.Key
 	if old := b.promptByKey[k]; old != nil {
 		b.expireDueLocked(old, now)
-		if old.state != promptClosedState {
+		// An answer whose session never resolved the prompt (its resolve was
+		// lost) is not handed to a new call past promptRetain: that would
+		// replay an old answer. The old record stays findable by id.
+		stale := old.state == promptAnsweredState && now.Sub(old.answeredAt) > promptRetain
+		if old.state != promptClosedState && !stale {
 			return old, false, nil
 		}
 	}

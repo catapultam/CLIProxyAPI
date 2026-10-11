@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { redact } from '../hooks/register'
 
 const DENIAL = 'Permission for this action was denied by the Claude Code auto mode classifier. Reason: Network fetch'
 const BAND = {
@@ -404,5 +405,29 @@ describe('denial-prompt redact', () => {
         'a [redacted] b [redacted] ' +
         'token = tokens[i] secret = getSecret() password = cfg.password pip install sk-learn',
     )
+  })
+})
+
+describe('denial-prompt final review fixes', () => {
+  test('"still open" answers that come back at once give up after five and fall back to 8 seconds', async ($, on) => {
+    const clock = mock.clock(on)
+    engine(on, { calls: 0 })
+    const p = proxy(on, { prompt: OPENED, wait: () => ({ status: 204, text: '' }) })
+    await start($)
+    const call = $.tool.call({ tool: 'Bash', command: 'git push --force', tool_use_id: 't1' })
+    await clock.settle()
+    expect(p.waits()).toBe(5)
+    await clock.advance(8_000)
+    const r = await call
+    expect(r.deny).toContain('did not answer within 8 seconds')
+  })
+
+  test('redact stays linear on long runs of dashes', () => {
+    for (const text of ['-'.repeat(100_000), `${'-'.repeat(50_000)}token x`]) {
+      const started = Date.now()
+      redact(text)
+      expect(Date.now() - started, `${text.length} chars`).toBeLessThan(500)
+    }
+    expect(redact('run --api-token abc123 now')).toBe('run --api-token [redacted] now')
   })
 })

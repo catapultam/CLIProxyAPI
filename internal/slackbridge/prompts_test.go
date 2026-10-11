@@ -1108,6 +1108,28 @@ func TestPromptReopenAfterResolveMakesANewPromptWithoutAReplayedAnswer(t *testin
 	}
 }
 
+func TestPromptAnswerWhoseResolveWasLostIsNotReplayedToANewCall(t *testing.T) {
+	e := newPromptEnv(t)
+	clock := newTestClock()
+	e.b.state.now = clock.now
+	id := e.open(permReq(sidA, "same", nil))
+	e.click("UALEX", id, "allow")
+	// The session never resolves it. Within promptRetain a re-entry still
+	// shares the prompt; past it a new call gets a new, unanswered one.
+	clock.advance(promptRetain - time.Minute)
+	if again := e.open(permReq(sidA, "same", nil)); again != id {
+		t.Fatalf("a recent answered prompt got a new id %s", again)
+	}
+	clock.advance(2 * time.Minute)
+	fresh := e.open(permReq(sidA, "same", nil))
+	if fresh == id {
+		t.Fatal("an answer past promptRetain was handed to a new call")
+	}
+	if w := e.wait(sidA, fresh); w.Code != http.StatusNoContent {
+		t.Fatalf("wait on the new prompt = %d %s", w.Code, w.Body)
+	}
+}
+
 func TestPromptClosedRecordsAreCapped(t *testing.T) {
 	e := newPromptEnv(t)
 	first := e.open(permReq(sidA, "first", nil))

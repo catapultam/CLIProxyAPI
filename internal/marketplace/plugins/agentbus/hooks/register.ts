@@ -445,7 +445,7 @@ const SECRET_SHAPES: Array<[RegExp, string]> = [
   // name=value, name: value, "name": "value", --name=value
   [new RegExp(`((?<![A-Za-z0-9_-])[A-Za-z0-9_-]*${SECRET_NAME}["']?\\s*[:=]\\s*)${SECRET_VALUE}`, 'gi'), '$1[redacted]'],
   // --name value
-  [new RegExp(`(--[A-Za-z0-9_-]*${SECRET_NAME}\\s+)(?!-)${SECRET_VALUE}`, 'gi'), '$1[redacted]'],
+  [new RegExp(`((?<![A-Za-z0-9_-])--[A-Za-z0-9_-]{0,64}${SECRET_NAME}\\s+)(?!-)${SECRET_VALUE}`, 'gi'), '$1[redacted]'],
 ]
 
 export function redact(text: string): string {
@@ -1147,9 +1147,21 @@ export function permissionDetail(tool: string, input: unknown): string {
 
 // The most of a transcript's tail searched for the plan file's path.
 const TRANSCRIPT_TAIL_CHARS = 2 * 1024 * 1024
-// The plan file's path as the transcript names it: whatever path text leads up to /plans/<name>.md. A JSON
-// transcript doubles its backslashes, hence the runs of separators.
-const PLAN_PATH = /([^\s"'`<>|*?]*)[\\/]+plans[\\/]+([A-Za-z0-9._-]+\.md)/g
+// The plan file's name as the transcript names it: /plans/<name>.md. A JSON transcript doubles its
+// backslashes, hence the runs of separators. Linear on purpose: a transcript can hold a pasted image as
+// one base64 run hundreds of thousands of characters long.
+const PLAN_PATH = /[\\/]+plans[\\/]+([A-Za-z0-9._-]+\.md)/g
+// The path text before a match is read backwards, at most this far, up to a character no path holds.
+const PLAN_PREFIX_CHARS = 1024
+const NOT_PATH = /[\s"'`<>|*?]/
+
+// planPrefix is the path text that leads up to the match at index.
+function planPrefix(text: string, index: number): string {
+  let start = index
+  const floor = Math.max(0, index - PLAN_PREFIX_CHARS)
+  while (start > floor && !NOT_PATH.test(text.charAt(start - 1))) start--
+  return text.slice(start, index)
+}
 
 // An ExitPlanMode plan: tool_input.plan, else the plan file this session's transcript names last. Never
 // "the newest plan in the folder": that could be another session's plan.
@@ -1164,8 +1176,8 @@ async function planText($: EngineInterface, input: unknown, transcriptPath: unkn
     let last: RegExpExecArray | null = null
     for (const m of tail.matchAll(PLAN_PATH)) last = m
     if (!last) return PLAN_MISSING
-    const name = last[2] as string
-    const prefix = (last[1] ?? '').replace(/\\\\/g, '\\')
+    const name = last[1] as string
+    const prefix = planPrefix(tail, last.index ?? 0).replace(/\\\\/g, '\\')
     const trim = (v: string) => v.replace(/[\\/]+$/, '')
     const home = trim((await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? '')
     const configDir = trim((await $.env.get('CLAUDE_CONFIG_DIR')) || (home ? `${home}/.claude` : ''))
@@ -1325,12 +1337,19 @@ async function openPrompt($: EngineInterface, key: string, body: PromptBody, age
   }
 }
 
+// A "still open" wait answer faster than this, FAST_OPEN_LIMIT times in a row, means the proxy is not
+// holding waits: give up rather than spin.
+const FAST_OPEN_MS = 1000
+const FAST_OPEN_LIMIT = 5
+
 type PromptAnswer = { choice?: string; reason?: string; answers?: Record<string, unknown>; by?: string }
 type Waited = { kind: 'answer'; answer: PromptAnswer } | { kind: 'closed' } | { kind: 'failed' } | { kind: 'stopped' }
 
 // Long-polls the answer, one fetch per iteration (the hook's budget is frozen while a fetch is in
 // flight, and no $.clock wait is used, which would not be). 404: the proxy lost the prompt (a restart),
 // so it is opened again once per streak of 404s; a second one in a row, or three errors in a row, give up.
+// The proxy holds a wait for up to 25 s, so a "still open" that comes back at once is a fault: five in a
+// row give up rather than spin on the proxy.
 export async function waitAnswer(
   $: EngineInterface,
   sid: string,
@@ -1339,10 +1358,12 @@ export async function waitAnswer(
 ): Promise<Waited> {
   let id = firstId
   let errors = 0
+  let fastOpen = 0
   let reopened = false
   for (;;) {
     if (opts.stopped?.()) return { kind: 'stopped' }
     let res: { status: number; json: Record<string, unknown> | null }
+    const sent = await $.clock.now()
     try {
       res = await bus($, 'GET', `/prompt/wait?session=${encodeURIComponent(sid)}&id=${encodeURIComponent(id)}`)
     } catch {
@@ -1355,6 +1376,8 @@ export async function waitAnswer(
     } else if (res.status === 204) {
       errors = 0
       reopened = false
+      fastOpen = (await $.clock.now()) - sent < FAST_OPEN_MS ? fastOpen + 1 : 0
+      if (fastOpen >= FAST_OPEN_LIMIT) return { kind: 'failed' }
       continue
     } else if (res.status === 410) {
       return { kind: 'closed' }
@@ -1754,6 +1777,13 @@ export const register: Register = on => {
   // hooks) are not delayed by the Slack wait: if they decide, that decision stands; if not, the wait goes on.
   // The hook's budget is frozen while next(e) or a fetch is in flight, and the wait loop runs on its own,
   // so it has a fetch in flight whenever next(e) has settled.
+  // decidedBelow says whether the hooks beneath settled the request: a decision, or a block or a stop,
+  // which a Slack answer must never override.
+  const decidedBelow = (r: unknown): boolean => {
+    const out = r as { decision?: unknown; block?: unknown; preventContinuation?: unknown } | null
+    return Boolean(out?.decision) || Boolean(out?.block) || Boolean(out?.preventContinuation)
+  }
+
   on('classic.PermissionRequest', async ($, e, next) => {
     if (!promptsActive() || e.tool_name === 'AskUserQuestion') return next(e)
     const below = next(e).then(
@@ -1769,12 +1799,12 @@ export const register: Register = on => {
     }
     const first = await Promise.race([below.then(b => ({ b })), slack.then(a => ({ a }))])
     if ('b' in first) {
-      if (!first.b.ok || (first.b.r as { decision?: unknown } | null)?.decision) return fromBelow(first.b)
-      // Nothing beneath decided: Slack may still. Its closing or failing leaves what the hooks said.
+      if (!first.b.ok || decidedBelow(first.b.r)) return fromBelow(first.b)
+      // Nothing beneath decided: Slack may still. Its closing or failing leaves what the hooks said, and its
+      // answer keeps the rest of what they said. The decision's shape is checked by decisionFor.
       const answered = await slack
       ctl.stop = true
-      // The decision's shape is checked by decisionFor.
-      return answered ? (answered as never) : fromBelow(first.b)
+      return answered ? ({ ...(first.b.r as object), ...(answered as object) } as never) : fromBelow(first.b)
     }
     // Slack came back first: its answer, or (closed, failed, aborted) whatever the hooks beneath say.
     if (first.a) {

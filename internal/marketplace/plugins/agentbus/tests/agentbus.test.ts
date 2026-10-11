@@ -2033,7 +2033,8 @@ test('waitAnswer stops when told to (the abort), one fetch per pass, no clock wa
         return { status: status.code, ok: status.code < 300, headers: {}, text: '' }
       },
     },
-    clock: new Proxy({}, { get: () => () => { throw new Error('a clock wait') } }),
+    // Reading the time is allowed (it spots a proxy that stops holding waits); waiting on the clock is not.
+    clock: new Proxy({}, { get: (_t, name) => (name === 'now' ? async () => 0 : () => { throw new Error('a clock wait') }) }),
   } as never
   let polls = 0
   expect(await waitAnswer(stub, DEFAULT_SESSION_ID, 'p_9', { stopped: () => polls++ >= 2 })).toEqual({ kind: 'stopped' })
@@ -2519,6 +2520,35 @@ test('a Slack answer is returned while the hooks beneath are still running', asy
   below.resolve({})
 })
 
+test('a block from the hooks beneath stands: Slack is not waited on and cannot allow over it', async ($, on) => {
+  const hold = defer<FetchAnswer>()
+  const world = await promptWorld($, on, promptServer({ waits: [() => hold.promise] }))
+  world.state.below = () => ({ block: 'a settings hook vetoed it' })
+  expect(await $.classic.PermissionRequest(permission())).toEqual({ block: 'a settings hook vetoed it' })
+  expect(world.state.nexts).toBe(1)
+  hold.resolve(ANSWER({ choice: 'allow' }))
+  await world.clock.settle()
+})
+
+test('a Slack answer keeps the rest of what the hooks beneath said', async ($, on) => {
+  // The hooks beneath settle first with no decision; Slack answers after.
+  const hold = defer<FetchAnswer>()
+  const world = await promptWorld($, on, promptServer({ waits: [() => hold.promise] }))
+  world.state.below = () => ({ stopReason: 'kept' })
+  const perm = $.classic.PermissionRequest(permission())
+  await world.clock.settle()
+  hold.resolve(ANSWER({ choice: 'allow' }))
+  await world.clock.settle()
+  expect(await perm).toEqual({ stopReason: 'kept', decision: { behavior: 'allow' } })
+})
+
+test('"still open" answers that come back at once give up after five, and the hooks beneath stand', async ($, on) => {
+  const world = await promptWorld($, on, promptServer({ waits: Array(8).fill(STILL_OPEN) }))
+  world.state.below = () => ({})
+  expect(await $.classic.PermissionRequest(permission())).toEqual({})
+  expect(promptWaits(world.calls).length).toBe(5)
+})
+
 test('Slack closing leaves the answer of the hooks beneath', async ($, on) => {
   const world = await promptWorld($, on, promptServer({ waits: [CLOSED] }))
   world.state.below = () => ({ decision: { behavior: 'deny', message: 'settings hook says no' } })
@@ -2564,6 +2594,15 @@ test('redact leaves code expressions and ordinary words alone', () => {
   for (const t of same) expect(redact(t), t).toBe(t)
   expect(redact('sk-learn is fine but sk-abcdefghijklmnopqrstuvwx is not')).toBe('sk-learn is fine but [redacted] is not')
   expect(redact('sk-ant-api03-abcdefghijklmnopqrstuvwxyz')).toBe('[redacted]')
+})
+
+test('redact stays linear on long runs of dashes and word characters', () => {
+  for (const text of ['-'.repeat(100_000), `${'-'.repeat(50_000)}token x`, 'a_'.repeat(50_000)]) {
+    const started = Date.now()
+    redact(text)
+    expect(Date.now() - started, `${text.length} chars`).toBeLessThan(500)
+  }
+  expect(redact('run --api-token abc123 now')).toBe('run --api-token [redacted] now')
 })
 
 // The idle ping.
@@ -2623,6 +2662,15 @@ test('the plan is the last plans/<name>.md the transcript names, read from the c
   const { detail, reads } = await planDetail($, on, { 'C:/t/session.jsonl': transcript, '/home/u/.claude/plans/cool-plan.md': '# The plan' })
   expect(detail).toBe('# The plan')
   expect(reads).toEqual(['C:/t/session.jsonl', '/home/u/.claude/plans/cool-plan.md'])
+})
+
+test('a transcript holding a long base64 run (a pasted image) is searched in linear time', async ($, on) => {
+  const run = 'iVBORw0KGgo'.repeat(30_000) // 330k characters with no space or quote
+  const transcript = `{"image":"${run}"}\n{"a":"edited /home/u/.claude/plans/fast-plan.md"}\n{"image":"${run}"}`
+  const started = Date.now()
+  const { detail } = await planDetail($, on, { 'C:/t/session.jsonl': transcript, '/home/u/.claude/plans/fast-plan.md': 'fast plan' })
+  expect(detail).toBe('fast plan')
+  expect(Date.now() - started).toBeLessThan(1000)
 })
 
 test('a relative plan path resolves under CLAUDE_CONFIG_DIR', async ($, on) => {

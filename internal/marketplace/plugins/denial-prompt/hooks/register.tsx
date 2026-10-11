@@ -53,7 +53,7 @@ const SECRET_SHAPES: Array<[RegExp, string]> = [
   // name=value, name: value, "name": "value", --name=value
   [new RegExp(`((?<![A-Za-z0-9_-])[A-Za-z0-9_-]*${SECRET_NAME}["']?\\s*[:=]\\s*)${SECRET_VALUE}`, 'gi'), '$1[redacted]'],
   // --name value
-  [new RegExp(`(--[A-Za-z0-9_-]*${SECRET_NAME}\\s+)(?!-)${SECRET_VALUE}`, 'gi'), '$1[redacted]'],
+  [new RegExp(`((?<![A-Za-z0-9_-])--[A-Za-z0-9_-]{0,64}${SECRET_NAME}\\s+)(?!-)${SECRET_VALUE}`, 'gi'), '$1[redacted]'],
 ]
 
 // redact masks the proxy token (when given) and the shapes of other secrets. (A copy of agentbus's: the
@@ -174,7 +174,9 @@ async function openSlack($: EngineInterface, toolUseId: string, summary: string,
 
 // slackWait long-polls the answer, one fetch per iteration and no $.clock wait,
 // until the deadline, a closed prompt, repeated errors, or stop. It returns the
-// choice, or 'lost' when Slack can no longer answer.
+// choice, or 'lost' when Slack can no longer answer. The proxy holds a wait for
+// up to 25 s, so five "still open" answers in a row that come back within a
+// second mean it is not holding them: give up rather than spin on it.
 async function slackWait(
   $: EngineInterface,
   s: Slack,
@@ -183,9 +185,11 @@ async function slackWait(
   show: (secondsLeft: number) => Promise<void>,
 ): Promise<Choice | 'lost'> {
   let errors = 0
+  let fastOpen = 0
   const url = `/prompt/wait?session=${encodeURIComponent(s.session)}&id=${encodeURIComponent(s.id)}`
   while (!stop.value) {
-    if (deadline - (await $.clock.now()) <= 0) return 'timeout'
+    const sent = await $.clock.now()
+    if (deadline - sent <= 0) return 'timeout'
     const res = await s.bus.get(url)
     if (stop.value) return 'lost'
     if (res === null || res.status >= 500) {
@@ -198,6 +202,8 @@ async function slackWait(
       return a?.choice === 'allow_once' ? 'allow' : 'deny'
     }
     if (res.status !== 204) return 'lost' // 404, 410, anything else: Slack is gone
+    fastOpen = (await $.clock.now()) - sent < 1000 ? fastOpen + 1 : 0
+    if (fastOpen >= 5) return 'lost'
     await show(Math.max(0, Math.ceil((deadline - (await $.clock.now())) / 1000)))
   }
   return 'lost'
