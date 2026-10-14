@@ -33,7 +33,7 @@ func TestUnnamedAgentIsNamedPubliclyForNonOwners(t *testing.T) {
 	b.handleEvent("EvNm1", dmMsg("UJANE", "thanks", "1700011000.000001", ""))
 	_ = claimOne(t, bus, sidB)
 	drainJobs(t, b)
-	if got := lastPost(t, f); got["text"] != "→ sent to `an agent`" || len(leaks(got["text"])) > 0 {
+	if got := ephemeralsSince(f, 0); len(got) != 1 || got[0]["text"] != "→ sent to `an agent`" || len(leaks(got[0]["text"])) > 0 {
 		t.Fatalf("dm_last reply = %+v", got)
 	}
 	// Offline: a top-level "address:" from jane still waits, and says so.
@@ -80,7 +80,7 @@ func TestOwnerDMStillNamesAgentsByAddress(t *testing.T) {
 	b.handleEvent("EvNo1", dmMsg("UALEX", "thanks", "1700011200.000001", ""))
 	_ = claimOne(t, bus, sidB)
 	drainJobs(t, b)
-	if got := lastPost(t, f); got["text"] != "→ sent to `pc/other-bbbbbb`" {
+	if got := ephemeralsSince(f, 0); len(got) != 1 || got[0]["text"] != "→ sent to `pc/other-bbbbbb`" {
 		t.Fatalf("owner dm_last reply = %+v", got)
 	}
 }

@@ -125,8 +125,11 @@ type dmLink struct {
 
 // dmLastEntry is the agent a user last talked to in their DM with the bot.
 type dmLastEntry struct {
-	Session string    `json:"session"`
-	At      time.Time `json:"at"`
+	Session string `json:"session"`
+	// Sent is the agent the user's own last DM went to. An agent's DM or a
+	// link changes Session but not Sent.
+	Sent string    `json:"sent,omitempty"`
+	At   time.Time `json:"at"`
 }
 
 type allowedUser struct {
@@ -726,7 +729,16 @@ func (st *state) dmHeaded(channel, sid string) bool {
 func (st *state) setDMLast(userID, sid string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.dmLasts[userID] = dmLastEntry{Session: sid, At: st.now()}
+	st.dmLasts[userID] = dmLastEntry{Session: sid, Sent: st.dmLasts[userID].Sent, At: st.now()}
+	st.dirty = true
+}
+
+// setDMSent makes sid the agent userID's plain DMs go to, and the agent
+// their own last DM went to.
+func (st *state) setDMSent(userID, sid string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.dmLasts[userID] = dmLastEntry{Session: sid, Sent: sid, At: st.now()}
 	st.dirty = true
 }
 
@@ -740,6 +752,18 @@ func (st *state) dmLast(userID string) (string, bool) {
 		return "", false
 	}
 	return e.Session, true
+}
+
+// dmSent returns the agent userID's own last DM went to, unless their
+// dm_last was set more than dmLastTTL ago.
+func (st *state) dmSent(userID string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	e, ok := st.dmLasts[userID]
+	if !ok || !e.At.After(st.now().Add(-dmLastTTL)) {
+		return ""
+	}
+	return e.Sent
 }
 
 // userByLabel finds an allowed user by label, compared case-insensitively.

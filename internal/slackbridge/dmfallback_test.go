@@ -24,7 +24,9 @@ func TestDMUnresolvedNameFallsBackToDMLast(t *testing.T) {
 		t.Fatal("delivered elsewhere")
 	}
 	drainJobs(t, b)
-	if got := lastPost(t, f); got["channel"] != "DUALEX" || got["text"] != "→ sent to `flyer`" {
+	// The name was no agent's: it says where the text went, though that is
+	// the agent the user last wrote to.
+	if got := ephemeralsSince(f, 0); len(got) != 1 || got[0]["channel"] != "DUALEX" || got[0]["text"] != "→ sent to `flyer`" {
 		t.Fatalf("reply = %+v", got)
 	}
 	// The answer goes to the DM's top level.

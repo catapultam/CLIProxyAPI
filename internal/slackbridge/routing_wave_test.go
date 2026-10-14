@@ -21,6 +21,17 @@ func postsSince(f *fakeSlack, n int) []map[string]string {
 	return out
 }
 
+// ephemeralsSince returns the chat.postEphemeral forms after the first n.
+func ephemeralsSince(f *fakeSlack, n int) []map[string]string {
+	var out []map[string]string
+	for i, c := range f.callsTo("chat.postEphemeral") {
+		if i >= n {
+			out = append(out, map[string]string{"channel": c.Form.Get("channel"), "user": c.Form.Get("user"), "text": c.Form.Get("text"), "thread_ts": c.Form.Get("thread_ts")})
+		}
+	}
+	return out
+}
+
 // Item 2: a closed session gets nothing queued; the thread says it ended.
 func TestThreadReplyToClosedSessionSaysEnded(t *testing.T) {
 	b, f, bus := newTestBridge(t)
@@ -61,10 +72,15 @@ func TestHandOffMovesSlackRoutingToTheNewSession(t *testing.T) {
 	if m := claimOne(t, bus, sidC); m.Body != "still there?" {
 		t.Fatalf("thread reply = %+v", m)
 	}
-	// So does a plain DM (dm_last).
+	// So does a plain DM (dm_last), with no "sent to" reply: the user last
+	// wrote to the same agent.
 	b.handleEvent("EvHo4", dmMsg("UALEX", "and here?", "1700000800.000004", ""))
 	if m := claimOne(t, bus, sidC); m.Body != "and here?" {
 		t.Fatalf("dm = %+v", m)
+	}
+	drainJobs(t, b)
+	if got := ephemeralsSince(f, 0); len(got) != 0 {
+		t.Fatalf("ephemerals = %+v", got)
 	}
 	// And a guest in the linked conversation.
 	b.handleEvent("EvHo5", foreignMsg("UBOB", "hello", "1700000800.000005", ""))
@@ -109,22 +125,46 @@ func TestAnswerToUnlinkedConversationIsDroppedWithNotice(t *testing.T) {
 	}
 }
 
-// Item 5: a plain top-level DM routed by dm_last says where it went, in a
-// thread under it.
+// Item 5: a plain top-level DM routed by dm_last says where it went, only
+// when that is not the agent the user last wrote to. The reply is ephemeral,
+// at the top level: no thread.
 func TestDMLastRoutingSaysWhereItWent(t *testing.T) {
 	b, f, bus := newTestBridge(t)
 	b.handleEvent("EvDl1", dmMsg("UALEX", "flyer: hi", "1700000600.000001", ""))
 	_ = deliveredID(t, bus, sidA)
 	drainJobs(t, b)
-	before := len(f.callsTo("chat.postMessage"))
+	eph := len(f.callsTo("chat.postEphemeral"))
+
+	// Same agent as last time: no reply.
 	b.handleEvent("EvDl2", dmMsg("UALEX", "and another thing", "1700000600.000002", ""))
 	if m := claimOne(t, bus, sidA); m.Body != "and another thing" {
 		t.Fatalf("msg = %+v", m)
 	}
 	drainJobs(t, b)
-	got := postsSince(f, before)
-	if len(got) != 1 || got[0]["channel"] != "DUALEX" || got[0]["thread_ts"] != "1700000600.000002" || got[0]["text"] != "→ sent to `flyer`" {
-		t.Fatalf("posts = %+v", got)
+	if got := ephemeralsSince(f, eph); len(got) != 0 {
+		t.Fatalf("ephemerals = %+v", got)
+	}
+
+	// Another agent DMs the user: the next plain DM goes to it, and says so.
+	sendDM(t, b, bus, sidB, "alex", "hello alex")
+	posts := len(f.callsTo("chat.postMessage"))
+	b.handleEvent("EvDl3", dmMsg("UALEX", "thanks", "1700000600.000003", ""))
+	_ = claimOne(t, bus, sidB)
+	drainJobs(t, b)
+	got := ephemeralsSince(f, eph)
+	if len(got) != 1 || got[0]["channel"] != "DUALEX" || got[0]["user"] != "UALEX" || got[0]["thread_ts"] != "" || got[0]["text"] != "→ sent to `pc/other-bbbbbb`" {
+		t.Fatalf("ephemerals = %+v", got)
+	}
+	if p := postsSince(f, posts); len(p) != 0 {
+		t.Fatalf("posts = %+v", p)
+	}
+
+	// Same agent again: no reply.
+	b.handleEvent("EvDl4", dmMsg("UALEX", "one more", "1700000600.000004", ""))
+	_ = claimOne(t, bus, sidB)
+	drainJobs(t, b)
+	if got := ephemeralsSince(f, eph); len(got) != 1 {
+		t.Fatalf("ephemerals = %+v", got)
 	}
 }
 

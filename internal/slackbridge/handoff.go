@@ -72,8 +72,11 @@ func (st *state) moveSession(oldID, newID string) {
 	for user, e := range st.dmLasts {
 		if e.Session == oldID {
 			e.Session = newID
-			st.dmLasts[user] = e
 		}
+		if e.Sent == oldID {
+			e.Sent = newID
+		}
+		st.dmLasts[user] = e
 	}
 	for channel, l := range st.convs {
 		if l.Session == oldID {

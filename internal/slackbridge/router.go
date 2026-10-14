@@ -374,7 +374,10 @@ func (b *Bridge) send(ev messageEvent, user allowedUser, sid, text string, adopt
 //     in the DM (dmLast, while it hasn't expired), else to the agent the DM
 //     is linked to, or gets a help reply. So does a "name: …" or "@name …"
 //     whose name is no agent's, whole, with a reply saying where it went
-//     (without dmLast or a link, it gets the not-found help).
+//     (without dmLast or a link, it gets the not-found help). A message
+//     sent by dmLast to an agent other than the one the user last wrote
+//     to in the DM also says where it went. That reply is ephemeral and
+//     at the top level.
 //
 // "!" commands take the same routes, with the same owner rule, except that
 // a command never falls back: its name must be an agent's. Every delivery
@@ -454,11 +457,20 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 		b.reply(ev, b.help(ev))
 		return
 	}
-	if _, delivered := b.deliver(ev, sid, text, user, sessionEnded, true); delivered && (viaLast || unresolved) {
-		// dm_last may be stale, or the text named another: say which agent
-		// got it.
-		b.replyInThread(ev, "→ sent to `"+escape(b.agentLabel(ev, sid))+"`")
+	changed := viaLast && b.state.dmSent(ev.User) != sid
+	if _, delivered := b.deliver(ev, sid, text, user, sessionEnded, true); delivered && (changed || unresolved) {
+		// dm_last is not the agent the user last wrote to, or the text named
+		// another: say which agent got it.
+		b.ephemeral(ev, "→ sent to `"+escape(b.agentLabel(ev, sid))+"`")
 	}
+}
+
+// ephemeral tells ev's author text at the top level of ev's conversation,
+// where only they see it.
+func (b *Bridge) ephemeral(ev messageEvent, text string) {
+	b.enqueue(func(ctx context.Context) error {
+		return b.api.postEphemeral(ctx, b.cfg.BotToken, ev.Channel, ev.User, text)
+	})
 }
 
 // dmHasFallback reports whether a plain top-level message from userID in
@@ -666,7 +678,7 @@ func (b *Bridge) topLevelOutside(ev messageEvent) bool {
 // becomes one of sid's threads (its home thread when it has none and its
 // home is the channel); in a DM the post is linked to sid, so thread
 // replies under it reach sid. Every delivery from a DM also makes sid the
-// user's dmLast.
+// user's dmLast and the agent they last wrote to.
 //
 // command is the name of the command msgID carries, or empty.
 //
@@ -685,7 +697,7 @@ func (b *Bridge) recordDelivery(ev messageEvent, msgID, sid string, adopt bool, 
 		return reaction
 	}
 	reaction := b.state.record(r)
-	b.state.setDMLast(ev.User, sid)
+	b.state.setDMSent(ev.User, sid)
 	if adopt {
 		b.state.linkDM(ev.Channel, ev.TS, sid, false)
 	}

@@ -843,7 +843,10 @@ agent gets the notice "That conversation is no longer reachable; your
 message was not posted." An image gets `conversation_unreachable`.
 
 **DM routing.** A plain top-level DM routed by `dm_last` gets "→ sent to
-`<name>`" in a thread under it. A bare top-level `!cmd` in a DM is never
+`<name>`" only when `<name>` is not the agent the user's own last DM went
+to (`dm_last.sent`; an agent's DM or a link changes `dm_last` but not
+`sent`). The reply is ephemeral, at the top level of the DM, not in a
+thread. A bare top-level `!cmd` in a DM is never
 sent to `dm_last` (it needs `name: !cmd`); `!commands` still lists.
 Unlinking a DM clears its users' `dm_last` when it pointed at the unlinked
 agent. A session's top-level post in a DM (or any non-main conversation)
@@ -986,7 +989,7 @@ says Slack messages may be broadcasts, to dismiss when not relevant.
 
 **DM fallback.** In a DM with the bot, a top-level `name: …` or `@name …`
 whose name is no agent's goes, whole, to `dm_last` (or the DM's link), with
-"→ sent to <agent>"; without either it gets the not-found help. A `!cmd`
+an ephemeral top-level "→ sent to <agent>" every time; without either it gets the not-found help. A `!cmd`
 never falls back. Thread replies already went to the thread's agent; the
 main channel is unchanged.
 
