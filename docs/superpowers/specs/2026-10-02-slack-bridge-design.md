@@ -819,8 +819,8 @@ After `/clear`, `/resume` or `/branch` the mod's re-hello carries
 offline session on the same machine that wasn't inherited before; the new
 session takes the old one's name (when it has none), its queued and
 unacknowledged messages (`/ack` under the old id still counts), and the
-bridge's `SessionMoved` re-points threads, links, homes, `dm_last`,
-conversation links and DM links, and records `moved[old]` so reply records
+bridge's `SessionMoved` re-points threads, links, homes, `dm_last` (and its
+`sent`), conversation links and DM links, and records `moved[old]` so reply records
 under either id answer as one session. Trust: like session ids, `previous`
 is whatever the client sends; a client on the same machine could inherit
 another closed or offline session there. Accepted.
@@ -844,12 +844,14 @@ message was not posted." An image gets `conversation_unreachable`.
 
 **DM routing.** A plain top-level DM routed by `dm_last` gets "→ sent to
 `<name>`" only when `<name>` is not the agent the user's own last DM went
-to (`dm_last.sent`; an agent's DM or a link changes `dm_last` but not
-`sent`). The reply is ephemeral, at the top level of the DM, not in a
-thread. A bare top-level `!cmd` in a DM is never
-sent to `dm_last` (it needs `name: !cmd`); `!commands` still lists.
-Unlinking a DM clears its users' `dm_last` when it pointed at the unlinked
-agent. A session's top-level post in a DM (or any non-main conversation)
+to (the `sent` field of the user's `dm_last` entry, set only by the user's
+own DM deliveries; an agent's DM or a link changes `dm_last` but keeps
+`sent`, and `sent` expires with the entry). The reply is ephemeral, at the
+top level of the DM, not in a thread. Entries saved before `sent` existed
+have none, so each user's first such DM after the upgrade gets the reply.
+A bare top-level `!cmd` in a DM is never sent to `dm_last` (it needs
+`name: !cmd`); `!commands` still lists. Unlinking a DM clears its users'
+`dm_last` (with its `sent`) when it pointed at the unlinked agent. A session's top-level post in a DM (or any non-main conversation)
 carries its header again when the newest top-level agent post there is
 another session's; a home thread's header in a DM counts as the session's
 post.
@@ -989,8 +991,8 @@ says Slack messages may be broadcasts, to dismiss when not relevant.
 
 **DM fallback.** In a DM with the bot, a top-level `name: …` or `@name …`
 whose name is no agent's goes, whole, to `dm_last` (or the DM's link), with
-an ephemeral top-level "→ sent to <agent>" every time; without either it gets the not-found help. A `!cmd`
-never falls back. Thread replies already went to the thread's agent; the
+an ephemeral top-level "→ sent to <agent>" every time; without either it
+gets the not-found help. A `!cmd` never falls back. Thread replies already went to the thread's agent; the
 main channel is unchanged.
 
 **Fix round 1.** Where this disagrees with the paragraphs above, it wins.

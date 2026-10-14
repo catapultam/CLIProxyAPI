@@ -725,11 +725,16 @@ func (st *state) dmHeaded(channel, sid string) bool {
 	return false
 }
 
-// setDMLast makes sid the agent userID's plain DMs go to.
+// setDMLast makes sid the agent userID's plain DMs go to. It keeps Sent
+// while the old entry has not expired.
 func (st *state) setDMLast(userID, sid string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.dmLasts[userID] = dmLastEntry{Session: sid, Sent: st.dmLasts[userID].Sent, At: st.now()}
+	sent := ""
+	if e, ok := st.dmLasts[userID]; ok && e.At.After(st.now().Add(-dmLastTTL)) {
+		sent = e.Sent
+	}
+	st.dmLasts[userID] = dmLastEntry{Session: sid, Sent: sent, At: st.now()}
 	st.dirty = true
 }
 

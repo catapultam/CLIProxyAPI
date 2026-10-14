@@ -198,3 +198,46 @@ func TestStateSeedAllowRemove(t *testing.T) {
 		t.Fatalf("mentionIDs = %v", reloaded.mentionIDs())
 	}
 }
+
+// sent is the agent the user's own last DM went to: an agent's DM keeps it,
+// it moves with a handoff, it is saved, and it expires with its entry.
+func TestDMSent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "slack-state.json")
+	st, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := newTestClock()
+	st.now = clock.now
+
+	st.setDMSent("UALEX", "sA")
+	st.setDMLast("UALEX", "sB")
+	if sid, _ := st.dmLast("UALEX"); sid != "sB" || st.dmSent("UALEX") != "sA" {
+		t.Fatalf("dm_last = %q, sent = %q", sid, st.dmSent("UALEX"))
+	}
+	// A handoff moves sent even when dm_last is another agent.
+	st.moveSession("sA", "sC")
+	if sid, _ := st.dmLast("UALEX"); sid != "sB" || st.dmSent("UALEX") != "sC" {
+		t.Fatalf("after handoff: dm_last = %q, sent = %q", sid, st.dmSent("UALEX"))
+	}
+	if err := st.flush(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.now = clock.now
+	if loaded.dmSent("UALEX") != "sC" {
+		t.Fatalf("loaded sent = %q", loaded.dmSent("UALEX"))
+	}
+	// An expired entry's sent does not come back with a new agent DM.
+	clock.advance(dmLastTTL + time.Hour)
+	if st.dmSent("UALEX") != "" {
+		t.Fatalf("expired sent = %q", st.dmSent("UALEX"))
+	}
+	st.setDMLast("UALEX", "sB")
+	if st.dmSent("UALEX") != "" {
+		t.Fatalf("revived sent = %q", st.dmSent("UALEX"))
+	}
+}

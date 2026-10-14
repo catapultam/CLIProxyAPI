@@ -461,16 +461,8 @@ func (b *Bridge) routeDM(ev messageEvent, user allowedUser, text string, link co
 	if _, delivered := b.deliver(ev, sid, text, user, sessionEnded, true); delivered && (changed || unresolved) {
 		// dm_last is not the agent the user last wrote to, or the text named
 		// another: say which agent got it.
-		b.ephemeral(ev, "→ sent to `"+escape(b.agentLabel(ev, sid))+"`")
+		b.ephemeralInDM(ev.User, "→ sent to `"+escape(b.agentLabel(ev, sid))+"`")
 	}
-}
-
-// ephemeral tells ev's author text at the top level of ev's conversation,
-// where only they see it.
-func (b *Bridge) ephemeral(ev messageEvent, text string) {
-	b.enqueue(func(ctx context.Context) error {
-		return b.api.postEphemeral(ctx, b.cfg.BotToken, ev.Channel, ev.User, text)
-	})
 }
 
 // dmHasFallback reports whether a plain top-level message from userID in
