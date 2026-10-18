@@ -41,18 +41,28 @@ func NormalizeClaudeUserAPIHeaders(header http.Header) {
 	}
 }
 
-// NormalizeClaudeUserAPIBody removes billing attribution and the standalone
-// official-client identity. Application instructions and conversation content
-// remain intact.
+// NormalizeClaudeUserAPIBody removes billing attribution and normalizes the
+// official-client identities used by main sessions and subagents. Application
+// instructions and conversation content remain intact.
 func NormalizeClaudeUserAPIBody(body []byte) []byte {
 	body = util.StripClaudeCodeAttributionSystem(body)
-	const identity = "You are Claude Code, Anthropic's official CLI for Claude."
 	system := gjson.GetBytes(body, "system")
-	if system.Type == gjson.String && strings.TrimSpace(system.String()) == identity {
-		updated, errDelete := sjson.DeleteBytes(body, "system")
-		if errDelete == nil {
+	if system.Type == gjson.String {
+		text := normalizeClaudeUserAPIIdentity(system.String())
+		if text == system.String() {
+			return body
+		}
+		var updated []byte
+		var err error
+		if text == "" {
+			updated, err = sjson.DeleteBytes(body, "system")
+		} else {
+			updated, err = sjson.SetBytes(body, "system", text)
+		}
+		if err == nil {
 			return updated
 		}
+		return body
 	}
 	if !system.IsArray() {
 		return body
@@ -60,11 +70,23 @@ func NormalizeClaudeUserAPIBody(body []byte) []byte {
 	kept := make([]string, 0, len(system.Array()))
 	removed := false
 	for _, block := range system.Array() {
-		if block.Get("type").String() == "text" && strings.TrimSpace(block.Get("text").String()) == identity {
-			removed = true
-			continue
+		raw := block.Raw
+		if block.Get("type").String() == "text" {
+			original := block.Get("text").String()
+			text := normalizeClaudeUserAPIIdentity(original)
+			if text != original {
+				removed = true
+				if text == "" {
+					continue
+				}
+				updated, errSet := sjson.Set(raw, "text", text)
+				if errSet != nil {
+					return body
+				}
+				raw = updated
+			}
 		}
-		kept = append(kept, block.Raw)
+		kept = append(kept, raw)
 	}
 	if !removed {
 		return body
@@ -81,4 +103,21 @@ func NormalizeClaudeUserAPIBody(body []byte) []byte {
 		return updated
 	}
 	return body
+}
+
+func normalizeClaudeUserAPIIdentity(text string) string {
+	trimmed := strings.TrimSpace(text)
+	for _, identity := range []string{
+		"You are Claude Code, Anthropic's official CLI for Claude.",
+		"You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+		"You are an agent for Claude Code, Anthropic's official CLI for Claude.",
+	} {
+		if trimmed == identity {
+			return ""
+		}
+		if strings.HasPrefix(trimmed, identity) {
+			return strings.Replace(text, identity, "You are a coding assistant.", 1)
+		}
+	}
+	return text
 }

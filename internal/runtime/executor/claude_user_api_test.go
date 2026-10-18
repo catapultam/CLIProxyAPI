@@ -31,7 +31,7 @@ func (tr *claudeUserAPITransport) RoundTrip(req *http.Request) (*http.Response, 
 	if errRead != nil {
 		return nil, errRead
 	}
-	if strings.Contains(string(body), "x-anthropic-billing-header:") || strings.Contains(string(body), claudeCodeCLIIdentity) {
+	if strings.Contains(string(body), "x-anthropic-billing-header:") || strings.Contains(string(body), claudeCodeCLIIdentity) || strings.Contains(string(body), "You are a Claude agent,") || strings.Contains(string(body), "You are an agent for Claude Code,") {
 		tr.t.Error("user API request retained Claude Code billing system blocks")
 	}
 	if !strings.Contains(string(body), "Keep this application rule.") || !strings.Contains(string(body), "Hello.") {
@@ -56,7 +56,7 @@ func TestClaudeUserAPINormalizesEveryRequestPath(t *testing.T) {
 			auth := &cliproxyauth.Auth{ID: "user-api", Provider: "claude", Attributes: map[string]string{"api_key": "sk-ant-usr-test", "auth_kind": "apikey", "config_index": "0"}}
 			transport := &claudeUserAPITransport{t: t}
 			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(transport))
-			req := cliproxyexecutor.Request{Model: "claude-sonnet-5-5", Payload: []byte(`{"model":"claude-sonnet-5-5","max_tokens":8,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Keep this application rule."}],"messages":[{"role":"user","content":"Hello."}]}`)}
+			req := cliproxyexecutor.Request{Model: "claude-sonnet-5-5", Payload: []byte(`{"model":"claude-sonnet-5-5","max_tokens":8,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."},{"type":"text","text":"You are an agent for Claude Code, Anthropic's official CLI for Claude. Keep this application rule."}],"messages":[{"role":"user","content":"Hello."}]}`)}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Headers: http.Header{"User-Agent": []string{"claude-cli/2.1.280 (external, cli)"}, "X-App": []string{"cli"}, "Anthropic-Beta": []string{"claude-code-20250219,interleaved-thinking-2025-05-14"}}}
 			var err error
 			switch mode {
