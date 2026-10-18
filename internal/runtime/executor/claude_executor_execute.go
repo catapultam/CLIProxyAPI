@@ -286,6 +286,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 	}
 	bodyForUpstream = stripDefaultKimiClaudeCodeAttribution(auth, url, fp.ProfileClaudeCodeCLI, bodyForUpstream)
+	if isAnthropicUpstreamBase(baseURL) && helps.IsClaudeUserAPIKey(apiKey) && !fp.ProfileClaudeCodeCLI {
+		bodyForUpstream = helps.NormalizeClaudeUserAPIBody(bodyForUpstream)
+	}
 	// Runs on the finished body: payload rules can rewrite model and messages
 	// long after translation, so an earlier check would not describe the request
 	// that is about to be sent.

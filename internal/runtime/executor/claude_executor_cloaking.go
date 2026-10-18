@@ -1357,6 +1357,9 @@ func resolveClaudeWirePolicy(cfg *config.Config, auth *cliproxyauth.Auth, apiKey
 		ConfirmedClaudeCode:  confirmedClaudeCode,
 		Cloak:                (fp.ProfileClaudeCodeCLI || cloakConfigured) && !confirmedClaudeCode,
 	}
+	if helps.IsClaudeUserAPIKey(apiKey) && !fp.ProfileClaudeCodeCLI && strings.EqualFold(cloakMode, "auto") {
+		policy.Cloak = false
+	}
 	if confirmedClaudeCode {
 		// Native Claude Code is always a passthrough client. An operator-level
 		// "always" mode may cloak unknown callers, but must not overwrite a

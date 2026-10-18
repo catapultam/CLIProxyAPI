@@ -211,6 +211,9 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 	if alignCLICountTokensShape {
 		body = util.StripClaudeCodeAttributionSystem(body)
 	}
+	if directAnthropic && helps.IsClaudeUserAPIKey(apiKey) && !fp.ProfileClaudeCodeCLI {
+		body = helps.NormalizeClaudeUserAPIBody(body)
+	}
 	// Runs on the finished body: payload rules can rewrite model and messages
 	// long after translation, so an earlier check would not describe the request
 	// that is about to be sent.
