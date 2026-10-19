@@ -125,7 +125,14 @@ async function arm($: EngineInterface) {
     timer = undefined
     ticker?.cancel()
     ticker = undefined
-    if ((await read($, lastRequest)) === null || g !== generation) return
+    // The request time can change after arming (a step with no response puts the earlier one back
+    // late): count again from the time that stands now.
+    const current = await read($, lastRequest)
+    if (g !== generation || current === null) return
+    if (current !== lastRequestAt) {
+      void arm($)
+      return
+    }
     // The timer can fire late (after a sleep): check the clock again.
     if ((await $.clock.now()) >= lastStart) {
       if (g === generation) $.ui.status('no compact: cache cold or too close to expiry')
@@ -215,6 +222,7 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     if (e.agentId !== undefined) return yield* next(e)
     const before = await read($, lastRequest)
+    const wasCompacted = await read($, isCompacted)
     const now = await $.clock.now()
     await update($, lastRequest, () => now)
     await update($, isCompacted, () => false)
@@ -226,7 +234,10 @@ export const register: Register = (on, options) => {
       answered = result.stopReason !== null
       return result
     } finally {
-      if (!answered) await update($, lastRequest, at => (at === now ? before : at))
+      if (!answered && (await read($, lastRequest)) === now) {
+        await update($, lastRequest, at => (at === now ? before : at))
+        await update($, isCompacted, () => wasCompacted)
+      }
     }
   })
 

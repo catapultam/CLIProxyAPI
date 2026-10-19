@@ -22,6 +22,8 @@ const world = (on: On, tokens: number | null = 100_000, opts: { failStep?: numbe
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* ($, e) {
     const failed = e.index === opts.failStep
+    // A failing step streams something first, so a test can abandon it part way.
+    if (failed) yield { kind: 'text', index: 0, text: '', turnId: e.turnId, step: e.index } as never
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: failed ? null : 'end_turn', usage: null } as never
   })
   on('turn.complete', () => ({ text: '' }))
@@ -364,5 +366,23 @@ test('a setting changed while the compaction runs does not compact again', async
   release()
   await clock.advance(TTL * 2)
   expect(calls).toEqual(['plugin'])
+})
+
+test('an interrupted step whose time is put back after the turn ended still counts from the earlier request', async ($, on) => {
+  const { clock, calls } = world(on, 100_000, { failStep: 1 })
+  await $.turn.start({ turnId: 't1', text: 'hi' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 })) void _
+  await clock.advance(120_000)
+  // The person interrupts step 1 part way: the turn ends (and arms) before the abandoned stream puts
+  // the earlier request time back.
+  const step1 = $.turn.step({ turnId: 't1', index: 1, model: 'm', messageCount: 1 })[Symbol.asyncIterator]()
+  await step1.next()
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: true, reason: 'aborted', usage: USAGE } as never)
+  await step1.return?.(undefined)
+  // Counted from step 0, a compaction is due by 270 s; any later one would hit a cold cache.
+  await clock.advance(TTL - MARGIN - 120_000)
+  const byDeadline = [...calls]
+  await clock.advance(TTL * 3)
+  expect(calls).toEqual(byDeadline)
 })
 
