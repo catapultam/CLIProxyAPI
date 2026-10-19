@@ -7,19 +7,22 @@ const TTL = 300_000
 const MARGIN = 30_000
 
 // The test's hooks stand for the engine: count compactions, report a big context.
-// tokens null: the engine does not know the context size.
-const world = (on: On, tokens: number | null = 100_000) => {
+// tokens null: the engine does not know the context size. failStep: the step with that index gets
+// no response. hold: the compaction waits for it.
+const world = (on: On, tokens: number | null = 100_000, opts: { failStep?: number; hold?: Promise<void> } = {}) => {
   const clock = mock.clock(on)
   const calls: string[] = []
   const status: (string | undefined)[] = []
-  on('session.compact', ($, e) => {
+  on('session.compact', async ($, e) => {
     // The kit leaves `trigger` unset on a plugin's own call.
     calls.push(e.trigger ?? 'plugin')
+    if (opts.hold) await opts.hold
     return { messages: MSG }
   })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* ($, e) {
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } as never
+    const failed = e.index === opts.failStep
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: failed ? null : 'end_turn', usage: null } as never
   })
   on('turn.complete', () => ({ text: '' }))
   on('ui.status', ($, e) => (status.push(e.text), { value: undefined }) as never)
@@ -332,5 +335,34 @@ test('a switch to another model while idle stops the countdown', async ($, on) =
   expect(status.at(-1)).toBe('waiting for next reply')
   await clock.advance(TTL * 2)
   expect(calls).toEqual([])
+})
+
+test('a last request that got no response does not restart the countdown', async ($, on) => {
+  const { clock, calls } = world(on, 100_000, { failStep: 1 })
+  // Step 0 answers at 0 and asks for a tool that runs 2 minutes; step 1 at 120 s gets no response.
+  await $.turn.start({ turnId: 't1', text: 'hi' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 })) void _
+  await clock.advance(120_000)
+  for await (const _ of $.turn.step({ turnId: 't1', index: 1, model: 'm', messageCount: 1 })) void _
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'error', usage: USAGE } as never)
+  // Counted from step 0: compact at 270 s, never at 390 s.
+  await clock.advance(TTL - MARGIN - 120_000)
+  expect(calls).toEqual(['plugin'])
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual(['plugin'])
+})
+
+test('a setting changed while the compaction runs does not compact again', async ($, on) => {
+  let release = () => {}
+  const hold = new Promise<void>(resolve => (release = resolve))
+  const { clock, calls } = world(on, 100_000, { hold })
+  const run = await command($, on)
+  await turn($, 't1')
+  await clock.advance(TTL - MARGIN)
+  expect(calls).toEqual(['plugin'])
+  await run('threshold 50k')
+  release()
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual(['plugin'])
 })
 

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-// The cache TTL starts again at each main-loop model request. When the
+// The cache TTL starts again at each main-loop model request that gets a response. When the
 // session stays idle, compact while the cache is still warm: the compaction
 // reads the cached prefix, and the next prompt re-caches only the summary.
 // After any compaction, wait for a new model request before the timer arms
@@ -93,7 +93,10 @@ async function arm($: EngineInterface) {
   const tokens = context.tokens
   // An unknown size is never compacted, and neither is any context under a minimum below 1 token.
   const isLarge = tokens !== undefined && min >= 1 && tokens >= min
-  const below = tokens === undefined ? 'no compact: size unknown' : `no compact: ${kilo(tokens)} < ${kilo(min)}`
+  const below =
+    tokens === undefined ? 'no compact: size unknown'
+    : min < 1 ? 'no compact: window unknown'
+    : `no compact: ${kilo(tokens)} < ${kilo(min)}`
 
   // A cold cache is never compacted: that would read the whole context uncached and lose
   // detail for nothing. This covers a setting changed after the TTL, and a laptop that slept.
@@ -130,6 +133,9 @@ async function arm($: EngineInterface) {
     }
     if (g !== generation) return
 
+    // Cleared first: a setting change or a reload while it runs must not arm a second one.
+    await update($, lastRequest, () => null)
+    if (g !== generation) return
     $.ui.status('compacting')
     try {
       const done = await $.session.compact()
@@ -204,16 +210,24 @@ export const register: Register = (on, options) => {
     return { text: `cache-compact is ${isEnabled ? 'on' : 'off'}; threshold ${describe(threshold)}.` }
   })
 
-  // Record when the request starts, not when it ends: this is the safe side.
+  // Record when the request starts, not when it ends: this is the safe side. A request that got
+  // no response (failed or interrupted) did not warm the cache: the earlier time is put back.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId === undefined) {
-      const now = await $.clock.now()
-      await update($, lastRequest, () => now)
-      await update($, isCompacted, () => false)
-      // An auto compaction in the turn set the "compacted" status; clear it.
-      $.ui.status(undefined)
+    if (e.agentId !== undefined) return yield* next(e)
+    const before = await read($, lastRequest)
+    const now = await $.clock.now()
+    await update($, lastRequest, () => now)
+    await update($, isCompacted, () => false)
+    // An auto compaction in the turn set the "compacted" status; clear it.
+    $.ui.status(undefined)
+    let answered = false
+    try {
+      const result = yield* next(e)
+      answered = result.stopReason !== null
+      return result
+    } finally {
+      if (!answered) await update($, lastRequest, at => (at === now ? before : at))
     }
-    return yield* next(e)
   })
 
   on('turn.start', ($, e, next) => {
