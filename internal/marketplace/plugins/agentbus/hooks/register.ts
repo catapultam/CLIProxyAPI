@@ -943,8 +943,8 @@ async function working($: EngineInterface, sid: string, ids: string[]) {
   }
 }
 
-// Cancels any pending "still working" timer. A turn ending, however it ends, clears it so a quick
-// answer never shows ⏳; a turn starting replaces it with a fresh one (scheduleWorking).
+// Cancels any pending "still working" timer. A main-loop turn ending, however it ends, clears it so a
+// quick answer never shows ⏳; a main-loop turn starting replaces it with a fresh one (scheduleWorking).
 function cancelWorking() {
   workingTimer?.cancel()
   workingTimer = undefined
@@ -1734,7 +1734,7 @@ export const register: Register = on => {
     return { result: { listing: listed.result.listing + section } }
   })
 
-  // Only the main loop's turns count. A subagent's run raises turn.start too (with agentId), also
+  // Only the main loop's turns count. A woken subagent's run raises turn.start too (with agentId), also
   // while the main loop is idle (a background subagent woken by its own task's notification). Counted,
   // it would set inTurn with no main turn running, and hold every message until the next main turn.
   on('turn.start', async ($, e, next) => {
