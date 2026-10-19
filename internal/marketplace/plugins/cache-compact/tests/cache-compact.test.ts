@@ -386,3 +386,22 @@ test('an interrupted step whose time is put back after the turn ended still coun
   expect(calls).toEqual(byDeadline)
 })
 
+test('after an interrupted step soon after the last answer, the compaction still comes before expiry', async ($, on) => {
+  const { clock, calls } = world(on, 100_000, { failStep: 1 })
+  await $.turn.start({ turnId: 't1', text: 'hi' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 })) void _
+  await clock.advance(10_000)
+  const step1 = $.turn.step({ turnId: 't1', index: 1, model: 'm', messageCount: 1 })[Symbol.asyncIterator]()
+  await step1.next()
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: true, reason: 'aborted', usage: USAGE } as never)
+  await step1.return?.(undefined)
+  // Armed from step 1 (fires at 280 s), then counted again from step 0: 280 s is still 20 s before
+  // step 0's cache expires, so it compacts then, once.
+  await clock.advance(TTL - MARGIN - 1)
+  expect(calls).toEqual([])
+  await clock.advance(1)
+  expect(calls).toEqual(['plugin'])
+  await clock.advance(TTL * 3)
+  expect(calls).toEqual(['plugin'])
+})
+
