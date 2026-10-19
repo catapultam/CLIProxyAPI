@@ -6,19 +6,19 @@
     "ttlSeconds": {
       "type": "number",
       "title": "Cache TTL (seconds)",
-      "description": "Prompt-cache TTL: 300 for 5m, 3600 for 1h.",
+      "description": "Prompt-cache TTL: 300 for 5m, 3600 for 1h. Must be more than 20; otherwise 300.",
       "default": 300
     },
     "marginSeconds": {
       "type": "number",
       "title": "Margin (seconds)",
-      "description": "Compact this many seconds before the TTL ends. Must be less than the TTL; otherwise 30 (or a tenth of the TTL).",
+      "description": "Compact this many seconds before the TTL ends. Must be at least 10 and less than the TTL; otherwise 30 (or half the TTL).",
       "default": 30
     },
     "minTokens": {
       "type": "number",
       "title": "Minimum context (tokens)",
-      "description": "Do not compact when the context is smaller than this. Must be more than 0; otherwise 40000.",
+      "description": "Do not compact when the context is smaller than this. Must be at least 1; otherwise 40000.",
       "default": 40000
     }
   },

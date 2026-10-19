@@ -28,11 +28,16 @@ const world = (on: On, tokens: number | null = 100_000) => {
   return { clock, calls, status }
 }
 
-const turn = async ($: Engine, turnId: string) => {
+// What a turn whose requests counted carries; a turn that died before any did has none.
+const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'm' }
+
+// One main-loop turn: one request at the current time, `runMs` long, then the turn completes.
+const turn = async ($: Engine, turnId: string, clock?: { advance: (ms: number) => Promise<void> }, runMs = 0, extra: object = { reason: 'answer', usage: USAGE }) => {
   await $.turn.start({ turnId, text: 'hi' })
   const stream = $.turn.step({ turnId, index: 0, model: 'm', messageCount: 1 })
   for await (const _ of stream) void _
-  await $.turn.complete({ turnId, answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as never)
+  if (clock && runMs > 0) await clock.advance(runMs)
+  await $.turn.complete({ turnId, answer: '', durationMs: 1, isAborted: false, ...extra } as never)
 }
 
 test('compacts once, just before the TTL ends', async ($, on) => {
@@ -183,7 +188,7 @@ test('an auto compaction in a turn shows until the next request', async ($, on) 
   expect(status.at(-1)).toBe('compacted · waiting for next reply')
   for await (const _ of $.turn.step({ turnId: 't1', index: 1, model: 'm', messageCount: 1 })) void _
   expect(status.at(-1)).toBe(undefined)
-  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as never)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'answer', usage: USAGE } as never)
   expect(status.at(-1)).toBe('compact in 4:30')
 })
 
@@ -204,7 +209,7 @@ test('a subagent turn does not cancel or move the countdown', async ($, on) => {
   await clock.advance(60_000)
   await $.turn.start({ turnId: 's1', text: '', agentId: 'a1' } as never)
   for await (const _ of $.turn.step({ turnId: 's1', index: 0, model: 'm', messageCount: 1, agentId: 'a1' } as never)) void _
-  await $.turn.complete({ turnId: 's1', answer: '', durationMs: 1, isAborted: false, reason: 'answer', agentId: 'a1' } as never)
+  await $.turn.complete({ turnId: 's1', answer: '', durationMs: 1, isAborted: false, reason: 'answer', usage: USAGE, agentId: 'a1' } as never)
   await clock.advance(TTL - MARGIN - 60_000)
   expect(calls).toEqual(['plugin'])
 })
@@ -234,7 +239,7 @@ test('a threshold of 0 is refused', async ($, on) => {
   expect(await run('threshold 0.4')).toMatch(/^Usage:/)
 })
 
-test('options that make no sense fall back to the defaults', { options: { ttlSeconds: 300, marginSeconds: 400, minTokens: 0 } }, async ($, on) => {
+test('options that make no sense fall back to the defaults', { options: { ttlSeconds: 300, marginSeconds: 400, minTokens: 0.4 } }, async ($, on) => {
   const { clock, calls, status } = world(on, 5_000)
   await turn($, 't1')
   // The minimum is 40k again, so 5k is left alone.
@@ -281,6 +286,50 @@ test('turning it on after the cache went cold does not compact', async ($, on) =
   await turn($, 't1')
   await clock.advance(15 * 60_000)
   await run('on')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
+test('a turn that ended on an API error before any request counted starts no countdown', async ($, on) => {
+  const { clock, calls, status } = world(on)
+  await turn($, 't1', clock, 0, { reason: 'error' })
+  expect(status.at(-1)).toBe('waiting for next reply')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
+test('a last request that ran until close to expiry does not compact', async ($, on) => {
+  const { clock, calls, status } = world(on)
+  await turn($, 't1', clock, TTL - 5_000)
+  expect(status.at(-1)).toBe('no compact: too close to expiry · cold in 0:05')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
+test('a lower threshold set seconds before expiry does not compact', async ($, on) => {
+  const { clock, calls } = world(on, 30_000)
+  const run = await command($, on)
+  await turn($, 't1')
+  await clock.advance(TTL - 5_000)
+  await run('threshold 20k')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
+test('a margin under 10 s falls back to the default', { options: { ttlSeconds: 300, marginSeconds: 0, minTokens: 40000 } }, async ($, on) => {
+  const { clock, calls } = world(on)
+  await turn($, 't1')
+  await clock.advance(TTL - MARGIN)
+  expect(calls).toEqual(['plugin'])
+})
+
+test('a switch to another model while idle stops the countdown', async ($, on) => {
+  const { clock, calls, status } = world(on)
+  on('classic.PostModelSwitch', () => ({}) as never)
+  await turn($, 't1')
+  await clock.advance(60_000)
+  await $.classic.PostModelSwitch({ from_model: 'opus', to_model: 'sonnet', requested_model: 'sonnet', source: 'command', context_tokens: 100_000, prompt_cache_warm: true, cache_ttl: '5m' } as never)
+  expect(status.at(-1)).toBe('waiting for next reply')
   await clock.advance(TTL * 2)
   expect(calls).toEqual([])
 })

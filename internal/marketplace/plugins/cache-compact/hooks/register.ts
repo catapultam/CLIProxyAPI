@@ -14,6 +14,9 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 // resumes the countdown. The compacted flag is session state too, so that the
 // status line still says "compacted" after a reload.
 // It does nothing in a non-interactive run.
+// The least time before the cache expires at which a compaction may still start: core runs its
+// hooks and builds the request first, and the request must reach the server while the cache is warm.
+const MIN_LEFT_MS = 10_000
 let ttlMs = 300_000
 let marginMs = 30_000
 let minTokens = 40_000
@@ -94,9 +97,10 @@ async function arm($: EngineInterface) {
 
   // A cold cache is never compacted: that would read the whole context uncached and lose
   // detail for nothing. This covers a setting changed after the TTL, and a laptop that slept.
+  const lastStart = expiresAt - MIN_LEFT_MS
   const show = (now: number) => {
-    if (isLarge && now < expiresAt) $.ui.status(`compact in ${clock(compactAt - now)}`)
-    else if (now < expiresAt) $.ui.status(`${below} · cold in ${clock(expiresAt - now)}`)
+    if (isLarge && now < lastStart) $.ui.status(`compact in ${clock(compactAt - now)}`)
+    else if (now < expiresAt) $.ui.status(`${isLarge ? 'no compact: too close to expiry' : below} · cold in ${clock(expiresAt - now)}`)
     else {
       $.ui.status(isLarge ? 'no compact: cache already cold' : `${below} · cold`)
       ticker?.cancel()
@@ -106,12 +110,13 @@ async function arm($: EngineInterface) {
   const now = await $.clock.now()
   if (g !== generation) return
   show(now)
+  if (now >= expiresAt) return
   ticker = $.clock.every(1000, async () => {
     const at = await $.clock.now()
     if (g === generation) show(at)
   })
 
-  if (!isLarge || now >= expiresAt) return
+  if (!isLarge || now >= lastStart) return
   timer = $.clock.after(Math.max(0, compactAt - now), async () => {
     if (g !== generation) return
     timer = undefined
@@ -119,8 +124,8 @@ async function arm($: EngineInterface) {
     ticker = undefined
     if ((await read($, lastRequest)) === null || g !== generation) return
     // The timer can fire late (after a sleep): check the clock again.
-    if ((await $.clock.now()) >= expiresAt) {
-      if (g === generation) $.ui.status('no compact: cache already cold')
+    if ((await $.clock.now()) >= lastStart) {
+      if (g === generation) $.ui.status('no compact: cache cold or too close to expiry')
       return
     }
     if (g !== generation) return
@@ -138,7 +143,7 @@ async function arm($: EngineInterface) {
       }
     } catch {
       // The compaction failed: a turn started meanwhile (its requests keep the cache warm), the
-      // summarizer request failed, or there was too little to compact. No retry until the next turn.
+      // summarizer request failed, or there was too little to compact. No retry in this countdown.
       if (g === generation) $.ui.status(undefined)
     }
   })
@@ -146,13 +151,14 @@ async function arm($: EngineInterface) {
 
 export const register: Register = (on, options) => {
   // A value that makes no sense falls back to its default: a margin not inside the TTL would
-  // compact right after every turn, and a minimum of 0 would compact any session.
+  // compact right after every turn, one under MIN_LEFT_MS would never compact, and a minimum
+  // under 1 token would compact any session.
   ttlMs = Number(options.ttlSeconds ?? 300) * 1000
   marginMs = Number(options.marginSeconds ?? 30) * 1000
-  if (!(ttlMs > 0)) ttlMs = 300_000
-  if (!(marginMs >= 0 && marginMs < ttlMs)) marginMs = Math.min(30_000, ttlMs / 10)
+  if (!(ttlMs > 2 * MIN_LEFT_MS)) ttlMs = 300_000
+  if (!(marginMs >= MIN_LEFT_MS && marginMs < ttlMs)) marginMs = Math.min(30_000, ttlMs / 2)
   minTokens = Number(options.minTokens ?? 40000)
-  if (!(minTokens > 0)) minTokens = 40_000
+  if (!(minTokens >= 1)) minTokens = 40_000
   threshold = { tokens: minTokens }
   isInteractive = true
 
@@ -227,11 +233,25 @@ export const register: Register = (on, options) => {
     return result
   }).catch(($, e, next) => next(e))
 
+  // A turn with no usage (an interrupt or an API error before any request counted) did not warm
+  // the cache, so the time its request started says nothing: no countdown until the next one.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId === undefined) await arm($)
+    if (e.agentId === undefined) {
+      if (e.usage === undefined) await update($, lastRequest, () => null)
+      await arm($)
+    }
     return result
   })
+
+  // Another model has its own cache, cold for this conversation: no countdown until it answers.
+  on('classic.PostModelSwitch', async ($, e, next) => {
+    if (!e.agent_id && e.from_model !== e.to_model) {
+      await update($, lastRequest, () => null)
+      await arm($)
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // /clear, /resume and the end of the session: the countdown belongs to the conversation that
   // ended, so it stops here and never compacts the next one. A /clear raises no session.start;
