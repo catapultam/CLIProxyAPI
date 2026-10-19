@@ -12,13 +12,13 @@
     "marginSeconds": {
       "type": "number",
       "title": "Margin (seconds)",
-      "description": "Compact this many seconds before the TTL ends.",
+      "description": "Compact this many seconds before the TTL ends. Must be less than the TTL; otherwise 30 (or a tenth of the TTL).",
       "default": 30
     },
     "minTokens": {
       "type": "number",
       "title": "Minimum context (tokens)",
-      "description": "Do not compact when the context is smaller than this.",
+      "description": "Do not compact when the context is smaller than this. Must be more than 0; otherwise 40000.",
       "default": 40000
     }
   },

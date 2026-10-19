@@ -44,7 +44,8 @@ function parseThreshold(text: string): Threshold | undefined {
   const unit = m[2]?.toLowerCase()
   if (n <= 0) return undefined
   if (unit === '%') return n <= 100 ? { percent: n } : undefined
-  return { tokens: Math.round(n * (unit === 'k' ? 1e3 : unit === 'm' ? 1e6 : 1)) }
+  const tokens = Math.round(n * (unit === 'k' ? 1e3 : unit === 'm' ? 1e6 : 1))
+  return tokens >= 1 ? { tokens } : undefined
 }
 
 function describe(t: Threshold) {
@@ -78,7 +79,7 @@ async function arm($: EngineInterface) {
   if (g !== generation) return
   if (!isEnabled || lastRequestAt === null) {
     const text = (await read($, isCompacted)) ? 'compacted · waiting for next reply' : 'waiting for next reply'
-    $.ui.status(isEnabled ? text : undefined)
+    if (g === generation) $.ui.status(isEnabled ? text : undefined)
     return
   }
   const expiresAt = lastRequestAt + ttlMs
@@ -86,16 +87,18 @@ async function arm($: EngineInterface) {
   const { context } = await $.session.usage()
   if (g !== generation) return
   const min = 'percent' in threshold ? (context.window * threshold.percent) / 100 : threshold.tokens
-  const tokens = context.tokens ?? 0
-  // An unknown size is never compacted.
-  const willCompact = context.tokens !== undefined && context.tokens !== null && tokens >= min
-  const below = `no compact: ${kilo(tokens)} < ${kilo(min)}`
+  const tokens = context.tokens
+  // An unknown size is never compacted, and neither is any context under a minimum below 1 token.
+  const isLarge = tokens !== undefined && min >= 1 && tokens >= min
+  const below = tokens === undefined ? 'no compact: size unknown' : `no compact: ${kilo(tokens)} < ${kilo(min)}`
 
+  // A cold cache is never compacted: that would read the whole context uncached and lose
+  // detail for nothing. This covers a setting changed after the TTL, and a laptop that slept.
   const show = (now: number) => {
-    if (willCompact) $.ui.status(`compact in ${clock(compactAt - now)}`)
+    if (isLarge && now < expiresAt) $.ui.status(`compact in ${clock(compactAt - now)}`)
     else if (now < expiresAt) $.ui.status(`${below} · cold in ${clock(expiresAt - now)}`)
     else {
-      $.ui.status(`${below} · cold`)
+      $.ui.status(isLarge ? 'no compact: cache already cold' : `${below} · cold`)
       ticker?.cancel()
       ticker = undefined
     }
@@ -108,17 +111,25 @@ async function arm($: EngineInterface) {
     if (g === generation) show(at)
   })
 
-  if (!willCompact) return
+  if (!isLarge || now >= expiresAt) return
   timer = $.clock.after(Math.max(0, compactAt - now), async () => {
     if (g !== generation) return
     timer = undefined
     ticker?.cancel()
     ticker = undefined
     if ((await read($, lastRequest)) === null || g !== generation) return
+    // The timer can fire late (after a sleep): check the clock again.
+    if ((await $.clock.now()) >= expiresAt) {
+      if (g === generation) $.ui.status('no compact: cache already cold')
+      return
+    }
+    if (g !== generation) return
 
     $.ui.status('compacting')
     try {
       const done = await $.session.compact()
+      // The conversation ended (/clear, /resume) or a turn started meanwhile: nothing to show here.
+      if (g !== generation) return
       if ('skip' in done) {
         $.ui.status(`compaction skipped (${done.skip})`)
       } else {
@@ -128,7 +139,7 @@ async function arm($: EngineInterface) {
     } catch {
       // The compaction failed: a turn started meanwhile (its requests keep the cache warm), the
       // summarizer request failed, or there was too little to compact. No retry until the next turn.
-      $.ui.status(undefined)
+      if (g === generation) $.ui.status(undefined)
     }
   })
 }
@@ -231,5 +242,5 @@ export const register: Register = (on, options) => {
     await update($, isCompacted, () => false)
     $.ui.status(undefined)
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 }

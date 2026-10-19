@@ -219,8 +219,9 @@ test('a non-interactive run is never compacted', async ($, on) => {
 })
 
 test('an unknown context size is never compacted', async ($, on) => {
-  const { clock, calls } = world(on, null)
+  const { clock, calls, status } = world(on, null)
   await turn($, 't1')
+  expect(status.at(-1)).toBe('no compact: size unknown · cold in 5:00')
   await clock.advance(TTL * 2)
   expect(calls).toEqual([])
 })
@@ -230,6 +231,7 @@ test('a threshold of 0 is refused', async ($, on) => {
   const run = await command($, on)
   expect(await run('threshold 0')).toMatch(/^Usage:/)
   expect(await run('threshold 0%')).toMatch(/^Usage:/)
+  expect(await run('threshold 0.4')).toMatch(/^Usage:/)
 })
 
 test('options that make no sense fall back to the defaults', { options: { ttlSeconds: 300, marginSeconds: 400, minTokens: 0 } }, async ($, on) => {
@@ -260,3 +262,26 @@ test('two settings changes at once leave one countdown and compact once', async 
   await clock.advance(TTL * 2)
   expect(calls).toEqual(['plugin'])
 })
+
+test('a lower threshold set after the cache went cold does not compact', async ($, on) => {
+  const { clock, calls, status } = world(on, 30_000)
+  const run = await command($, on)
+  await turn($, 't1')
+  await clock.advance(TTL + 1_000)
+  await run('threshold 20k')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+  expect(status.at(-1)).toBe('no compact: cache already cold')
+})
+
+test('turning it on after the cache went cold does not compact', async ($, on) => {
+  const { clock, calls } = world(on)
+  const run = await command($, on)
+  await run('off')
+  await turn($, 't1')
+  await clock.advance(15 * 60_000)
+  await run('on')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
