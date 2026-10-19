@@ -126,7 +126,7 @@ async function arm($: EngineInterface) {
     ticker?.cancel()
     ticker = undefined
     // The request time can change after arming (a step with no response puts the earlier one back
-    // late): count again from the time that stands now.
+    // late): arm again from the time that stands now (no countdown if it is cleared).
     const current = await read($, lastRequest)
     if (g !== generation) return
     if (current !== lastRequestAt) {
@@ -220,7 +220,8 @@ export const register: Register = (on, options) => {
   // Record when the request starts, not when it ends: this is the safe side. A request that got
   // no response (failed or interrupted) did not warm the cache: the earlier time is put back, if no
   // other write came since. The put-back can come after turn.complete armed from this step's time;
-  // the timer then finds the changed time when it fires and counts again from it.
+  // the timer then finds the changed time when it fires and arms again from it (no countdown if
+  // it is cleared).
   on('turn.step', async function* ($, e, next) {
     if (e.agentId !== undefined) return yield* next(e)
     const before = await read($, lastRequest)

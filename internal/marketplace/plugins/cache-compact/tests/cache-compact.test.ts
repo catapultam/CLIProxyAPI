@@ -405,3 +405,15 @@ test('after an interrupted step soon after the last answer, the compaction still
   expect(calls).toEqual(['plugin'])
 })
 
+test('an interrupted first step leaves no countdown once the timer finds the time cleared', async ($, on) => {
+  const { clock, calls, status } = world(on, 100_000, { failStep: 0 })
+  await $.turn.start({ turnId: 't1', text: 'hi' })
+  const step0 = $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 })[Symbol.asyncIterator]()
+  await step0.next()
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: true, reason: 'aborted', usage: USAGE } as never)
+  await step0.return?.(undefined)
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+  expect(status.at(-1)).toBe('waiting for next reply')
+})
+
