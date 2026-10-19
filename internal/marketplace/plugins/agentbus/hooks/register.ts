@@ -4,7 +4,7 @@ import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
 // recognizable and every other recipient goes to Claude Code untouched.
 export const PREFIX = 'agentbus:'
 // The proxy hands remote commands only to a waiter reporting this version or later.
-export const VERSION = '0.5.0'
+export const VERSION = '0.5.1'
 const RETRY_AFTER_MS = 5000
 // Command output posted to Slack is cut to this many characters.
 const MAX_OUTPUT_CHARS = 3500
@@ -1734,8 +1734,11 @@ export const register: Register = on => {
     return { result: { listing: listed.result.listing + section } }
   })
 
-  // Only the main loop raises turn.start (a subagent's run doesn't).
+  // Only the main loop's turns count. A subagent's run raises turn.start too (with agentId), also
+  // while the main loop is idle (a background subagent woken by its own task's notification). Counted,
+  // it would set inTurn with no main turn running, and hold every message until the next main turn.
   on('turn.start', async ($, e, next) => {
+    if (e.agentId) return next(e)
     inTurn = true
     turnSeq++
     deliveredThisTurn = []

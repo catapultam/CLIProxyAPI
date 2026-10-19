@@ -433,7 +433,7 @@ test('session.end with clear says bye, then the next tick follows the session to
   await clock.advance(1000)
   const hello = calls.find(c => c.url.endsWith('/hello'))
   // The old id goes along, so the bus hands the name, inbox and Slack routing to the new one.
-  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.5.0', previous: DEFAULT_SESSION_ID })
+  expect(hello?.body).toMatchObject({ session: session.id, mod: true, version: '0.5.1', previous: DEFAULT_SESSION_ID })
   const wait = calls.find(c => c.url.includes('/wait?'))
   expect(wait?.url).toContain(`session=${encodeURIComponent(session.id)}`)
 })
@@ -450,11 +450,11 @@ test('both hellos and every wait carry the mod version', async ($, on) => {
 
   const hellos = calls.filter(c => c.url.endsWith('/hello'))
   expect(hellos.length).toBe(2)
-  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.5.0' })
-  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.5.0' })
+  expect(at(hellos, 0).body).toMatchObject({ session: DEFAULT_SESSION_ID, mod: true, version: '0.5.1' })
+  expect(at(hellos, 1).body).toMatchObject({ session: session.id, mod: true, version: '0.5.1' })
   const waits = calls.filter(c => c.url.includes('/wait?'))
   expect(waits.length).toBeGreaterThan(0)
-  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.5.0')
+  for (const w of waits) expect(w.url).toContain('&mod=1&v=0.5.1')
 })
 
 test('without COMPUTERNAME the machine name comes from /etc/hostname', async ($, on) => {
@@ -1257,6 +1257,39 @@ test('a Slack message held behind a running turn that makes no more tool calls r
   await t.complete('t1')
   await clock.settle()
   expect(acks(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
+})
+
+// A background subagent woken by its own task's notification starts a turn (agentId set) while the main
+// loop is idle. That is not a main-loop turn: a message arriving then runs as a prompt at once, not held
+// until the main loop's next turn ends.
+test('a message that arrives while only a subagent turn runs is submitted at once', async ($, on) => {
+  const t = turns($, on)
+  const clock = mock.clock(on)
+  wire($, on, [{ status: 200, text: JSON.stringify({ messages: [SLACK_MSG] }) }])
+  const prompts: string[] = []
+  on('prompt.submit', (_$, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: 'C:/work/comms' })
+  await $.turn.start({ text: 'task notification', turnId: 'sub-turn', agentId: 'agent-7' })
+  await clock.advance(1000)
+  await clock.settle()
+  expect(prompts.length).toBe(1)
+  await t.complete('sub-turn', { agentId: 'agent-7' })
+})
+
+// A subagent's turn starting does not restart the main turn's working timer: /working still fires 15s
+// after the main turn started.
+test('a subagent turn.start does not restart the main turn\'s working timer', async ($, on) => {
+  const t = turns($, on)
+  const { calls, prompts, clock } = await runMessages($, on, [SLACK_MSG], { routes: { '/working': { status: 200, text: '{"working":1}' } } })
+  await t.start(at(prompts, 0), 't1')
+  await clock.advance(10000)
+  await $.turn.start({ text: 'look this up', turnId: 'sub-turn', agentId: 'agent-7' })
+  await clock.advance(WORKING_AFTER_MS - 10000)
+  await clock.settle()
+  expect(workings(calls)).toEqual([{ session: DEFAULT_SESSION_ID, ids: ['m_a1'] }])
 })
 
 test('a turn that ends on an API error leaves the ack for the next completed turn', async ($, on) => {
