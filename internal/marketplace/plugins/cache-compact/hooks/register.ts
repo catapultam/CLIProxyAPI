@@ -13,6 +13,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 // across sessions. The last request time is session state, so that a reload
 // resumes the countdown. The compacted flag is session state too, so that the
 // status line still says "compacted" after a reload.
+// It does nothing in a non-interactive run.
 let ttlMs = 300_000
 let marginMs = 30_000
 let minTokens = 40_000
@@ -22,6 +23,10 @@ type Threshold = { tokens: number } | { percent: number }
 let threshold: Threshold = { tokens: minTokens }
 
 let isEnabled = true
+let isInteractive = true
+// cancel() bumps it, so an arm() that awaits while another starts, or a timer that a later
+// arm() replaced, can tell and stops.
+let generation = 0
 const lastRequest = atom({ plugin: 'cache-compact', key: 'lastRequestAt' } as const, null)
 const isCompacted = atom({ plugin: 'cache-compact', key: 'isCompacted' } as const, false)
 let timer: Timer | undefined
@@ -37,6 +42,7 @@ function parseThreshold(text: string): Threshold | undefined {
   if (!m) return undefined
   const n = Number(m[1])
   const unit = m[2]?.toLowerCase()
+  if (n <= 0) return undefined
   if (unit === '%') return n <= 100 ? { percent: n } : undefined
   return { tokens: Math.round(n * (unit === 'k' ? 1e3 : unit === 'm' ? 1e6 : 1)) }
 }
@@ -50,6 +56,7 @@ function kilo(tokens: number) {
 }
 
 function cancel() {
+  generation++
   timer?.cancel()
   timer = undefined
   ticker?.cancel()
@@ -65,7 +72,10 @@ async function compacted($: EngineInterface) {
 
 async function arm($: EngineInterface) {
   cancel()
+  const g = generation
+  if (!isInteractive) return
   const lastRequestAt = await read($, lastRequest)
+  if (g !== generation) return
   if (!isEnabled || lastRequestAt === null) {
     const text = (await read($, isCompacted)) ? 'compacted · waiting for next reply' : 'waiting for next reply'
     $.ui.status(isEnabled ? text : undefined)
@@ -74,9 +84,11 @@ async function arm($: EngineInterface) {
   const expiresAt = lastRequestAt + ttlMs
   const compactAt = expiresAt - marginMs
   const { context } = await $.session.usage()
+  if (g !== generation) return
   const min = 'percent' in threshold ? (context.window * threshold.percent) / 100 : threshold.tokens
   const tokens = context.tokens ?? 0
-  const willCompact = tokens >= min
+  // An unknown size is never compacted.
+  const willCompact = context.tokens !== undefined && context.tokens !== null && tokens >= min
   const below = `no compact: ${kilo(tokens)} < ${kilo(min)}`
 
   const show = (now: number) => {
@@ -88,15 +100,21 @@ async function arm($: EngineInterface) {
       ticker = undefined
     }
   }
-  show(await $.clock.now())
-  ticker = $.clock.every(1000, async () => show(await $.clock.now()))
+  const now = await $.clock.now()
+  if (g !== generation) return
+  show(now)
+  ticker = $.clock.every(1000, async () => {
+    const at = await $.clock.now()
+    if (g === generation) show(at)
+  })
 
   if (!willCompact) return
-  timer = $.clock.after(Math.max(0, compactAt - (await $.clock.now())), async () => {
+  timer = $.clock.after(Math.max(0, compactAt - now), async () => {
+    if (g !== generation) return
     timer = undefined
     ticker?.cancel()
     ticker = undefined
-    if ((await read($, lastRequest)) === null) return
+    if ((await read($, lastRequest)) === null || g !== generation) return
 
     $.ui.status('compacting')
     try {
@@ -108,19 +126,27 @@ async function arm($: EngineInterface) {
         $.ui.toast('cache-compact: compacted before cache expiry')
       }
     } catch {
-      // A turn started meanwhile; its own requests keep the cache warm.
+      // The compaction failed: a turn started meanwhile (its requests keep the cache warm), the
+      // summarizer request failed, or there was too little to compact. No retry until the next turn.
       $.ui.status(undefined)
     }
   })
 }
 
 export const register: Register = (on, options) => {
+  // A value that makes no sense falls back to its default: a margin not inside the TTL would
+  // compact right after every turn, and a minimum of 0 would compact any session.
   ttlMs = Number(options.ttlSeconds ?? 300) * 1000
   marginMs = Number(options.marginSeconds ?? 30) * 1000
+  if (!(ttlMs > 0)) ttlMs = 300_000
+  if (!(marginMs >= 0 && marginMs < ttlMs)) marginMs = Math.min(30_000, ttlMs / 10)
   minTokens = Number(options.minTokens ?? 40000)
+  if (!(minTokens > 0)) minTokens = 40_000
   threshold = { tokens: minTokens }
+  isInteractive = true
 
   on('session.start', async ($, e, next) => {
+    isInteractive = e.isInteractive !== false
     isEnabled = (await $.store.get('enabled')) !== false
     const saved = await $.store.get('threshold')
     if (typeof saved === 'string') threshold = parseThreshold(saved) ?? threshold
@@ -194,5 +220,16 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (e.agentId === undefined) await arm($)
     return result
+  })
+
+  // /clear, /resume and the end of the session: the countdown belongs to the conversation that
+  // ended, so it stops here and never compacts the next one. A /clear raises no session.start;
+  // the next main turn arms again.
+  on('session.end', async ($, e, next) => {
+    cancel()
+    await update($, lastRequest, () => null)
+    await update($, isCompacted, () => false)
+    $.ui.status(undefined)
+    return next(e)
   })
 }

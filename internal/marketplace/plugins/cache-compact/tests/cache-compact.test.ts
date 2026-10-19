@@ -7,7 +7,8 @@ const TTL = 300_000
 const MARGIN = 30_000
 
 // The test's hooks stand for the engine: count compactions, report a big context.
-const world = (on: On, tokens = 100_000) => {
+// tokens null: the engine does not know the context size.
+const world = (on: On, tokens: number | null = 100_000) => {
   const clock = mock.clock(on)
   const calls: string[] = []
   const status: (string | undefined)[] = []
@@ -23,7 +24,7 @@ const world = (on: On, tokens = 100_000) => {
   on('turn.complete', () => ({ text: '' }))
   on('ui.status', ($, e) => (status.push(e.text), { value: undefined }) as never)
   on('ui.toast', () => ({ value: undefined }) as never)
-  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens, window: 200_000 }, rateLimits: [] } }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: tokens ?? undefined, window: 200_000 }, rateLimits: [] } }))
   return { clock, calls, status }
 }
 
@@ -184,4 +185,78 @@ test('an auto compaction in a turn shows until the next request', async ($, on) 
   expect(status.at(-1)).toBe(undefined)
   await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'answer' } as never)
   expect(status.at(-1)).toBe('compact in 4:30')
+})
+
+test('the end of a conversation (/clear, /resume) stops its countdown', async ($, on) => {
+  const { clock, calls, status } = world(on)
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  await turn($, 't1')
+  await clock.advance(60_000)
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
+  expect(status.at(-1)).toBe(undefined)
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
+test('a subagent turn does not cancel or move the countdown', async ($, on) => {
+  const { clock, calls } = world(on)
+  await turn($, 't1')
+  await clock.advance(60_000)
+  await $.turn.start({ turnId: 's1', text: '', agentId: 'a1' } as never)
+  for await (const _ of $.turn.step({ turnId: 's1', index: 0, model: 'm', messageCount: 1, agentId: 'a1' } as never)) void _
+  await $.turn.complete({ turnId: 's1', answer: '', durationMs: 1, isAborted: false, reason: 'answer', agentId: 'a1' } as never)
+  await clock.advance(TTL - MARGIN - 60_000)
+  expect(calls).toEqual(['plugin'])
+})
+
+test('a non-interactive run is never compacted', async ($, on) => {
+  const { clock, calls } = world(on)
+  on('session.start', ($, e) => e as never)
+  await $.session.start({ cwd: '/tmp', surface: null, isInteractive: false } as never)
+  await turn($, 't1')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
+test('an unknown context size is never compacted', async ($, on) => {
+  const { clock, calls } = world(on, null)
+  await turn($, 't1')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
+test('a threshold of 0 is refused', async ($, on) => {
+  world(on)
+  const run = await command($, on)
+  expect(await run('threshold 0')).toMatch(/^Usage:/)
+  expect(await run('threshold 0%')).toMatch(/^Usage:/)
+})
+
+test('options that make no sense fall back to the defaults', { options: { ttlSeconds: 300, marginSeconds: 400, minTokens: 0 } }, async ($, on) => {
+  const { clock, calls, status } = world(on, 5_000)
+  await turn($, 't1')
+  // The minimum is 40k again, so 5k is left alone.
+  expect(status.at(-1)).toBe('no compact: 5k < 40k · cold in 5:00')
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual([])
+})
+
+test('a margin outside the TTL does not compact right after the turn', { options: { ttlSeconds: 300, marginSeconds: 400, minTokens: 40000 } }, async ($, on) => {
+  const { clock, calls } = world(on)
+  await turn($, 't1')
+  await clock.advance(1_000)
+  expect(calls).toEqual([])
+  await clock.advance(TTL - MARGIN - 1_000)
+  expect(calls).toEqual(['plugin'])
+})
+
+test('two settings changes at once leave one countdown and compact once', async ($, on) => {
+  const { clock, calls } = world(on)
+  const run = await command($, on)
+  await turn($, 't1')
+  await Promise.all([run('on'), run('threshold 50k')])
+  await clock.advance(TTL - MARGIN)
+  expect(calls).toEqual(['plugin'])
+  await clock.advance(TTL * 2)
+  expect(calls).toEqual(['plugin'])
 })
