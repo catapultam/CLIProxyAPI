@@ -1,0 +1,26 @@
+{
+  "name": "cache-compact",
+  "version": "0.1.0",
+  "description": "Compacts an idle session just before its prompt cache expires.",
+  "userConfig": {
+    "ttlSeconds": {
+      "type": "number",
+      "title": "Cache TTL (seconds)",
+      "description": "Prompt-cache TTL: 300 for 5m, 3600 for 1h.",
+      "default": 300
+    },
+    "marginSeconds": {
+      "type": "number",
+      "title": "Margin (seconds)",
+      "description": "Compact this many seconds before the TTL ends.",
+      "default": 30
+    },
+    "minTokens": {
+      "type": "number",
+      "title": "Minimum context (tokens)",
+      "description": "Do not compact when the context is smaller than this.",
+      "default": 40000
+    }
+  },
+  "types": "./types/index.d.ts"
+}
