@@ -118,3 +118,30 @@ func TestRewriteClaudeDDModelInBody(t *testing.T) {
 		})
 	}
 }
+
+func TestClaudeModelsResponseOmitsHiddenModels(t *testing.T) {
+	const clientID = "claude-hidden-models-test"
+	registryRef := registry.GetGlobalRegistry()
+	registryRef.RegisterClient(clientID, "claude", []*registry.ModelInfo{
+		{ID: "claude-hidden-models-test-a", Object: "model", OwnedBy: "test"},
+		{ID: "claude-hidden-models-test-b", Object: "model", OwnedBy: "test"},
+	})
+	t.Cleanup(func() {
+		registryRef.UnregisterClient(clientID)
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	baseHandler := &handlers.BaseAPIHandler{Cfg: &sdkconfig.SDKConfig{
+		ClaudeCode: sdkconfig.ClaudeCodeConfig{HiddenModels: []string{"CLAUDE-hidden-models-test-a"}},
+	}}
+	NewClaudeCodeAPIHandler(baseHandler).ClaudeModels(ctx)
+
+	body := recorder.Body.String()
+	if gjson.Get(body, `data.#(id=="claude-hidden-models-test-a")`).Exists() {
+		t.Fatalf("hidden model still listed: %s", body)
+	}
+	if !gjson.Get(body, `data.#(id=="claude-hidden-models-test-b")`).Exists() {
+		t.Fatalf("visible model missing: %s", body)
+	}
+}

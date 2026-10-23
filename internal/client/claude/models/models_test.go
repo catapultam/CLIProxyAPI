@@ -10,7 +10,7 @@ func TestBuildResponse(t *testing.T) {
 		{"id": "claude-b", "display_name": "Beta"},
 	}
 
-	response := BuildResponse(availableModels, false)
+	response := BuildResponse(availableModels, false, nil)
 	models, ok := response["data"].([]map[string]any)
 	if !ok {
 		t.Fatalf("data type = %T, want []map[string]any", response["data"])
@@ -56,7 +56,7 @@ func TestBuildResponseWithCloakingDisabled(t *testing.T) {
 		{"id": "gpt-4o", "display_name": "GPT-4o"},
 	}
 
-	response := BuildResponse(availableModels, true)
+	response := BuildResponse(availableModels, true, nil)
 	models, ok := response["data"].([]map[string]any)
 	if !ok {
 		t.Fatalf("data type = %T, want []map[string]any", response["data"])
@@ -76,7 +76,7 @@ func TestBuildResponseWithCloakingDisabled(t *testing.T) {
 }
 
 func TestBuildResponseEmpty(t *testing.T) {
-	response := BuildResponse(nil, false)
+	response := BuildResponse(nil, false, nil)
 	models, ok := response["data"].([]map[string]any)
 	if !ok {
 		t.Fatalf("data type = %T, want []map[string]any", response["data"])
@@ -135,4 +135,90 @@ func TestResolveClaudeModelIDPrefix(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildResponseHiddenModels(t *testing.T) {
+	newInput := func() []map[string]any {
+		return []map[string]any{
+			{"id": "claude-opus-5", "display_name": "Opus 5"},
+			{"id": "claude-opus-4-8", "display_name": "Opus 4.8"},
+			{"id": "claude-sonnet-5", "display_name": "Sonnet 5"},
+			{"id": "claude-haiku-5", "display_name": "Haiku 5"},
+			{"id": "gpt-5", "display_name": "GPT 5"},
+		}
+	}
+	ids := func(t *testing.T, response map[string]any) []string {
+		t.Helper()
+		models, ok := response["data"].([]map[string]any)
+		if !ok {
+			t.Fatalf("data type = %T, want []map[string]any", response["data"])
+		}
+		out := make([]string, len(models))
+		for i, model := range models {
+			out[i], _ = model["id"].(string)
+		}
+		return out
+	}
+
+	tests := []struct {
+		name            string
+		hidden          []string
+		disableCloaking bool
+		want            []string
+	}{
+		{"exact", []string{"claude-opus-5"}, true, []string{"claude-opus-4-8", "claude-sonnet-5", "claude-haiku-5", "gpt-5"}},
+		{"case-insensitive and trimmed", []string{"  CLAUDE-Opus-5 ", ""}, true, []string{"claude-opus-4-8", "claude-sonnet-5", "claude-haiku-5", "gpt-5"}},
+		{"prefix wildcard", []string{"claude-opus-*"}, true, []string{"claude-sonnet-5", "claude-haiku-5", "gpt-5"}},
+		{"suffix and substring wildcard", []string{"*-5", "*opus*"}, true, []string{}},
+		{"non-Claude hidden by original ID while cloaking", []string{"gpt-5"}, false, []string{"claude-opus-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-5"}},
+		{"cloaked ID does not match", []string{EnsureClaudeModelIDPrefix("gpt-5")}, false, nil},
+		{"empty list hides nothing", nil, true, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := BuildResponse(newInput(), tt.disableCloaking, tt.hidden)
+			got := ids(t, response)
+			if tt.want == nil {
+				if len(got) != 5 {
+					t.Fatalf("len(data) = %d, want 5 (%v)", len(got), got)
+				}
+				return
+			}
+			want := map[string]bool{}
+			for _, id := range tt.want {
+				want[id] = true
+			}
+			if len(got) != len(want) {
+				t.Fatalf("ids = %v, want %v", got, tt.want)
+			}
+			for _, id := range got {
+				if !want[id] {
+					t.Fatalf("ids = %v, want %v", got, tt.want)
+				}
+			}
+			wantFirst, wantLast := "", ""
+			if len(got) > 0 {
+				wantFirst, wantLast = got[0], got[len(got)-1]
+			}
+			if response["first_id"] != wantFirst || response["last_id"] != wantLast {
+				t.Fatalf("first_id/last_id = %v/%v, want %s/%s", response["first_id"], response["last_id"], wantFirst, wantLast)
+			}
+		})
+	}
+
+	t.Run("first_id and last_id come from filtered list", func(t *testing.T) {
+		response := BuildResponse(newInput(), true, []string{"claude-haiku-5", "gpt-5"})
+		// Sorted by display name: Opus 4.8, Opus 5, Sonnet 5.
+		if response["first_id"] != "claude-opus-4-8" || response["last_id"] != "claude-sonnet-5" {
+			t.Fatalf("first_id/last_id = %v/%v", response["first_id"], response["last_id"])
+		}
+	})
+
+	t.Run("input is not mutated", func(t *testing.T) {
+		input := newInput()
+		BuildResponse(input, false, []string{"claude-opus-5", "gpt-5"})
+		if len(input) != 5 || input[0]["id"] != "claude-opus-5" || input[4]["id"] != "gpt-5" {
+			t.Fatalf("input mutated: %v", input)
+		}
+	})
 }

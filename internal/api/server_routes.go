@@ -862,7 +862,11 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 
 	if isClaude {
 		disableCloaking := s.cfg != nil && s.cfg.ClaudeCode.DisableCloakingModelList
-		s.writeModelListResponse(c, "claude", claudemodels.BuildResponse(formatHomeClaudeModels(entries), disableCloaking))
+		var hiddenModels []string
+		if s.cfg != nil {
+			hiddenModels = s.cfg.ClaudeCode.HiddenModels
+		}
+		s.writeModelListResponse(c, "claude", claudemodels.BuildResponse(formatHomeClaudeModels(entries), disableCloaking, hiddenModels))
 		return
 	}
 

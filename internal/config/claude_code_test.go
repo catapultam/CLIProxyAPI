@@ -63,3 +63,25 @@ func TestParseConfigBytesClaudeModelLevelCooling(t *testing.T) {
 		})
 	}
 }
+
+func TestParseConfigBytesClaudeCodeHiddenModels(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{"legacy claude-code", "claude-code:\n  hidden-models: [claude-opus-5, 'claude-sonnet-*']\n"},
+		{"v8 upstream.claude", "upstream:\n  claude:\n    hidden-models: [claude-opus-5, 'claude-sonnet-*']\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, errParse := ParseConfigBytes([]byte(tt.yaml))
+			if errParse != nil {
+				t.Fatalf("ParseConfigBytes() error = %v", errParse)
+			}
+			got := cfg.ClaudeCode.HiddenModels
+			if len(got) != 2 || got[0] != "claude-opus-5" || got[1] != "claude-sonnet-*" {
+				t.Fatalf("HiddenModels = %v", got)
+			}
+		})
+	}
+}

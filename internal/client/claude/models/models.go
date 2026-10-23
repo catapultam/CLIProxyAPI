@@ -9,13 +9,19 @@ import (
 const claudeDDModelPrefix = "claude-fable-5-dd-"
 
 // BuildResponse builds an Anthropic model response from available models.
-func BuildResponse(availableModels []map[string]any, disableCloaking bool) map[string]any {
-	models := make([]map[string]any, len(availableModels))
-	for i, model := range availableModels {
-		models[i] = cloneModel(model)
-		if id, ok := models[i]["id"].(string); ok && !disableCloaking {
-			models[i]["id"] = EnsureClaudeModelIDPrefix(id)
+// Models whose original ID matches hiddenModels are omitted; matching happens before cloaking.
+func BuildResponse(availableModels []map[string]any, disableCloaking bool, hiddenModels []string) map[string]any {
+	models := make([]map[string]any, 0, len(availableModels))
+	for _, model := range availableModels {
+		id, hasID := model["id"].(string)
+		if hasID && isHidden(id, hiddenModels) {
+			continue
 		}
+		cloned := cloneModel(model)
+		if hasID && !disableCloaking {
+			cloned["id"] = EnsureClaudeModelIDPrefix(id)
+		}
+		models = append(models, cloned)
 	}
 
 	sort.SliceStable(models, func(i, j int) bool {
@@ -97,4 +103,40 @@ func reverseModelID(id string) string {
 		runes[i], runes[j] = runes[j], runes[i]
 	}
 	return string(runes)
+}
+
+func isHidden(id string, patterns []string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	for _, pattern := range patterns {
+		pattern = strings.ToLower(strings.TrimSpace(pattern))
+		if pattern != "" && matchWildcard(pattern, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchWildcard matches value against a pattern where '*' matches any substring.
+func matchWildcard(pattern, value string) bool {
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == value
+	}
+	if !strings.HasPrefix(value, parts[0]) {
+		return false
+	}
+	value = value[len(parts[0]):]
+	last := parts[len(parts)-1]
+	if !strings.HasSuffix(value, last) {
+		return false
+	}
+	value = value[:len(value)-len(last)]
+	for _, segment := range parts[1 : len(parts)-1] {
+		idx := strings.Index(value, segment)
+		if idx < 0 {
+			return false
+		}
+		value = value[idx+len(segment):]
+	}
+	return true
 }

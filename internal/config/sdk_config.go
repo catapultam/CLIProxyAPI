@@ -94,6 +94,10 @@ type CodexClientConfig struct {
 type ClaudeCodeConfig struct {
 	// DisableCloakingModelList disables model ID cloaking in Anthropic model list responses.
 	DisableCloakingModelList bool `yaml:"disable-cloaking-model-list" json:"disable-cloaking-model-list"`
+
+	// HiddenModels lists model IDs (exact or with '*' wildcards, case-insensitive) omitted from
+	// Anthropic model list responses. Hidden models still route normally.
+	HiddenModels []string `yaml:"hidden-models,omitempty" json:"hidden-models,omitempty"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

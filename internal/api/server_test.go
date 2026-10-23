@@ -2188,6 +2188,46 @@ func TestClaudeModelListCloakingConfigHotReload(t *testing.T) {
 	assertModelID(modelID)
 }
 
+func TestClaudeModelListHiddenModelsOnlyAffectsAnthropicListing(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	clientID := "test-claude-model-list-hidden"
+	modelRegistry.RegisterClient(clientID, "claude", []*registry.ModelInfo{
+		{ID: "claude-hidden-list-a", Object: "model", OwnedBy: "test"},
+		{ID: "claude-hidden-list-b", Object: "model", OwnedBy: "test"},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(clientID)
+	})
+
+	server := newTestServer(t)
+	updatedCfg := *server.cfg
+	updatedCfg.SDKConfig = server.cfg.SDKConfig
+	updatedCfg.ClaudeCode.HiddenModels = []string{"claude-hidden-list-a"}
+	server.UpdateClients(&updatedCfg)
+
+	list := func(anthropic bool) string {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		if anthropic {
+			req.Header.Set("Anthropic-Version", "2023-06-01")
+		}
+		recorder := httptest.NewRecorder()
+		server.engine.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+		}
+		return recorder.Body.String()
+	}
+
+	anthropicBody := list(true)
+	if strings.Contains(anthropicBody, "claude-hidden-list-a") || !strings.Contains(anthropicBody, "claude-hidden-list-b") {
+		t.Fatalf("anthropic listing wrong: %s", anthropicBody)
+	}
+	if body := list(false); !strings.Contains(body, "claude-hidden-list-a") {
+		t.Fatalf("OpenAI listing must keep hidden model: %s", body)
+	}
+}
+
 func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 	modelRegistry := registry.GetGlobalRegistry()
 	clientID := "test-client-version-catalog"
