@@ -398,6 +398,13 @@ upstream:
     # When true, return original model IDs in Anthropic model list responses instead of cloaked IDs.
     disable-cloaking-model-list: false
 
+    # Model IDs to omit from Anthropic model list responses (what Claude Code's /model picker reads).
+    # Matches the original model ID (before cloaking); case-insensitive; '*' is a wildcard.
+    # Hidden models still route and serve normally; only the listing changes.
+    # hidden-models:
+    #   - claude-opus-5
+    #   - claude-sonnet-*
+
     # Anthropic-Beta is assembled per request rather than sent as a fixed list, matching
     # Claude Code: context-1m sits right after claude-code, mid-conversation-system
     # is added only for models that accept a role=system turn, advanced-tool-use only when
