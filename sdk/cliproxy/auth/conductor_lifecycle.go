@@ -259,20 +259,34 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		auth.CredentialVersion = existingVersion
 	}
 	cooldownStateChanged := false
+	now := time.Now()
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
 		if credChanged || mode == updateModeRefresh {
 			auth.RejectedAccessToken = ""
-			if hasUnauthorizedAuthFailure(existing) || (auth.LastError != nil && isUnauthorizedError(auth.LastError)) {
+			auth.RefreshFailures = 0
+			if credChanged && mode != updateModeRefresh && auth.NextRefreshAfter.Equal(existing.NextRefreshAfter) {
+				auth.NextRefreshAfter = time.Time{}
+			}
+			isAuthOrGrantFailure := hasUnauthorizedAuthFailure(existing) ||
+				(auth.LastError != nil && (isUnauthorizedError(auth.LastError) || isInvalidGrantResultError(auth.LastError)))
+			if !auth.Quota.NextRecoverAt.After(now) &&
+				(isAuthOrGrantFailure || (auth.Unavailable && !auth.NextRetryAfter.After(now))) {
 				auth.Unavailable = false
+				auth.NextRetryAfter = time.Time{}
+				auth.cooldownRecordedSeq = 0
 				auth.LastError = nil
 				auth.StatusMessage = ""
 				auth.Status = StatusActive
 				cooldownStateChanged = true
+			} else if isAuthOrGrantFailure && auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now) {
+				auth.LastError = nil
+				auth.StatusMessage = auth.Quota.Reason
+				cooldownStateChanged = true
 			}
-			resumed := clearUnauthorizedModelStates(auth, time.Now())
+			resumed := clearUnauthorizedModelStates(auth, now)
 			if len(resumed) > 0 {
 				cooldownStateChanged = true
 			}
@@ -288,7 +302,6 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			}
 		}
 	}
-	now := time.Now()
 	auth.UpdatedAt = now
 	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
