@@ -10,7 +10,7 @@ Add the proxy's homelab marketplace if it is not already registered, then instal
 claude plugin install gateway-models@homelab
 ```
 
-In Claude Code, run `/gateway-models-setup` once. It synchronizes the settings and installs a small pre-launch integration in your shell profile. Start a new shell after installation. Thereafter, use `claude` normally: each launch fetches the panel's latest model configuration before Claude Code reads its settings. The Windows `claude2` launcher is supported through `CLAUDE_CONFIG_DIR`.
+In Claude Code, run `/gateway-models-setup` once. It synchronizes the settings and installs a small pre-launch integration in your shell profile. Start a new shell after installation. Thereafter, use `claude` normally: each launch fetches the panel's latest model configuration before Claude Code reads its settings. The Windows `claude2` launcher is supported through `CLAUDE_CONFIG_DIR`. Setup keeps a durable copy of the synchronizer outside the versioned plugin cache. Rerun `/gateway-models-setup` after updating the plugin to refresh that copy.
 
 This integration needs Node.js. It uses the `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` already configured on the client and requires no management key. It never sends an inference or availability request. No credentials are stored in its cache or printed in diagnostics.
 

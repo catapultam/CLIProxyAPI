@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import {
   parseSnapshot, mergeSettings, sync, install, upsertBlock, effectiveCredentials, normalizeBase,
   parseSettingsText, SyncError, STATE_FILE, LOCK_FILE, BLOCK_START, BLOCK_END,
+  generatePowerShellLauncher, generatePosixLauncher,
 } from '../hooks/sync.mjs'
 
 const SCRIPT = fileURLToPath(new URL('../hooks/sync.mjs', import.meta.url))
@@ -115,6 +116,18 @@ test('credentials: process env wins over settings.env', () => {
   assert.equal(normalizeBase('https://u:p@host'), undefined)
   assert.equal(normalizeBase('ftp://host'), undefined)
   assert.equal(normalizeBase('https://Host:443/x/?q=1#f'), 'https://host/x')
+})
+
+test('partial process overrides never borrow credentials from the settings file', async () => {
+  const settings = baseSettings()
+  assert.deepEqual(effectiveCredentials({ ANTHROPIC_BASE_URL: 'https://other.example' }, settings), { base: 'https://other.example', token: undefined })
+  assert.deepEqual(effectiveCredentials({ ANTHROPIC_AUTH_TOKEN: 'different-test' }, settings), { base: undefined, token: 'different-test' })
+  const dir = tmp()
+  write(dir, settings)
+  let calls = 0
+  const result = await sync({ configDir: dir, env: { ANTHROPIC_BASE_URL: 'https://other.example' }, fetch: async () => { calls++; throw new Error('must not call') } })
+  assert.equal(result.reason, 'no-credentials')
+  assert.equal(calls, 0)
 })
 
 test('sync writes rows, preserves BOM and CRLF, and does not churn', async () => {
@@ -342,15 +355,20 @@ test('install generates launchers and one idempotent profile block with a backup
   const dir = tmp()
   const profile = path.join(tmp(), 'profile.ps1')
   fs.writeFileSync(profile, 'Set-Alias ll ls\r\n')
-  const options = { configDir: dir, scriptPath: 'C:/plug ins/it\'s/sync.mjs', nodePath: 'C:/node/node.exe', profilePath: profile, profileKind: 'ps', platform: 'win32' }
+  const source = path.join(tmp(), "plug in's sync.mjs")
+  fs.writeFileSync(source, '// fixture v1\n')
+  const options = { configDir: dir, scriptPath: source, nodePath: 'C:/node/node.exe', profilePath: profile, profileKind: 'ps', platform: 'win32' }
   const first = install(options)
   assert.equal(first.profiles[0].changed, true)
   assert.equal(fs.readFileSync(`${profile}.gateway-models.bak`, 'utf8'), 'Set-Alias ll ls\r\n')
   const ps1 = fs.readFileSync(path.join(dir, 'gateway-models-launcher.ps1'), 'utf8')
   const sh = fs.readFileSync(path.join(dir, 'gateway-models-launcher.sh'), 'utf8')
   assert.ok(ps1.includes('Get-Command claude.exe -CommandType Application'))
-  assert.ok(ps1.includes("'C:/plug ins/it''s/sync.mjs'") && ps1.includes('--quiet') && ps1.includes('ExpectingInput'))
-  assert.ok(sh.includes('command claude "$@"') && sh.includes("'C:/plug ins/it'\\''s/sync.mjs'") && sh.includes('--quiet'))
+  assert.ok(ps1.includes('gateway-models-sync.mjs') && ps1.includes('--quiet') && ps1.includes('ExpectingInput'))
+  assert.ok(sh.includes('command claude "$@"') && sh.includes('gateway-models-sync.mjs') && sh.includes('--quiet'))
+  assert.equal(fs.readFileSync(path.join(dir, 'gateway-models-sync.mjs'), 'utf8'), '// fixture v1\n')
+  assert.ok(generatePowerShellLauncher("C:/plug ins/it's/sync.mjs").includes("'C:/plug ins/it''s/sync.mjs'"))
+  assert.ok(generatePosixLauncher("C:/plug ins/it's/sync.mjs").includes("'C:/plug ins/it'\\''s/sync.mjs'"))
   const content = fs.readFileSync(profile, 'utf8')
   assert.ok(content.startsWith('Set-Alias ll ls\r\n'))
   assert.equal(content.split(BLOCK_START).length - 1, 1)
@@ -360,21 +378,26 @@ test('install generates launchers and one idempotent profile block with a backup
   assert.equal(second.profiles[0].changed, false)
   assert.equal(fs.readFileSync(profile, 'utf8'), content)
 
-  const upgraded = install({ ...options, scriptPath: 'C:/plugins/v2/sync.mjs' })
-  assert.equal(upgraded.profiles[0].changed, false, 'block points at the launcher, which is rewritten instead')
-  assert.ok(fs.readFileSync(path.join(dir, 'gateway-models-launcher.ps1'), 'utf8').includes('C:/plugins/v2/sync.mjs'))
+  const upgradedSource = path.join(tmp(), 'sync-v2.mjs')
+  fs.writeFileSync(upgradedSource, '// fixture v2\n')
+  const upgraded = install({ ...options, scriptPath: upgradedSource })
+  assert.equal(upgraded.profiles[0].changed, false, 'profile still points at the same launcher')
+  assert.equal(fs.readFileSync(path.join(dir, 'gateway-models-sync.mjs'), 'utf8'), '// fixture v2\n')
+  fs.unlinkSync(source)
+  fs.unlinkSync(upgradedSource)
+  assert.ok(fs.existsSync(path.join(dir, 'gateway-models-sync.mjs')), 'plugin cache cleanup cannot break the launcher')
 })
 
 test('install picks the rc file from SHELL on POSIX and skips unknown shells', () => {
   const home = tmp()
   const dir = tmp()
-  const result = install({ configDir: dir, homedir: home, platform: 'linux', env: { SHELL: '/bin/zsh' }, scriptPath: '/p/sync.mjs', nodePath: '/usr/bin/node' })
+  const result = install({ configDir: dir, homedir: home, platform: 'linux', env: { SHELL: '/bin/zsh' }, scriptPath: SCRIPT, nodePath: '/usr/bin/node' })
   assert.equal(result.profiles[0].file, path.join(home, '.zshrc'))
   assert.ok(fs.readFileSync(path.join(home, '.zshrc'), 'utf8').includes('gateway-models-launcher.sh'))
   assert.equal(fs.existsSync(path.join(home, '.zshrc.gateway-models.bak')), false, 'no backup for a new file')
-  const bash = install({ configDir: dir, homedir: home, platform: 'linux', env: { SHELL: '/bin/bash' }, scriptPath: '/p/sync.mjs' })
+  const bash = install({ configDir: dir, homedir: home, platform: 'linux', env: { SHELL: '/bin/bash' }, scriptPath: SCRIPT })
   assert.equal(bash.profiles[0].file, path.join(home, '.bashrc'))
-  const fish = install({ configDir: dir, homedir: home, platform: 'linux', env: { SHELL: '/usr/bin/fish' }, scriptPath: '/p/sync.mjs' })
+  const fish = install({ configDir: dir, homedir: home, platform: 'linux', env: { SHELL: '/usr/bin/fish' }, scriptPath: SCRIPT })
   assert.equal(fish.profileSkipped, true)
 })
 

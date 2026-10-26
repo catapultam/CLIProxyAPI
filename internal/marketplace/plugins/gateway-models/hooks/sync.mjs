@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Synchronizes gateway model picker rows and per-model settings from the
 // gateway's /v1/claude-code/settings endpoint into the user's settings.json
-// before Claude Code starts. No dependencies; Node 24+.
+// before Claude Code starts. No dependencies; Node 22+.
 //
 //   node sync.mjs [--config-dir path] [--quiet] [--install]
 //
@@ -210,14 +210,13 @@ export function resolveConfigDir(argvDir, env = process.env, home = os.homedir()
 // runs before Claude Code applies settings.env.
 export function effectiveCredentials(env, settings) {
   const fromSettings = record(settings.env) ? settings.env : {}
-  const pick = (name) => {
-    for (const source of [env, fromSettings]) {
-      const value = source[name]
-      if (typeof value === 'string' && value.trim() !== '') return value.trim()
-    }
-    return undefined
-  }
-  return { base: pick('ANTHROPIC_BASE_URL'), token: pick('ANTHROPIC_AUTH_TOKEN') }
+  const text = (value) => typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+  const envBase = text(env.ANTHROPIC_BASE_URL)
+  const envToken = text(env.ANTHROPIC_AUTH_TOKEN)
+  // Never send a settings-file credential to an unrelated process-env endpoint.
+  // A partial override is intentionally incomplete and causes sync to skip.
+  if (envBase || envToken) return { base: envBase, token: envToken }
+  return { base: text(fromSettings.ANTHROPIC_BASE_URL), token: text(fromSettings.ANTHROPIC_AUTH_TOKEN) }
 }
 
 // Cache key and request origin: scheme, host, port and path, no credentials,
@@ -495,9 +494,16 @@ export function install(options = {}) {
   const home = options.homedir ?? os.homedir()
   const platform = options.platform ?? process.platform
   const configDir = resolveConfigDir(options.configDir, env, home)
-  const scriptPath = options.scriptPath ?? fileURLToPath(import.meta.url)
+  const sourcePath = options.scriptPath ?? fileURLToPath(import.meta.url)
   const nodePath = options.nodePath ?? process.execPath
   fs.mkdirSync(configDir, { recursive: true })
+  // Installed plugin caches are versioned and can be cleaned up. Launch from
+  // a durable client-owned copy, refreshed whenever setup runs after an update.
+  const scriptPath = path.join(configDir, 'gateway-models-sync.mjs')
+  const source = fs.readFileSync(sourcePath)
+  let current
+  try { current = fs.readFileSync(scriptPath) } catch { /* not installed yet */ }
+  if (!current?.equals(source)) atomicWrite(scriptPath, source, 0o644)
 
   const ps1 = path.join(configDir, 'gateway-models-launcher.ps1')
   const sh = path.join(configDir, 'gateway-models-launcher.sh')
