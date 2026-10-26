@@ -1614,9 +1614,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		nsModel = canonicalModelKey(raw)
 	}
 
-	if res.Error != nil && shouldSkipCredentialCooldown(res.Error) {
-		// Request-scoped or caller-attributed failures are not evidence that the
-		// selected credential is unhealthy, so preserve both explicit and LCP bindings.
+	if res.Error != nil && !isUsageRestrictionError(res.Error) && shouldSkipCredentialCooldown(res.Error) {
+		// Request-scoped or caller-attributed failures preserve explicit and LCP
+		// bindings, but known account restrictions must release them even if cooling is disabled.
 		return
 	}
 

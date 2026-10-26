@@ -1481,9 +1481,12 @@ func resultErrorFromError(err error) *Error {
 	if resultErr.HTTPStatus == 0 {
 		resultErr.HTTPStatus = statusCodeFromError(err)
 	}
+	if isUsageRestrictionError(err) {
+		if body := billingErrorBody(err); body != "" {
+			resultErr.Message = body
+		}
+	}
 	switch {
-	case isBillingError(err):
-		resultErr.Message = billingErrorBody(err)
 	case isExplicitModelNotFoundError(err, ""):
 		if resultErr.Code == "" || resultErr.Code == requestScopedErrorCode {
 			resultErr.Code = "model_not_found"
@@ -1935,7 +1938,7 @@ func isResponsesCompactRequestFaultError(opts cliproxyexecutor.Options, err erro
 	if !isResponsesCompactRequest(opts) || err == nil {
 		return false
 	}
-	if isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) {
+	if isUsageRestrictionError(err) || isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) {
 		return false
 	}
 	status := statusCodeFromError(err)
@@ -1963,10 +1966,10 @@ func isResponsesCompactAvailabilityNeutralError(opts cliproxyexecutor.Options, e
 	if resultErr != nil && resultErr.Code == ErrorCodeForceCooldown {
 		return false
 	}
-	if isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) {
+	if isUsageRestrictionError(err) || isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) {
 		return false
 	}
-	if resultErr != nil && (isCloudflareChallengeResultError(resultErr) || isInvalidGrantResultError(resultErr)) {
+	if resultErr != nil && (isUsageRestrictionError(resultErr) || isCloudflareChallengeResultError(resultErr) || isInvalidGrantResultError(resultErr)) {
 		return false
 	}
 	status := statusCodeFromError(err)
@@ -2187,7 +2190,9 @@ func isRequestInvalidError(err error) bool {
 	if isModelSupportError(err) {
 		return false
 	}
-	if isBillingError(err) {
+	// Fast-mode credit eligibility only releases affinity; it remains a request
+	// fault for retry/cooling. Account quota and billing restrictions do not.
+	if usageRestrictionStatusCode(err) != 0 {
 		return false
 	}
 	status := statusCodeFromError(err)
