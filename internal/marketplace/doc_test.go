@@ -41,7 +41,7 @@ func TestBuildDocShape(t *testing.T) {
 	if doc.Name != "homelab" || doc.Owner.Name != "catapultam" {
 		t.Fatalf("doc = %+v", doc)
 	}
-	if len(doc.Plugins) != 3 || doc.Plugins[1].Name != "cache-compact" || doc.Plugins[2].Name != "denial-prompt" {
+	if len(doc.Plugins) != 4 || doc.Plugins[1].Name != "cache-compact" || doc.Plugins[2].Name != "denial-prompt" || doc.Plugins[3].Name != "gateway-models" {
 		t.Fatalf("plugins = %+v", doc.Plugins)
 	}
 	p := doc.Plugins[0]

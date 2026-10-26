@@ -409,6 +409,24 @@ upstream:
     #   - claude-opus-5
     #   - claude-sonnet-*
 
+    # Non-Claude upstream models that Claude Code clients present as Claude models. Served
+    # sanitized at GET /v1/claude-code/settings (client API key required) so each machine
+    # does not need hand-edited Claude Code settings. At most 200 rows.
+    #   id: original provider model ID; must not start with "claude-"; letters, digits and . _ : / - only
+    #   label: optional display name
+    #   behaves-as: required known Claude model ID whose client behavior is borrowed
+    #   auto-compact-window: optional, 100000..1000000; 0 or omitted uses the client default
+    #   effort-level: optional, low, medium, high or xhigh; empty inherits the client setting
+    #   hide-from-discovery: default true; hides the original ID from Anthropic model lists
+    #     in addition to hidden-models. Hidden models still route normally.
+    # gateway-models:
+    #   - id: gpt-6.1-sol
+    #     label: GPT 6.1 Sol
+    #     behaves-as: claude-fable-5-1
+    #     auto-compact-window: 500000
+    #     effort-level: xhigh
+    #     hide-from-discovery: true
+
     # Anthropic-Beta is assembled per request rather than sent as a fixed list, matching
     # Claude Code: context-1m sits right after claude-code, mid-conversation-system
     # is added only for models that accept a role=system turn, advanced-tool-use only when

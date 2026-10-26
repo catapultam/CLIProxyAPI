@@ -1,0 +1,6 @@
+{
+  "name": "gateway-models",
+  "version": "0.1.0",
+  "description": "Sync gateway model picker, behavior, effort and compact settings from CLIProxyAPI Management Center before launch",
+  "author": { "name": "catapultam" }
+}

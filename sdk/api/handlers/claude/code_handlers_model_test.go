@@ -150,3 +150,35 @@ func TestClaudeModelsResponseOmitsHiddenModels(t *testing.T) {
 		t.Fatalf("visible model missing: %s", body)
 	}
 }
+
+func TestClaudeModelsResponseOmitsGatewayModelsUnlessShown(t *testing.T) {
+	const clientID = "claude-gateway-hidden-models-test"
+	registryRef := registry.GetGlobalRegistry()
+	registryRef.RegisterClient(clientID, "claude", []*registry.ModelInfo{
+		{ID: "gwsdk-default", Object: "model", OwnedBy: "test"},
+		{ID: "gwsdk-shown", Object: "model", OwnedBy: "test"},
+		{ID: "gwsdk-plain", Object: "model", OwnedBy: "test"},
+	})
+	t.Cleanup(func() {
+		registryRef.UnregisterClient(clientID)
+	})
+
+	shown := false
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	baseHandler := &handlers.BaseAPIHandler{Cfg: &sdkconfig.SDKConfig{
+		ClaudeCode: sdkconfig.ClaudeCodeConfig{GatewayModels: []sdkconfig.ClaudeGatewayModel{
+			{ID: "gwsdk-default", BehavesAs: "claude-opus-5"},
+			{ID: "gwsdk-shown", BehavesAs: "claude-opus-5", HideFromDiscovery: &shown},
+		}},
+	}}
+	NewClaudeCodeAPIHandler(baseHandler).ClaudeModels(ctx)
+
+	body := recorder.Body.String()
+	if gjson.Get(body, `data.#(id=="claude-gw-gwsdk-default")`).Exists() {
+		t.Fatalf("default-hidden gateway model still listed: %s", body)
+	}
+	if !gjson.Get(body, `data.#(id=="claude-gw-gwsdk-shown")`).Exists() || !gjson.Get(body, `data.#(id=="claude-gw-gwsdk-plain")`).Exists() {
+		t.Fatalf("visible models missing: %s", body)
+	}
+}

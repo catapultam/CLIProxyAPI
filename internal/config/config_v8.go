@@ -41,6 +41,7 @@ var v8SharedPaths = []configPath{
 	{"oauth.providers.claude.model-level-cooling", "upstream.claude.model-level-cooling"},
 	{"oauth.providers.claude.claude-code.disable-cloaking-model-list", "upstream.claude.disable-cloaking-model-list"},
 	{"oauth.providers.claude.claude-code.hidden-models", "upstream.claude.hidden-models"},
+	{"oauth.providers.claude.claude-code.gateway-models", "upstream.claude.gateway-models"},
 	{"oauth.providers.claude.disable-claude-cloak-mode", "upstream.claude.disable-claude-cloak-mode"},
 	{"oauth.providers.claude.header-defaults.user-agent", "upstream.claude.header-defaults.user-agent"},
 	{"oauth.providers.claude.header-defaults.package-version", "upstream.claude.header-defaults.package-version"},
@@ -898,5 +899,8 @@ func ValidateV8Config(data []byte) error {
 	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
 	decoder.KnownFields(true)
 	var cfg legacyConfig
-	return decoder.Decode(&cfg)
+	if err = decoder.Decode(&cfg); err != nil {
+		return err
+	}
+	return cfg.ClaudeCode.ValidateGatewayModels()
 }

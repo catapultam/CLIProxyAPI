@@ -74,6 +74,7 @@ func (s *Server) setupRoutes() {
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.GET("/usage", s.pooledUsageHandler)
 		v1.GET("/auto-mode", s.autoModeHandler)
+		v1.GET("/claude-code/settings", s.claudeCodeSettingsHandler)
 		s.agentbus.Register(v1.Group("/agentbus"))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
@@ -864,7 +865,7 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		disableCloaking := s.cfg != nil && s.cfg.ClaudeCode.DisableCloakingModelList
 		var hiddenModels []string
 		if s.cfg != nil {
-			hiddenModels = s.cfg.ClaudeCode.HiddenModels
+			hiddenModels = s.cfg.ClaudeCode.EffectiveHiddenModels()
 		}
 		s.writeModelListResponse(c, "claude", claudemodels.BuildResponse(formatHomeClaudeModels(entries), disableCloaking, hiddenModels))
 		return

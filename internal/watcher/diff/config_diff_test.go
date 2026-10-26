@@ -467,6 +467,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 			ClaudeCode: sdkconfig.ClaudeCodeConfig{
 				DisableCloakingModelList: true,
 				HiddenModels:             []string{"claude-opus-5"},
+				GatewayModels:            []sdkconfig.ClaudeGatewayModel{{ID: "gpt-6.1-sol", BehavesAs: "claude-fable-5-1"}},
 			},
 		},
 	}
@@ -481,6 +482,7 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "disable-image-generation: false -> true")
 	expectContains(t, details, "claude-code.disable-cloaking-model-list: false -> true")
 	expectContains(t, details, "claude-code.hidden-models: [] -> [claude-opus-5]")
+	expectContains(t, details, "claude-code.gateway-models: 0 -> 1 rows")
 	expectContains(t, details, "request-log: false -> true")
 	expectContains(t, details, "request-retry: 1 -> 2")
 	expectContains(t, details, "max-retry-credentials: 1 -> 3")

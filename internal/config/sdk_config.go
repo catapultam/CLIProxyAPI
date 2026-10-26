@@ -98,6 +98,10 @@ type ClaudeCodeConfig struct {
 	// HiddenModels lists model IDs (exact or with '*' wildcards, case-insensitive) omitted from
 	// Anthropic model list responses. Hidden models still route normally.
 	HiddenModels []string `yaml:"hidden-models,omitempty" json:"hidden-models,omitempty"`
+
+	// GatewayModels lists non-Claude upstream models that Claude Code clients present as
+	// Claude models. See ClaudeGatewayModel and the /v1/claude-code/settings endpoint.
+	GatewayModels []ClaudeGatewayModel `yaml:"gateway-models,omitempty" json:"gateway-models,omitempty"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

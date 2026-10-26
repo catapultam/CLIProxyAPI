@@ -33,7 +33,7 @@ func TestPluginsMarketplaceJSONNeedsNoAuth(t *testing.T) {
 	if doc.Name != "homelab" || doc.Owner.Name != "catapultam" {
 		t.Fatalf("doc = %+v", doc)
 	}
-	if len(doc.Plugins) != 3 || doc.Plugins[0].Name != "agentbus" || doc.Plugins[1].Name != "cache-compact" || doc.Plugins[2].Name != "denial-prompt" {
+	if len(doc.Plugins) != 4 || doc.Plugins[0].Name != "agentbus" || doc.Plugins[1].Name != "cache-compact" || doc.Plugins[2].Name != "denial-prompt" || doc.Plugins[3].Name != "gateway-models" {
 		t.Fatalf("plugins = %+v", doc.Plugins)
 	}
 	wantURL := "https://cakebox:8317/plugins/agentbus-0.5.1.zip"
@@ -47,6 +47,10 @@ func TestPluginsMarketplaceJSONNeedsNoAuth(t *testing.T) {
 	wantURL = "https://cakebox:8317/plugins/denial-prompt-0.2.0.zip"
 	if doc.Plugins[2].Source.URL != wantURL {
 		t.Fatalf("url = %q, want %q", doc.Plugins[2].Source.URL, wantURL)
+	}
+	wantURL = "https://cakebox:8317/plugins/gateway-models-0.1.0.zip"
+	if doc.Plugins[3].Source.URL != wantURL {
+		t.Fatalf("url = %q, want %q", doc.Plugins[3].Source.URL, wantURL)
 	}
 }
 

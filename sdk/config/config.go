@@ -14,6 +14,7 @@ type ClientConfig = internalconfig.ClientConfig
 type CodexClientConfig = internalconfig.CodexClientConfig
 type StreamingConfig = internalconfig.StreamingConfig
 type ClaudeCodeConfig = internalconfig.ClaudeCodeConfig
+type ClaudeGatewayModel = internalconfig.ClaudeGatewayModel
 type TLSConfig = internalconfig.TLSConfig
 type DiscoveryConfig = internalconfig.DiscoveryConfig
 type DiscoveryInterfacesConfig = internalconfig.DiscoveryInterfacesConfig

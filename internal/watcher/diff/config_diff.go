@@ -64,6 +64,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if !reflect.DeepEqual(oldCfg.ClaudeCode.HiddenModels, newCfg.ClaudeCode.HiddenModels) {
 		changes = append(changes, fmt.Sprintf("claude-code.hidden-models: %v -> %v", oldCfg.ClaudeCode.HiddenModels, newCfg.ClaudeCode.HiddenModels))
 	}
+	if !reflect.DeepEqual(oldCfg.ClaudeCode.GatewayModels, newCfg.ClaudeCode.GatewayModels) {
+		changes = append(changes, fmt.Sprintf("claude-code.gateway-models: %d -> %d rows", len(oldCfg.ClaudeCode.GatewayModels), len(newCfg.ClaudeCode.GatewayModels)))
+	}
 	if oldCfg.DisableImageGeneration != newCfg.DisableImageGeneration {
 		changes = append(changes, fmt.Sprintf("disable-image-generation: %v -> %v", oldCfg.DisableImageGeneration, newCfg.DisableImageGeneration))
 	}
