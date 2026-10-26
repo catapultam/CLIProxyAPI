@@ -81,14 +81,19 @@ func TestClaudeModelsResponseDisablesModelListCloaking(t *testing.T) {
 	t.Fatalf("uncloaked model %q not found in response", modelID)
 }
 
-func TestRewriteClaudeDDModelInBody(t *testing.T) {
+func TestRewriteClaudeGatewayModelInBody(t *testing.T) {
 	tests := []struct {
 		name      string
 		body      string
 		wantModel string
 	}{
 		{
-			name:      "encoded model is decoded",
+			name:      "gateway model is decoded",
+			body:      `{"model":"claude-gw-gpt-6.1-sol","messages":[]}`,
+			wantModel: "gpt-6.1-sol",
+		},
+		{
+			name:      "legacy encoded model is decoded",
 			body:      `{"model":"claude-fable-5-dd-o4-tpg","messages":[]}`,
 			wantModel: "gpt-4o",
 		},
@@ -111,7 +116,7 @@ func TestRewriteClaudeDDModelInBody(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := rewriteClaudeDDModelInBody([]byte(tt.body))
+			got := rewriteClaudeGatewayModelInBody([]byte(tt.body))
 			if model := gjson.GetBytes(got, "model").String(); model != tt.wantModel {
 				t.Fatalf("model = %q, want %q; body=%s", model, tt.wantModel, string(got))
 			}

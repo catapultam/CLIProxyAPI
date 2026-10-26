@@ -87,8 +87,8 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	// so a status line can read it back from GET /v1/auto-mode.
 	observeAutoModeFromRequest(c, rawJSON)
 
-	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
-	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	// Decode claude-gw-<id> (and legacy claude-fable-5-dd-<reversed>) model IDs back to the real model name for routing.
+	rawJSON = rewriteClaudeGatewayModelInBody(rawJSON)
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -119,8 +119,8 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 		return
 	}
 
-	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
-	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
+	// Decode claude-gw-<id> (and legacy claude-fable-5-dd-<reversed>) model IDs back to the real model name for routing.
+	rawJSON = rewriteClaudeGatewayModelInBody(rawJSON)
 
 	c.Header("Content-Type", "application/json")
 
@@ -175,9 +175,9 @@ func claudeBetaHasAFKMode(betaHeader string) bool {
 	return false
 }
 
-// rewriteClaudeDDModelInBody decodes model IDs of the form claude-fable-5-dd-<reversed>
+// rewriteClaudeGatewayModelInBody decodes model IDs of the form claude-gw-<id> or the legacy claude-fable-5-dd-<reversed>
 // back into the original model name used for routing and upstream requests.
-func rewriteClaudeDDModelInBody(rawJSON []byte) []byte {
+func rewriteClaudeGatewayModelInBody(rawJSON []byte) []byte {
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	resolved := claudemodels.ResolveClaudeModelIDPrefix(modelName)
 	if resolved == modelName {

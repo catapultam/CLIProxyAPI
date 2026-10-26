@@ -6,6 +6,18 @@ import (
 	"strings"
 )
 
+// claudeGatewayModelPrefix marks a non-Claude model ID in Anthropic model listings.
+// Claude Code's gateway discovery drops IDs that do not contain "claude" or "anthropic",
+// and it identifies models by searching the ID for family names such as
+// "claude-fable-5". The prefix contains no family name, so Claude Code reads
+// "claude-gw-gpt-6.1-sol" as its own unknown model (own modelSettings key, unknown-model
+// defaults) until a client maps it with a modelPicker behavesAs row.
+const claudeGatewayModelPrefix = "claude-gw-"
+
+// claudeDDModelPrefix is the legacy encoding: "claude-fable-5-dd-" plus the original ID
+// reversed. Claude Code read every such ID as Fable 5 (1M window, Fable 5 settings).
+// Listings no longer produce it; requests are still decoded so sessions and transcripts
+// that picked a legacy ID keep routing.
 const claudeDDModelPrefix = "claude-fable-5-dd-"
 
 // BuildResponse builds an Anthropic model response from available models.
@@ -52,29 +64,32 @@ func BuildResponse(availableModels []map[string]any, disableCloaking bool, hidde
 
 // EnsureClaudeModelIDPrefix rewrites model IDs for Anthropic model listings.
 // IDs that already start with "claude-" are returned unchanged; all other IDs
-// become "claude-fable-5-dd-" plus the original ID with its characters reversed.
+// become "claude-gw-" plus the original ID.
 func EnsureClaudeModelIDPrefix(id string) string {
 	if id == "" || strings.HasPrefix(id, "claude-") {
 		return id
 	}
-	return claudeDDModelPrefix + reverseModelID(id)
+	return claudeGatewayModelPrefix + id
 }
 
 // ResolveClaudeModelIDPrefix reverses EnsureClaudeModelIDPrefix for request routing.
+// It also decodes the legacy claude-fable-5-dd-<reversed> form.
 // Optional thinking suffixes in model(value) form are preserved.
 func ResolveClaudeModelIDPrefix(id string) string {
 	if id == "" {
 		return id
 	}
 	base, suffix, hasSuffix := splitModelThinkingSuffix(id)
-	if !strings.HasPrefix(base, claudeDDModelPrefix) {
+	var resolved string
+	switch {
+	case strings.HasPrefix(base, claudeGatewayModelPrefix):
+		resolved = base[len(claudeGatewayModelPrefix):]
+	case strings.HasPrefix(base, claudeDDModelPrefix):
+		resolved = reverseModelID(base[len(claudeDDModelPrefix):])
+	}
+	if resolved == "" {
 		return id
 	}
-	encoded := base[len(claudeDDModelPrefix):]
-	if encoded == "" {
-		return id
-	}
-	resolved := reverseModelID(encoded)
 	if hasSuffix {
 		return resolved + "(" + suffix + ")"
 	}

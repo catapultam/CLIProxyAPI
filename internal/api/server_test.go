@@ -2079,17 +2079,17 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 			switch id {
 			case "claude-sonnet-4-6":
 				claudeModel = m
-			case "claude-fable-5-dd-o4-tpg":
+			case "claude-gw-gpt-4o":
 				rewrittenModel = m
-			case "gpt-4o", "claude-gpt-4o":
-				t.Fatalf("expected non-claude model id to be rewritten as claude-fable-5-dd-<reversed>, got %q", id)
+			case "gpt-4o", "claude-gpt-4o", "claude-fable-5-dd-o4-tpg":
+				t.Fatalf("expected non-claude model id to be rewritten as claude-gw-<id>, got %q", id)
 			}
 		}
 		if claudeModel == nil {
 			t.Fatalf("expected claude-sonnet-4-6 in response, got %s", rr.Body.String())
 		}
 		if rewrittenModel == nil {
-			t.Fatalf("expected claude-fable-5-dd-o4-tpg in response, got %s", rr.Body.String())
+			t.Fatalf("expected claude-gw-gpt-4o in response, got %s", rr.Body.String())
 		}
 		for _, field := range []string{"max_input_tokens", "max_tokens", "display_name"} {
 			if _, ok := claudeModel[field]; !ok {
@@ -2128,7 +2128,7 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 			if id, _ := m["id"].(string); id == "gpt-4o" {
 				foundRawGPT = true
 			}
-			if id, _ := m["id"].(string); id == "claude-gpt-4o" || id == "claude-fable-5-dd-o4-tpg" {
+			if id, _ := m["id"].(string); id == "claude-gpt-4o" || id == "claude-gw-gpt-4o" || id == "claude-fable-5-dd-o4-tpg" {
 				t.Fatalf("did not expect Anthropic id rewrite on OpenAI format models, got %v", m)
 			}
 		}

@@ -396,6 +396,10 @@ upstream:
     disable-claude-cloak-mode: false
 
     # When true, return original model IDs in Anthropic model list responses instead of cloaked IDs.
+    # Cloaked IDs are "claude-gw-<original id>" for any ID not starting with "claude-", because
+    # Claude Code's /model discovery drops IDs without "claude" in them. Requests decode both that
+    # form and the legacy "claude-fable-5-dd-<reversed>" form. In Claude Code, map a cloaked ID to
+    # a Claude model's behavior with a modelPicker behavesAs row.
     disable-cloaking-model-list: false
 
     # Model IDs to omit from Anthropic model list responses (what Claude Code's /model picker reads).

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
 )
 
 // pooledUsageHandler serves pooled 5h and weekly usage in the rate_limits shape
@@ -16,7 +17,8 @@ import (
 //	                                 weekly pool of every provider (seven_day_by_provider)
 //	GET /v1/usage?provider=<name>    every credential of claude or codex (openai)
 func (s *Server) pooledUsageHandler(c *gin.Context) {
-	model := strings.TrimSpace(c.Query("model"))
+	// Status lines pass the model ID Claude Code uses, which is claude-gw-<id> for non-Claude models.
+	model := claudemodels.ResolveClaudeModelIDPrefix(strings.TrimSpace(c.Query("model")))
 	provider := strings.ToLower(strings.TrimSpace(c.Query("provider")))
 	if provider == "openai" {
 		provider = "codex"
