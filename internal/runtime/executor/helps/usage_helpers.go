@@ -605,6 +605,9 @@ func (r *UsageReporter) publishAttemptRecord(ctx context.Context, record usage.R
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
 	record.ResponseHeadersAt = internallogging.GetResponseHeadersReceivedAt(ctx)
+	if r != nil {
+		ctx = usage.WithCapturedIdentity(ctx, r.apiKey, r.accessProvider, r.isNativeKey)
+	}
 	usage.PublishRecord(ctx, record)
 }
 
@@ -804,9 +807,12 @@ func APIKeyFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
+	if usage.HasCapturedIdentity(ctx) {
+		return usage.APIKeyFromContext(ctx)
+	}
 	ginCtx, ok := ctx.Value("gin").(*gin.Context)
 	if !ok || ginCtx == nil {
-		return ""
+		return usage.APIKeyFromContext(ctx)
 	}
 	if v, exists := ginCtx.Get("userApiKey"); exists {
 		switch value := v.(type) {
@@ -818,13 +824,16 @@ func APIKeyFromContext(ctx context.Context) string {
 			return fmt.Sprintf("%v", value)
 		}
 	}
-	return ""
+	return usage.APIKeyFromContext(ctx)
 }
 
 // AccessProviderFromContext extracts the client authentication provider identifier from the context.
 func AccessProviderFromContext(ctx context.Context) string {
 	if provider := usage.AccessProviderFromContext(ctx); provider != "" {
 		return provider
+	}
+	if usage.HasCapturedIdentity(ctx) {
+		return ""
 	}
 	if ctx == nil {
 		return ""
