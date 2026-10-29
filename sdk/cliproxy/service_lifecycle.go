@@ -369,7 +369,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
-		usage.StopDefault()
+		if !usage.StopDefaultAndWait(ctx) {
+			log.Warn("usage: shutdown deadline reached before queued usage records were delivered")
+		}
 	})
 	return shutdownErr
 }

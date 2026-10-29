@@ -98,6 +98,7 @@ retain the corresponding business operation's fields.
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
 | `/observability/usage/queue` | GET | Get queued usage events. |
+| `/observability/usage/metrics-embed` | GET | Get a signed URL for the fixed Metabase metrics dashboard. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |
 | `/credentials/download` | GET | Download a credential file. |
@@ -114,6 +115,32 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store. |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+## Metrics embed
+
+`GET /observability/usage/metrics-embed` signs a Metabase static-embedding URL for
+one fixed dashboard. The caller cannot choose the dashboard or its parameters.
+The response has `Cache-Control: no-store`.
+
+```json
+{"configured": true, "url": "https://<metabase>/embed/dashboard/<token>#bordered=true&titled=true", "expires_at": "<RFC 3339>"}
+```
+
+The token is an HS256 JWT with the claims
+`{"resource": {"dashboard": <id>}, "params": {}, "exp": <now + 600 s>}`.
+Configuration comes only from the server environment:
+
+| Variable | Value |
+| --- | --- |
+| `USAGE_ANALYTICS_METABASE_URL` | Metabase base URL. It must use `https` and have no user info, query, or fragment. |
+| `USAGE_ANALYTICS_METABASE_DASHBOARD_ID` | The dashboard ID, a positive integer. |
+| `USAGE_ANALYTICS_EMBED_SECRET_FILE` | Path to a file that holds the Metabase embedding secret key (at least 32 characters). The file is read on each request. |
+
+If none of the variables is set, the response is `{"configured": false}`. If
+only some are set or a value is not valid, the response is HTTP 500 with a
+general error. The log names the bad variable but never the secret. In
+Metabase, turn on static embedding and publish the dashboard for static
+embedding with no parameters.
 
 ## OAuth
 

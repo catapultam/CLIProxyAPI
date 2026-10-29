@@ -593,6 +593,7 @@ func (r *UsageReporter) publishAttemptRecord(ctx context.Context, record usage.R
 
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
+	record.ResponseHeadersAt = internallogging.GetResponseHeadersReceivedAt(ctx)
 	usage.PublishRecord(ctx, record)
 }
 
@@ -682,6 +683,7 @@ func failFromErrors(errs ...error) usage.Failure {
 		return usage.Failure{
 			Body:       body,
 			StatusCode: clienterror.HTTPStatusFromError(err),
+			Class:      cliproxyauth.UsageFailureClass(err),
 		}
 	}
 	return usage.Failure{}

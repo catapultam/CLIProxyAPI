@@ -35,9 +35,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/store"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/tui"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usageanalytics"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	log "github.com/sirupsen/logrus"
 )
@@ -825,8 +827,41 @@ func main() {
 			managementasset.StartAutoUpdater(context.Background(), configFilePath)
 			misc.StartAntigravityVersionUpdater(context.Background())
 			startModelCatalogUpdaters(localModel, cfg.Home.Enabled)
+			analyticsSink := startUsageAnalytics(lookupEnv)
 			cmd.StartServiceWithPluginHost(cfg, configFilePath, password, pluginHost, serverOptions...)
+			stopUsageAnalytics(analyticsSink)
 		}
+	}
+}
+
+// startUsageAnalytics starts the passive analytics sink when
+// USAGE_ANALYTICS_PG_DSN is set. A failure only disables the sink.
+func startUsageAnalytics(lookupEnv func(...string) (string, bool)) *usageanalytics.Sink {
+	dsn, ok := lookupEnv("USAGE_ANALYTICS_PG_DSN", "usage_analytics_pg_dsn")
+	if !ok {
+		return nil
+	}
+	spoolDir, _ := lookupEnv("USAGE_ANALYTICS_SPOOL_DIR", "usage_analytics_spool_dir")
+	sink, errOpen := usageanalytics.Open(dsn, spoolDir)
+	if errOpen != nil {
+		log.Errorf("usage analytics disabled: %v", errOpen)
+		return nil
+	}
+	sink.Start()
+	coreusage.RegisterNamedPlugin("usage-analytics", sink)
+	log.Info("usage analytics sink enabled")
+	return sink
+}
+
+// stopUsageAnalytics runs after the service shutdown has drained the usage queue.
+func stopUsageAnalytics(sink *usageanalytics.Sink) {
+	if sink == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if !sink.Close(ctx) {
+		log.Warn("usage analytics: close deadline reached; rows in memory may be lost")
 	}
 }
 

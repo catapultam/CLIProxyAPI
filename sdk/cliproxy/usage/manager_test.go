@@ -85,3 +85,42 @@ func TestRecordOmittedGenerateIsEnabled(t *testing.T) {
 		t.Fatalf("GenerateEnabled(omitted) = false, want true")
 	}
 }
+
+type blockingPlugin struct {
+	release chan struct{}
+	handled chan struct{}
+}
+
+func (p *blockingPlugin) HandleUsage(context.Context, Record) {
+	<-p.release
+	close(p.handled)
+}
+
+func TestStopAndWaitWaitsForQueuedRecords(t *testing.T) {
+	m := NewManager(1)
+	p := &blockingPlugin{release: make(chan struct{}), handled: make(chan struct{})}
+	m.Register(p)
+	m.Publish(context.Background(), Record{Provider: "p"})
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	if m.StopAndWait(expired) {
+		t.Fatal("StopAndWait reported delivery while the plugin was still blocked")
+	}
+
+	close(p.release)
+	if !m.StopAndWait(context.Background()) {
+		t.Fatal("StopAndWait did not report delivery")
+	}
+	select {
+	case <-p.handled:
+	default:
+		t.Fatal("StopAndWait returned before the plugin finished")
+	}
+}
+
+func TestStopAndWaitWithoutStart(t *testing.T) {
+	if !NewManager(1).StopAndWait(context.Background()) {
+		t.Fatal("never-started manager must report done")
+	}
+}

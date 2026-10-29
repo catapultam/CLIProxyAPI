@@ -24,7 +24,8 @@ const AutoServiceTier = "auto"
 type Record struct {
 	// RequestID uniquely identifies this specific model execution instance (UUID v4).
 	RequestID string
-	// TraceID identifies the parent inbound HTTP request when available (8-character hex).
+	// TraceID identifies the parent inbound HTTP request when available (full UUIDv7;
+	// logs show only its last 8 characters).
 	TraceID  string
 	Provider string
 	// BaseURL stores the configured upstream base URL when available.
@@ -67,12 +68,16 @@ type Record struct {
 	Detail      Detail
 	// ResponseHeaders stores a snapshot of upstream response headers for usage sinks.
 	ResponseHeaders http.Header
+	// ResponseHeadersAt is when the proxy received ResponseHeaders; zero when unknown.
+	ResponseHeadersAt time.Time
 }
 
 // Failure holds HTTP failure metadata for an upstream request attempt.
 type Failure struct {
 	StatusCode int
 	Body       string
+	// Class is the auth classifier verdict for the error (see auth.UsageFailureClass).
+	Class string
 }
 
 // Detail holds the token usage breakdown.
@@ -307,6 +312,8 @@ type Manager struct {
 	once     sync.Once
 	stopOnce sync.Once
 	cancel   context.CancelFunc
+	// done is closed when the dispatcher exits; nil until Start runs.
+	done chan struct{}
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -336,7 +343,14 @@ func (m *Manager) Start(ctx context.Context) {
 		}
 		var workerCtx context.Context
 		workerCtx, m.cancel = context.WithCancel(ctx)
-		go m.run(workerCtx)
+		done := make(chan struct{})
+		m.mu.Lock()
+		m.done = done
+		m.mu.Unlock()
+		go func() {
+			defer close(done)
+			m.run(workerCtx)
+		}()
 	})
 }
 
@@ -354,6 +368,30 @@ func (m *Manager) Stop() {
 		m.mu.Unlock()
 		m.cond.Broadcast()
 	})
+}
+
+// StopAndWait stops the dispatcher and waits until it has delivered every queued
+// record or ctx ends. It reports whether the queue was fully delivered.
+func (m *Manager) StopAndWait(ctx context.Context) bool {
+	if m == nil {
+		return true
+	}
+	m.Stop()
+	m.mu.Lock()
+	done := m.done
+	m.mu.Unlock()
+	if done == nil {
+		return true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // Register appends a plugin to the delivery list.
@@ -483,3 +521,6 @@ func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }
 
 // StopDefault stops the default manager's dispatcher.
 func StopDefault() { DefaultManager().Stop() }
+
+// StopDefaultAndWait stops the default manager and waits for queued records.
+func StopDefaultAndWait(ctx context.Context) bool { return DefaultManager().StopAndWait(ctx) }

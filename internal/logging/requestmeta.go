@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type endpointKey struct{}
@@ -32,6 +33,8 @@ type responseStatusHolder struct {
 type responseHeadersHolder struct {
 	mu      sync.RWMutex
 	headers http.Header
+	// receivedAt is when the proxy last stored upstream headers.
+	receivedAt time.Time
 }
 
 func WithEndpoint(ctx context.Context, endpoint string) context.Context {
@@ -123,6 +126,7 @@ func SetResponseHeaders(ctx context.Context, headers http.Header) {
 	holder.mu.Lock()
 	defer holder.mu.Unlock()
 	holder.headers = cloneHTTPHeader(headers)
+	holder.receivedAt = time.Now()
 }
 
 // MergeResponseHeaders adds headers observed after the initial HTTP response,
@@ -147,6 +151,7 @@ func MergeResponseHeaders(ctx context.Context, headers http.Header) {
 		}
 		holder.headers[canonicalKey] = append([]string(nil), values...)
 	}
+	holder.receivedAt = time.Now()
 }
 
 func GetResponseStatus(ctx context.Context) int {
@@ -171,6 +176,21 @@ func GetResponseHeaders(ctx context.Context) http.Header {
 	holder.mu.RLock()
 	defer holder.mu.RUnlock()
 	return cloneHTTPHeader(holder.headers)
+}
+
+// GetResponseHeadersReceivedAt returns when the current attempt last stored
+// upstream response headers, or zero when none were stored.
+func GetResponseHeadersReceivedAt(ctx context.Context) time.Time {
+	if ctx == nil {
+		return time.Time{}
+	}
+	holder, ok := ctx.Value(responseHeadersKey{}).(*responseHeadersHolder)
+	if !ok || holder == nil {
+		return time.Time{}
+	}
+	holder.mu.RLock()
+	defer holder.mu.RUnlock()
+	return holder.receivedAt
 }
 
 func cloneHTTPHeader(src http.Header) http.Header {

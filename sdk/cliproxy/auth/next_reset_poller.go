@@ -209,6 +209,7 @@ func (p *nextResetPoller) fetch(ctx context.Context, auth *Auth, now time.Time) 
 			return
 		}
 		p.store.set(auth.ID, snap)
+		notifyQuotaPollObserver(auth, snap, time.Now())
 		// Re-evaluate now so a confirmed reset releases the latch at once.
 		nextResetBlocked(auth, now)
 		// A real usage_limit_reached 429 sets a credential_quota cooldown
