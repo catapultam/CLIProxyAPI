@@ -57,6 +57,15 @@ func TestPostgresIntegration(t *testing.T) {
 	failed.A.Failed, failed.A.UsageKnown, failed.A.TotalTokens, failed.A.InputUncachedTokens = true, false, nil, nil
 	jitter := uuid.NewString() // 42 -> 43 -> 42 -> 43 in one window: net +1, not +2
 	fable := uuid.NewString()
+	// Float residue: header 0.07 (fraction) stores 7.000000000000001; a poll
+	// reports 7. The net change must be exactly 0, then 0.071 adds exactly 0.1.
+	precise := uuid.NewString()
+	fraction07, fraction071 := 0.07, 0.071 // variables: constant math would be exact
+	reported := func(at time.Time, raw, scale string, stored float64) item {
+		it := obsFor(precise, "short", at, stored, reset)
+		it.O.RawValue, it.O.RawScale = raw, scale
+		return it
+	}
 	items := []item{
 		obs(base, 10, reset),
 		attempt(base.Add(1*time.Minute), 40), attempt(base.Add(2*time.Minute), 60),
@@ -72,6 +81,9 @@ func TestPostgresIntegration(t *testing.T) {
 		obsFor(jitter, "short", base.Add(6*time.Minute), 43, reset),
 		obsFor(fable, "fable_weekly", base, 1, reset), attemptFor(fable, base.Add(time.Minute), 10),
 		obsFor(fable, "fable_weekly", base.Add(2*time.Minute), 2, reset),
+		reported(base, "7", "percent", 7), attemptFor(precise, base.Add(time.Minute), 10),
+		reported(base.Add(2*time.Minute), "0.07", "fraction", fraction07*100), attemptFor(precise, base.Add(3*time.Minute), 10),
+		reported(base.Add(4*time.Minute), "0.071", "fraction", fraction071*100),
 		{H: &heartbeatRow{RunID: uuid.NewString(), Seq: 1, At: base, Kind: "start"}},
 	}
 	for i := 0; i < 2; i++ { // the second insert is a replay and must be a no-op
@@ -104,6 +116,30 @@ func TestPostgresIntegration(t *testing.T) {
 	if errScan = reader.QueryRowContext(ctx, `SELECT count(*) FROM subscription_analytics.capacity_spans WHERE account_hash = $1`,
 		fable).Scan(&fableSpans); errScan != nil || fableSpans != 0 {
 		t.Fatalf("fable window must not form ratio spans: %d %v", fableSpans, errScan)
+	}
+	if fraction07*100 == 7 {
+		t.Fatal("test needs the float residue")
+	}
+	var zeroDelta, tenthDelta string
+	var zeroRatioNull bool
+	if errScan = reader.QueryRowContext(ctx, `SELECT
+		  (array_agg(delta_percent::text ORDER BY observed_at))[1],
+		  (array_agg(delta_percent::text ORDER BY observed_at))[2],
+		  (array_agg(total_tokens_per_pp IS NULL ORDER BY observed_at))[1]
+		FROM subscription_analytics.quota_intervals WHERE account_hash = $1`, precise).
+		Scan(&zeroDelta, &tenthDelta, &zeroRatioNull); errScan != nil {
+		t.Fatal(errScan)
+	}
+	if zeroDelta != "0" && zeroDelta != "0.00" || !zeroRatioNull {
+		t.Fatalf("0.07 fraction vs 7 percent: delta %s, ratio null %v", zeroDelta, zeroRatioNull)
+	}
+	var spanDelta string
+	if errScan = reader.QueryRowContext(ctx, `SELECT delta_percent::text, total_tokens_per_pp::float8
+		FROM subscription_analytics.capacity_spans WHERE account_hash = $1`, precise).Scan(&spanDelta, &tokensPerPP); errScan != nil {
+		t.Fatal(errScan)
+	}
+	if tenthDelta != "0.100" || spanDelta != "0.100" || tokensPerPP != 200 {
+		t.Fatalf("0.1 pp step: interval %s span %s tokens/pp %v", tenthDelta, spanDelta, tokensPerPP)
 	}
 	var pairing string
 	if errScan = reader.QueryRowContext(ctx, `SELECT pairing FROM subscription_analytics.quota_intervals

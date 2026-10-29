@@ -99,20 +99,32 @@ GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9;
 -- Negative and zero deltas stay eligible: headers can arrive out of order or with
 -- other precision, so spans use the NET change (sum of deltas), which does not
 -- count the same percentage point twice. Per-interval ratios need delta > 0.
+-- Percentages are exact numeric values from the reported text (raw_value), not
+-- the stored double: 0.07 (fraction) * 100 must equal a reported 7 (percent),
+-- or a float residue such as 8.9e-16 would become a false positive change.
+-- used_percent / prev_used_percent / delta_percent below are these numerics.
 CREATE VIEW subscription_analytics.quota_intervals AS
 WITH gaps AS MATERIALIZED (
     SELECT gap_start, gap_end FROM subscription_analytics.collector_gaps
-), obs AS (
+), canon AS (
     SELECT o.*,
+           CASE WHEN o.raw_value ~ '^[0-9]+(\.[0-9]+)?$'
+                THEN o.raw_value::numeric * CASE WHEN o.raw_scale = 'fraction' THEN 100 ELSE 1 END
+                -- Other text forms: the stored value, rounded to 6 decimals.
+                ELSE round(o.used_percent::numeric, 6)
+           END AS pct
+    FROM subscription_analytics.quota_observations o
+), obs AS (
+    SELECT canon.*,
            lag(observed_at)  OVER w AS prev_observed_at,
-           lag(used_percent) OVER w AS prev_used_percent,
+           lag(pct)          OVER w AS prev_pct,
            lag(reset_at)     OVER w AS prev_reset_at,
            lag(source)       OVER w AS prev_source
-    FROM subscription_analytics.quota_observations o
+    FROM canon
     WINDOW w AS (PARTITION BY account_hash, window_key ORDER BY observed_at, observation_id)
 ), paired AS (
     SELECT obs.*,
-           used_percent - prev_used_percent AS delta_percent,
+           pct - prev_pct AS delta_percent,
            CASE
                WHEN prev_reset_at IS NOT NULL AND prev_reset_at <= observed_at THEN 'reset_passed'
                WHEN reset_at IS NULL OR prev_reset_at IS NULL THEN 'missing_reset'
@@ -125,7 +137,7 @@ WITH gaps AS MATERIALIZED (
 SELECT p.account_hash, p.provider, p.auth_kind, p.window_key, p.observation_id,
        p.prev_observed_at, p.observed_at,
        p.prev_source, p.source, p.observed_at_quality,
-       p.prev_used_percent, p.used_percent, p.delta_percent,
+       p.prev_pct AS prev_used_percent, p.pct AS used_percent, p.delta_percent,
        p.prev_reset_at, p.reset_at, p.pairing,
        (p.pairing = 'same_window' AND p.window_key <> 'fable_weekly') AS ratio_eligible,
        (p.delta_percent < 0)                                          AS negative_delta,
