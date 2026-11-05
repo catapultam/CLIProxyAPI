@@ -792,6 +792,5 @@ func reloginSnapshot(t *testing.T, path, token string, expiry time.Time) *Auth {
 		Attributes: map[string]string{"path": path, "source": path},
 		Metadata:   map[string]any{"type": "claude", "access_token": token + "-at", "refresh_token": token + "-rt", "expired": expired},
 	}
-	a.BindFileSnapshot(path, data)
 	return a
 }
