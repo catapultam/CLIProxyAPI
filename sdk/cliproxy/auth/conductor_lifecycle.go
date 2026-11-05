@@ -261,6 +261,23 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	cooldownStateChanged := false
 	now := time.Now()
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+		// File reloads reconstruct credentials without runtime failure and cooldown state.
+		isFileSnapshot := mode == updateModeReplace && auth.Attributes[AttributePath] != "" && auth.Attributes[AttributeSource] != ""
+		if isFileSnapshot {
+			auth.ModelStates = existing.ModelStates
+			auth.LastRefreshedAt = existing.LastRefreshedAt
+			auth.Status = existing.Status
+			auth.StatusMessage = existing.StatusMessage
+			auth.Unavailable = existing.Unavailable
+			auth.NextRetryAfter = existing.NextRetryAfter
+			auth.LastError = cloneError(existing.LastError)
+			auth.Quota = existing.Quota
+			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
+			if !credChanged {
+				auth.NextRefreshAfter = existing.NextRefreshAfter
+				auth.RefreshFailures = existing.RefreshFailures
+			}
+		}
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}

@@ -134,6 +134,11 @@ func (m *Manager) ReleaseQuotaCooldown(ctx context.Context, authID string) (bool
 	var snapshot *Auth
 	cooldownStateChanged := false
 
+	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, authID)
+	if errMutation != nil {
+		return false, errMutation
+	}
+	defer releaseMutation()
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
 	if !ok || auth == nil {
@@ -157,8 +162,10 @@ func (m *Manager) ReleaseQuotaCooldown(ctx context.Context, authID string) (bool
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 	}
-	errPersist := m.persist(ctx, auth)
+	errPersist := m.persistLocked(ctx, auth)
+	snapshot = auth.Clone()
 	m.mu.Unlock()
+	releaseMutation()
 
 	defer func() {
 		if cooldownStateChanged {

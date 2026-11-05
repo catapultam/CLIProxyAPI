@@ -120,8 +120,14 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	host := h.pluginHost
 	h.mu.Unlock()
 	var quotaSupportedProviders map[string]struct{}
+	var quotaPluginIDs map[string]string
+	isV8 := c.GetBool(ConfigV8ContextKey)
 	if host != nil {
-		quotaSupportedProviders = host.QuotaSupportedProvidersSet(c.Request.Context())
+		if isV8 {
+			quotaPluginIDs = host.QuotaProviderPluginIDs(c.Request.Context())
+		} else {
+			quotaSupportedProviders = host.QuotaSupportedProvidersSet(c.Request.Context())
+		}
 	}
 	auths := h.authManager.List()
 	observedAt := time.Now().UTC()
@@ -142,6 +148,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		files := make([]gin.H, 0, end-start)
 		for _, auth := range matching[start:end] {
 			if entry := h.buildAuthFileEntry(auth, quotaSupportedProviders); entry != nil {
+				if isV8 {
+					applyV8AuthFileQuota(entry, auth.Provider, quotaPluginIDs)
+				}
 				entry["cooldowns"] = nil
 				if cooldownsKnown {
 					entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
@@ -158,6 +167,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 			continue
 		}
 		if entry := h.buildAuthFileEntry(auth, quotaSupportedProviders); entry != nil {
+			if isV8 {
+				applyV8AuthFileQuota(entry, auth.Provider, quotaPluginIDs)
+			}
 			entry["cooldowns"] = nil
 			if cooldownsKnown {
 				entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
@@ -989,4 +1001,16 @@ func isUnsafeAuthFileName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// applyV8AuthFileQuota advertises only the plugin quota routes supported by v8.
+func applyV8AuthFileQuota(entry gin.H, provider string, pluginIDs map[string]string) {
+	delete(entry, "quota_probe")
+	delete(entry, "supports_quota")
+	delete(entry, "quota_provider")
+	if pluginID := pluginIDs[strings.ToLower(strings.TrimSpace(provider))]; pluginID != "" {
+		entry["supports_quota"] = true
+		entry["quota_provider"] = provider
+		entry["quota_plugin_id"] = pluginID
+	}
 }

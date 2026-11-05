@@ -1204,3 +1204,92 @@ func TestFetchCredentialQuota_MissingTokenDoesNotHitUpstream(t *testing.T) {
 		t.Fatal("upstream server must NOT be contacted when template requires token but token is missing")
 	}
 }
+
+func TestV8AuthFilesListAdvertisesPluginQuotaRoutes(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	authWithPlugin := &coreauth.Auth{
+		ID:         "opencode-auth-list",
+		FileName:   "opencode.json",
+		Provider:   "opencode-go",
+		Attributes: map[string]string{"runtime_only": "true"},
+	}
+	authWithProbe := &coreauth.Auth{
+		ID:         "custom-auth-list",
+		FileName:   "custom.json",
+		Provider:   "custom",
+		Attributes: map[string]string{"runtime_only": "true"},
+		Metadata: map[string]any{
+			"quota_probe": map[string]any{
+				"url": "https://api.example.com/quota",
+			},
+		},
+	}
+	authNormal := &coreauth.Auth{
+		ID:         "normal-auth-list",
+		FileName:   "normal.json",
+		Provider:   "openai",
+		Attributes: map[string]string{"runtime_only": "true"},
+	}
+	_, _ = manager.Register(context.Background(), authWithPlugin)
+	_, _ = manager.Register(context.Background(), authWithProbe)
+	_, _ = manager.Register(context.Background(), authNormal)
+
+	host := pluginhost.New()
+	host.RegisterPluginForTest("opencode-plugin", pluginapi.Plugin{
+		Metadata: pluginapi.Metadata{Name: "OpenCode Plugin"},
+		Capabilities: pluginapi.Capabilities{
+			QuotaProvider: &mockQuotaProvider{identifier: "opencode-go"},
+		},
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.SetPluginHost(host)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v8/management/credentials?page=1&page_size=10", nil)
+	ctx.Set(ConfigV8ContextKey, true)
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	var resp struct {
+		Files []map[string]any `json:"files"`
+	}
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &resp); errUnmarshal != nil {
+		t.Fatalf("failed to unmarshal files: %v", errUnmarshal)
+	}
+
+	var foundPlugin, foundProbe, foundNormal bool
+	for _, f := range resp.Files {
+		id, _ := f["id"].(string)
+		switch id {
+		case "opencode-auth-list":
+			foundPlugin = true
+			if supports, ok := f["supports_quota"].(bool); !ok || !supports {
+				t.Fatalf("expected opencode auth to have supports_quota: true, got %#v", f["supports_quota"])
+			}
+			if qp, ok := f["quota_provider"].(string); !ok || qp != "opencode-go" {
+				t.Fatalf("expected quota_provider: opencode-go, got %#v", f["quota_provider"])
+			}
+			if f["quota_plugin_id"] != "opencode-plugin" {
+				t.Fatalf("quota plugin ID = %v", f["quota_plugin_id"])
+			}
+		case "custom-auth-list":
+			foundProbe = true
+			if f["supports_quota"] != nil || f["quota_probe"] != nil || f["quota_plugin_id"] != nil {
+				t.Fatalf("v8 advertised unsupported declarative quota probe: %#v", f)
+			}
+		case "normal-auth-list":
+			foundNormal = true
+			if supports, ok := f["supports_quota"].(bool); ok && supports {
+				t.Fatalf("expected normal auth to have supports_quota: false, got true")
+			}
+		}
+	}
+	if !foundPlugin || !foundProbe || !foundNormal {
+		t.Fatalf("did not find all auth entries: plugin=%v probe=%v normal=%v", foundPlugin, foundProbe, foundNormal)
+	}
+}
